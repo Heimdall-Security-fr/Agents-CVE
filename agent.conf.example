@@ -1,0 +1,37 @@
+; ─────────────────────────────────────────────────────────────────────────────
+;  Heimdall Agent — fichier de configuration
+;
+;  Copiez ce fichier en « agent.conf » dans le même dossier que l'agent, puis
+;  renseignez vos valeurs. Ne committez JAMAIS votre agent.conf (il contient
+;  des secrets) — il est ignoré par .gitignore.
+;
+;  Emplacements recherchés automatiquement :
+;    - <dossier de l'agent>/agent.conf
+;    - /opt/heimdall-agent/agent.conf        (Linux)
+;    - C:\ProgramData\HeimdallAgent\agent.conf (Windows)
+; ─────────────────────────────────────────────────────────────────────────────
+
+[main_server]
+; Hôte / IP du serveur agent Heimdall (celui que vous déployez avec docker compose)
+host = 127.0.0.1
+; Port du serveur agent (défaut : 4000)
+port = 4000
+; Doit correspondre à AGENT_AUTH_TOKEN défini côté serveur agent.
+; Générez-en un fort, par ex. : python -c "import secrets; print(secrets.token_hex(32))"
+token = changeme-secret-token
+
+[api]
+; Clé API du site CVE Heimdall (générée sur la page « API Key » du frontend).
+; Laissez vide si vous n'utilisez pas les corrélations CVE côté agent.
+cve_api_key =
+
+[agent]
+; Intervalle en minutes entre deux envois en mode démon
+interval_minutes = 60
+; Activer le scan de ports à chaque collecte (true/false)
+port_scan = false
+
+[dashboard]
+; URL publique du frontend CVE (ex : http://localhost:3000 ou https://cve.mon-domaine.com)
+; Utilisée pour générer les liens vers les pages de détail CVE.
+frontend_url = http://localhost:3000

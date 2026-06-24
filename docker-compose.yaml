@@ -1,0 +1,56 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Heimdall Agent Server — déploiement auto-hébergé
+#
+#  Démarre le serveur agent (dashboard + API d'ingestion) et sa base MongoDB.
+#  Les agents installés sur vos postes envoient leur inventaire ici ; le serveur
+#  corrèle ensuite avec le site CVE Heimdall.
+#
+#  Démarrage :   docker compose up -d --build
+#  Dashboard :   http://localhost:4000/admin
+#
+#  ⚠️  AVANT LA PROD : changez AGENT_AUTH_TOKEN, DEFAULT_ADMIN_PASSWORD et
+#      DASHBOARD_JWT_SECRET ci-dessous.
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  agent_server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: heimdall_agent_server
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      MONGO_URI: "mongodb://mongodb:27017/heimdall_agents"
+      SERVER_PUBLIC_PORT: "4000"
+      # IP/domaine public de CE serveur (utilisé dans les liens de téléchargement agent)
+      SERVER_PUBLIC_HOST: "127.0.0.1"
+      # Token partagé serveur <-> agents — À CHANGER
+      AGENT_AUTH_TOKEN: "changeme-secret-token"
+      # Clé de signature des sessions du dashboard — À CHANGER
+      DASHBOARD_JWT_SECRET: "change-me-please-32-bytes-minimum"
+      # Compte admin créé au premier démarrage — DÉFINISSEZ VOS PROPRES VALEURS
+      DEFAULT_ADMIN_EMAIL: "admin@example.local"
+      DEFAULT_ADMIN_PASSWORD: "change-me"
+      # URL publique du frontend CVE Heimdall
+      HEIMDALL_FRONT_URL: "http://localhost:3000"
+      # API CVE Heimdall (site) interrogée pour les corrélations
+      HEIMDALL_CVE_API: "http://cve_api:5000"
+      HEIMDALL_RSS_URL: "http://cve_api:5000/cves/rss"
+      # Clé API CVE (optionnelle, plan premium)
+      CVE_API_KEY: ""
+    depends_on:
+      - mongodb
+
+  mongodb:
+    image: mongo:7
+    container_name: heimdall_agent_mongo
+    restart: unless-stopped
+    volumes:
+      - agent_mongo_data:/data/db
+    # Décommentez pour exposer Mongo en local (debug) :
+    # ports:
+    #   - "27017:27017"
+
+volumes:
+  agent_mongo_data:

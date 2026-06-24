@@ -1,0 +1,34 @@
+# Secrets / config locale — NE JAMAIS committer
+agent.conf
+*.env
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Build / artefacts agent Windows
+build/
+dist/
+*.spec
+*.exe
+heimdall_icon.py
+heimdall_icon.ico
+
+# Asset généré au build (exe cross-compilé servi par le serveur)
+server/static/heimdall-agent.exe
+
+# OS / éditeurs
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
+heimdall-crash.log
