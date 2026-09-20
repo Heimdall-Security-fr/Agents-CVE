@@ -42,7 +42,7 @@ logger = logging.getLogger("HeimdallAgent")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
-    "main_server": {"host": "127.0.0.1", "port": "4000", "token": "changeme-secret-token"},
+    "main_server": {"host": "127.0.0.1", "port": "4000", "token": ""},
     "api":         {"cve_api_key": ""},
     "agent":       {"interval_minutes": "60", "port_scan": "false"}
 }
@@ -570,7 +570,9 @@ def _server_url(config) -> str:
     return f"http://{host}:{port}"
 
 def _agent_headers(config) -> dict:
-    token = config.get("main_server", "token", fallback="changeme-secret-token")
+    token = config.get("main_server", "token", fallback="")
+    if len(token) < 32:
+        raise ValueError("agent.conf must contain a 32+ character main_server token")
     return {"x-agent-token": token}
 
 # ─── Envoi du rapport (avec retry/backoff) ───────────────────────────────────

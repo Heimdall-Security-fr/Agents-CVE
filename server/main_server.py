@@ -4,6 +4,7 @@ from flask_cors import CORS
 from datetime import datetime, timedelta
 from functools import wraps
 import os
+import hmac
 import uuid
 import secrets
 import threading
@@ -352,14 +353,15 @@ MONGO_URI         = os.getenv("MONGO_URI",          "mongodb://mongodb:27017/hei
 SERVER_CVE_API_KEY = os.getenv("CVE_API_KEY", "")  # Clé serveur (premium) pour les corrélations internes
 SERVER_PUBLIC_HOST = os.getenv("SERVER_PUBLIC_HOST", "127.0.0.1")
 SERVER_PUBLIC_PORT = int(os.getenv("SERVER_PUBLIC_PORT", 4000))
-AGENT_AUTH_TOKEN   = os.getenv("AGENT_AUTH_TOKEN",   "changeme-secret-token")
+AGENT_AUTH_TOKEN   = os.getenv("AGENT_AUTH_TOKEN", "")
 HEIMDALL_FRONT_URL = os.getenv("HEIMDALL_FRONT_URL", "http://localhost:3000")
 AGENT_VERSION      = os.getenv("AGENT_VERSION", "1.0.0")
 
 app = Flask(__name__)
 app.config["MONGO_URI"] = MONGO_URI
 mongo = PyMongo(app)
-CORS(app, origins="*", supports_credentials=True)
+_dashboard_origins = [origin.strip() for origin in os.getenv("DASHBOARD_ALLOWED_ORIGINS", "").split(",") if origin.strip()]
+CORS(app, origins=_dashboard_origins, supports_credentials=False)
 
 # PyMongo est déjà thread-safe (pool de connexions interne).
 # On garde le nom `db_lock` pour préserver la sémantique des `with db_lock:`,
@@ -368,8 +370,13 @@ from contextlib import nullcontext
 db_lock = nullcontext()
 
 # ─── Dashboard auth (JWT) ─────────────────────────────────────────────────────
-DASHBOARD_JWT_SECRET    = os.getenv("DASHBOARD_JWT_SECRET", secrets.token_hex(32))
+DASHBOARD_JWT_SECRET    = os.getenv("DASHBOARD_JWT_SECRET", "")
 DASHBOARD_JWT_EXPIRE_D  = int(os.getenv("DASHBOARD_JWT_EXPIRE_DAYS", 7))
+
+if not AGENT_AUTH_TOKEN or len(AGENT_AUTH_TOKEN) < 32:
+    raise RuntimeError("AGENT_AUTH_TOKEN must be configured and at least 32 characters long")
+if not DASHBOARD_JWT_SECRET or len(DASHBOARD_JWT_SECRET) < 32:
+    raise RuntimeError("DASHBOARD_JWT_SECRET must be configured and at least 32 characters long")
 
 ROLES = ("admin", "deployment", "inspection_logs", "codir")
 
@@ -691,7 +698,7 @@ def require_agent_token(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         token = request.headers.get("x-agent-token")
-        if token != AGENT_AUTH_TOKEN:
+        if not token or not hmac.compare_digest(token, AGENT_AUTH_TOKEN):
             return {"error": "Unauthorized"}, 401
         return f(*args, **kwargs)
     return decorated
@@ -720,7 +727,7 @@ def refresh_cve_from_rss():
     """Consomme le flux RSS de l'API CVE et met à jour la base locale."""
     try:
         logger.info("[RSS] Récupération du flux RSS…")
-        r = requests.get(HEIMDALL_RSS_URL + "?limit=200", timeout=15)
+        r = requests.get(HEIMDALL_RSS_URL + "?limit=200", headers={"x-api-key": SERVER_CVE_API_KEY}, timeout=15)
         r.raise_for_status()
         root = ET.fromstring(r.text)
         channel = root.find('channel')
@@ -751,7 +758,7 @@ def refresh_cve_from_rss():
     except Exception as e:
         logger.warning(f"[RSS] Échec récupération flux RSS: {e}. Tentative via API directe…")
         try:
-            r = requests.get(f"{HEIMDALL_CVE_API}/cves/recent", timeout=15)
+            r = requests.get(f"{HEIMDALL_CVE_API}/cves/recent", headers={"x-api-key": SERVER_CVE_API_KEY}, timeout=15)
             r.raise_for_status()
             cves = r.json() if isinstance(r.json(), list) else r.json().get("results", [])
             for cve in cves:
@@ -1163,13 +1170,14 @@ def agent_software(hostname):
 
 # ─── Téléchargement agent pré-configuré ───────────────────────────────────────
 @app.route('/api/download/agent/<target_os>', methods=['GET'])
+@require_admin
 def download_agent(target_os):
     """Génère et retourne un package agent pré-configuré pour Linux, macOS ou Windows."""
     if target_os not in ("linux", "macos", "windows"):
         return {"error": "OS cible invalide (linux | macos | windows)"}, 400
 
-    server_host = request.args.get("server", SERVER_PUBLIC_HOST)
-    server_port = request.args.get("port", str(SERVER_PUBLIC_PORT))
+    server_host = SERVER_PUBLIC_HOST
+    server_port = str(SERVER_PUBLIC_PORT)
     auth_token  = AGENT_AUTH_TOKEN
 
     config_content = textwrap.dedent(f"""\
@@ -1867,14 +1875,17 @@ def serve_admin(path=None):
     return render_template('admin.html')
 
 # ─── Seed compte admin par défaut ────────────────────────────────────────────
-DEFAULT_ADMIN_EMAIL    = os.getenv("DEFAULT_ADMIN_EMAIL",    "root@heimdall.local")
-DEFAULT_ADMIN_PASSWORD = os.getenv("DEFAULT_ADMIN_PASSWORD", "root")
+DEFAULT_ADMIN_EMAIL    = os.getenv("DEFAULT_ADMIN_EMAIL", "")
+DEFAULT_ADMIN_PASSWORD = os.getenv("DEFAULT_ADMIN_PASSWORD", "")
 
 def _seed_default_admin():
     """Crée le compte admin par défaut si aucun admin n'existe encore."""
     with db_lock:
         try:
             if mongo.db.dashboard_users.count_documents({"role": "admin"}) == 0:
+                if not DEFAULT_ADMIN_EMAIL or len(DEFAULT_ADMIN_PASSWORD) < 12:
+                    app.logger.error("No admin account exists: set DEFAULT_ADMIN_EMAIL and a 12+ character DEFAULT_ADMIN_PASSWORD")
+                    return
                 doc = {
                     "_id":           str(uuid.uuid4()),
                     "email":         DEFAULT_ADMIN_EMAIL,

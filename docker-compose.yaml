@@ -26,12 +26,13 @@ services:
       # IP/domaine public de CE serveur (utilisé dans les liens de téléchargement agent)
       SERVER_PUBLIC_HOST: "127.0.0.1"
       # Token partagé serveur <-> agents — À CHANGER
-      AGENT_AUTH_TOKEN: "changeme-secret-token"
+      AGENT_AUTH_TOKEN: "${AGENT_AUTH_TOKEN:?Set AGENT_AUTH_TOKEN (32+ characters)}"
       # Clé de signature des sessions du dashboard — À CHANGER
-      DASHBOARD_JWT_SECRET: "change-me-please-32-bytes-minimum"
+      DASHBOARD_JWT_SECRET: "${DASHBOARD_JWT_SECRET:?Set DASHBOARD_JWT_SECRET (32+ characters)}"
       # Compte admin créé au premier démarrage — DÉFINISSEZ VOS PROPRES VALEURS
-      DEFAULT_ADMIN_EMAIL: "admin@example.local"
-      DEFAULT_ADMIN_PASSWORD: "change-me"
+      DEFAULT_ADMIN_EMAIL: "${DEFAULT_ADMIN_EMAIL:?Set DEFAULT_ADMIN_EMAIL}"
+      DEFAULT_ADMIN_PASSWORD: "${DEFAULT_ADMIN_PASSWORD:?Set DEFAULT_ADMIN_PASSWORD (12+ characters)}"
+      DASHBOARD_ALLOWED_ORIGINS: "${DASHBOARD_ALLOWED_ORIGINS:-}"
       # URL publique du frontend CVE Heimdall
       HEIMDALL_FRONT_URL: "http://localhost:3000"
       # API CVE Heimdall (site) interrogée pour les corrélations
