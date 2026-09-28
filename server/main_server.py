@@ -561,6 +561,13 @@ DEFAULT_COMPLIANCE_RULES = [
      "severity": "high", "cis_ref": "CIS 4.1.1",
      "example": "true",
      "platforms": ["linux"], "enabled": True},
+    {"id": "pending_updates",
+     "name": "Logiciels à jour",
+     "description": "Nombre de logiciels/paquets dont une version plus récente est disponible (winget, apt, dnf, brew…) — voir la page « Mises à jour »",
+     "expected_op": "<=", "expected_value": 0, "type": "int",
+     "severity": "medium", "cis_ref": "",
+     "example": "0 = tout est à jour — mettez 5 ou 10 pour tolérer un léger retard",
+     "platforms": ["windows", "linux", "darwin"], "enabled": False},
     {"id": "umask_value",
      "name": "Umask par défaut restrictif",
      "description": "Masque de création de fichiers — doit être 027 ou plus restrictif",
@@ -700,6 +707,22 @@ def require_agent_token(f):
         token = request.headers.get("x-agent-token")
         if not token or not hmac.compare_digest(token, AGENT_AUTH_TOKEN):
             return {"error": "Unauthorized"}, 401
+        return f(*args, **kwargs)
+    return decorated
+
+def require_admin_or_agent_token(f):
+    """Session admin (dashboard) OU token agent (curl / PowerShell d'installation)."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get("x-agent-token")
+        if token and hmac.compare_digest(token, AGENT_AUTH_TOKEN):
+            return f(*args, **kwargs)
+        user, err = _get_dashboard_user()
+        if not user:
+            return jsonify({"error": err or "Unauthorized"}), 401
+        if user["role"] != "admin":
+            return jsonify({"error": "Accès réservé aux administrateurs"}), 403
+        request.dashboard_user = user
         return f(*args, **kwargs)
     return decorated
 
@@ -897,6 +920,34 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
             })
     return vulns
 
+# ─── Logiciels à mettre à jour (rapporté par les agents) ─────────────────────
+def _sanitize_update_check(raw):
+    """Valide/borne le bloc `update_check` envoyé par l'agent (entrée non fiable)."""
+    if not isinstance(raw, dict):
+        return None
+    def _s(v, n=200):
+        return None if v is None else str(v)[:n]
+    items = []
+    for it in (raw.get("items") or [])[:500]:
+        if isinstance(it, dict) and it.get("name"):
+            items.append({"name": _s(it.get("name")), "id": _s(it.get("id")),
+                          "installed": _s(it.get("installed")),
+                          "available": _s(it.get("available"))})
+    ok = bool(raw.get("ok"))
+    count = len(items) if ok else None
+    if ok and isinstance(raw.get("count"), int) and raw["count"] >= len(items):
+        count = raw["count"]           # l'agent peut avoir tronqué la liste
+    age = raw.get("cache_age_hours")
+    return {
+        "manager":         _s(raw.get("manager"), 32),
+        "ok":              ok,
+        "error":           _s(raw.get("error")),
+        "count":           count,
+        "checked_at":      _s(raw.get("checked_at"), 40),
+        "cache_age_hours": age if isinstance(age, (int, float)) else None,
+        "items":           items,
+    }
+
 # ─── Endpoints agents ─────────────────────────────────────────────────────────
 @app.route('/api/agents/report', methods=['POST'])
 @require_agent_token
@@ -910,6 +961,7 @@ def agent_report():
     compliance    = data.get("compliance", {})          # NEW: agent-sent compliance data
     ip_addresses  = data.get("ip_addresses", [])        # NEW: agent's own IPs
     agent_version = data.get("agent_version", "")        # NEW: version reportée
+    update_check  = _sanitize_update_check(data.get("update_check"))
     remote_ip     = request.remote_addr or ""           # server-observed IP as fallback
 
     # Fusion IP : on prend ce que l'agent envoie + l'IP source vue par Flask.
@@ -965,6 +1017,9 @@ def agent_report():
         "ip_addresses":     display_ips,
         "compliance":       compliance,
     }
+    # Absent (ancien agent) → on ne l'écrit pas, pour ne pas effacer le dernier résultat connu.
+    if update_check is not None:
+        report["update_check"] = update_check
 
     with db_lock:
         # On garde l'historique et on met à jour le "dernier rapport" de ce serveur
@@ -1170,7 +1225,7 @@ def agent_software(hostname):
 
 # ─── Téléchargement agent pré-configuré ───────────────────────────────────────
 @app.route('/api/download/agent/<target_os>', methods=['GET'])
-@require_admin
+@require_admin_or_agent_token
 def download_agent(target_os):
     """Génère et retourne un package agent pré-configuré pour Linux, macOS ou Windows."""
     if target_os not in ("linux", "macos", "windows"):
@@ -1866,6 +1921,54 @@ def compliance_results():
     _COMPLIANCE_CACHE["data"]        = results
     _COMPLIANCE_CACHE["computed_at"] = now
     return jsonify(results), 200
+
+# ─── Mises à jour logicielles ────────────────────────────────────────────────
+STALE_CACHE_HOURS = 24 * 7   # cache apt > 7 jours : la liste peut être périmée
+
+@app.route('/api/updates', methods=['GET'])
+@require_role("admin", "inspection_logs", "codir")
+def updates_overview():
+    """Par serveur : logiciels dont une version plus récente est disponible."""
+    agents = list(mongo.db.agents.find(
+        {}, {"_id": 0, "hostname": 1, "os": 1, "release": 1, "update_check": 1}
+    ))
+    rows, outdated_hosts, checked, unavailable, total_pkgs = [], 0, 0, 0, 0
+    for a in agents:
+        uc = a.get("update_check")
+        if not uc:
+            status = "unknown"      # ancien agent : n'envoie pas encore ce rapport
+        elif not uc.get("ok"):
+            status = "unavailable"
+            unavailable += 1
+        else:
+            checked += 1
+            n = uc.get("count") or 0
+            total_pkgs += n
+            status = "outdated" if n > 0 else "up_to_date"
+            if n > 0:
+                outdated_hosts += 1
+        age = (uc or {}).get("cache_age_hours")
+        rows.append({
+            "hostname":        a["hostname"],
+            "os":              a.get("os", ""),
+            "release":         a.get("release", ""),
+            "status":          status,
+            "manager":         (uc or {}).get("manager"),
+            "count":           (uc or {}).get("count"),
+            "error":           (uc or {}).get("error"),
+            "checked_at":      (uc or {}).get("checked_at"),
+            "cache_age_hours": age,
+            "stale_cache":     bool(age is not None and age > STALE_CACHE_HOURS),
+            "items":           (uc or {}).get("items", []),
+        })
+    order = {"outdated": 0, "unavailable": 1, "unknown": 2, "up_to_date": 3}
+    rows.sort(key=lambda r: (order[r["status"]], -(r["count"] or 0), r["hostname"].lower()))
+    return jsonify({
+        "summary": {"agents": len(rows), "checked": checked, "outdated_hosts": outdated_hosts,
+                    "up_to_date_hosts": checked - outdated_hosts, "unavailable": unavailable,
+                    "total_outdated_packages": total_pkgs},
+        "agents": rows,
+    }), 200
 
 # ─── Admin dashboard ────────────────────────────────────────────────────────────────────
 @app.route('/admin')

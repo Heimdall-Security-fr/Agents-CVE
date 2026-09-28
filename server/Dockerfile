@@ -3,6 +3,7 @@ FROM cdrx/pyinstaller-windows:python3 AS win-builder
 
 WORKDIR /src
 COPY windows_agent_tray.py .
+COPY server/static/heimdall-logo.png .
 
 RUN pip install --quiet "requests" "pillow" "pystray>=0.19.5" "pyinstaller>=5.13"
 
@@ -21,6 +22,7 @@ RUN pyinstaller \
     --hidden-import tkinter.messagebox \
     --collect-all pystray \
     --collect-all PIL \
+    --add-data "heimdall-logo.png;." \
     windows_agent_tray.py
 
 # ── Stage 2 : Serveur agent (embarque l'exe compilé) ──────────────────────────────────

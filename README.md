@@ -152,6 +152,10 @@ http://<serveur>:4000/static/heimdall-agent.exe
 Placez `heimdall-agent.exe` et `agent.conf` dans le même dossier, puis lancez l'exe :
 une icône apparaît dans la barre système (configuration et état accessibles via le menu).
 
+Dans **Configuration** (clic droit sur l'icône), vous pouvez aussi choisir l'**apparence**
+(sombre, clair ou automatique selon le thème Windows) et activer le **démarrage avec Windows**.
+Le choix est enregistré dans `agent.conf` (`[ui] theme = dark | light | auto`).
+
 Pour compiler l'exe vous-même (PowerShell admin) :
 
 ```powershell
@@ -185,6 +189,17 @@ Options utiles :
 
 L'agent gère l'**auto-update** (récupération de la dernière version auprès du serveur)
 et la **résilience réseau** (backoff exponentiel si le serveur est injoignable).
+
+---
+
+## ✅ 3. Conformité et mises à jour
+
+Le dashboard évalue la configuration de chaque machine (pare-feu, SSH, mots de passe,
+TLS…) selon des règles modifiables, et liste les logiciels dont une version plus récente
+est disponible (winget, apt, dnf, yum, zypper, brew).
+
+📘 **[Guide utilisateur — Conformité et mises à jour](docs/GUIDE_CONFORMITE.md)** :
+fonctionnement, liste des règles, règles personnalisées, droits nécessaires, dépannage.
 
 ---
 

@@ -128,6 +128,7 @@ DEFAULT_CONFIG = {
     "main_server": {"host": "127.0.0.1", "port": "4000", "token": "changeme-secret-token"},
     "api":         {"cve_api_key": ""},
     "agent":       {"interval_minutes": "60", "port_scan": "false"},
+    "ui":          {"theme": "dark"},
 }
 
 
@@ -165,17 +166,104 @@ def load_config() -> configparser.ConfigParser:
     state.config = cfg
     return cfg
 
-def save_config(host: str, port: str, token: str, interval: str, port_scan: bool, cve_api_key: str = ""):
+def save_config(host: str, port: str, token: str, interval: str, port_scan: bool,
+                cve_api_key: str = "", theme: str = None):
     path = os.path.join(_LOG_DIR, "agent.conf")
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Thème : valeur fournie, sinon celle déjà en config, sinon sombre.
+    if theme is None:
+        theme = (state.config.get("ui", "theme", fallback="dark")
+                 if state.config is not None else "dark")
     cfg = configparser.ConfigParser()
     cfg["main_server"] = {"host": host.strip(), "port": port.strip(), "token": token.strip()}
     cfg["api"]         = {"cve_api_key": cve_api_key.strip()}
     cfg["agent"]       = {"interval_minutes": interval.strip(), "port_scan": "true" if port_scan else "false"}
+    if state.config is not None and state.config.has_option("agent", "update_check_hours"):
+        cfg["agent"]["update_check_hours"] = state.config.get("agent", "update_check_hours")
+    cfg["ui"]          = {"theme": theme}
     with open(path, "w", encoding="utf-8") as f:
         cfg.write(f)
     state.config = cfg
     logger.info(f"Configuration sauvegardée → {path}")
+
+# ─── Thèmes & logo ────────────────────────────────────────────────────────────
+THEMES = {
+    "dark": dict(bg="#0f172a", card="#1e293b", input="#334155", fg="#e2e8f0",
+                 muted="#94a3b8", accent="#3b82f6", accent_fg="white", title="#60a5fa",
+                 ok="#4ade80", err="#f87171", warn="#fb923c",
+                 btn_bg="#334155", btn_fg="#e2e8f0"),
+    "light": dict(bg="#f1f5f9", card="#ffffff", input="#e2e8f0", fg="#0f172a",
+                  muted="#475569", accent="#2563eb", accent_fg="white", title="#1d4ed8",
+                  ok="#16a34a", err="#dc2626", warn="#ea580c",
+                  btn_bg="#e2e8f0", btn_fg="#0f172a"),
+}
+THEME_LABELS = {"dark": "Sombre", "light": "Clair", "auto": "Système (auto)"}
+
+def _system_prefers_light() -> bool:
+    """True si Windows est réglé sur le mode d'application clair."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 1
+    except Exception:
+        return False
+
+def _theme_setting() -> str:
+    cfg = state.config
+    name = cfg.get("ui", "theme", fallback="dark") if cfg is not None else "dark"
+    return name if name in THEME_LABELS else "dark"
+
+def _pal(setting: str = None) -> dict:
+    """Palette de couleurs effective (résout le mode « auto »)."""
+    name = setting or _theme_setting()
+    if name == "auto":
+        name = "light" if _system_prefers_light() else "dark"
+    return THEMES.get(name, THEMES["dark"])
+
+def _logo_image(height: int, eye_only: bool = False):
+    """Logo Heimdall (PIL) redimensionné à `height` px, ou None s'il est introuvable.
+    eye_only : ne garde que l'œil (sans le texte), lisible en petit format."""
+    if not TRAY_OK:
+        return None
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (os.path.join(getattr(sys, "_MEIPASS", ""), "heimdall-logo.png"),
+              os.path.join(_EXE_DIR, "heimdall-logo.png"),
+              os.path.join(here, "heimdall-logo.png"),
+              os.path.join(here, "server", "static", "heimdall-logo.png")):
+        if os.path.isfile(p):
+            try:
+                img = Image.open(p).convert("RGBA")
+                if eye_only:
+                    img = img.crop((0, 0, img.width, int(img.height * 0.70)))
+                w = max(1, round(img.width * height / img.height))
+                return img.resize((w, height), Image.LANCZOS)
+            except Exception:
+                return None
+    return None
+
+def _logo_photo(height: int):
+    """Logo au format tk.PhotoImage (à conserver dans une variable), ou None."""
+    img = _logo_image(height)
+    if img is None or not TKINTER_OK:
+        return None
+    try:
+        import io, base64
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
+    except Exception:
+        return None
+
+def _apply_window_icon(win):
+    """Icône de la barre de titre = logo Heimdall (si disponible)."""
+    photo = _logo_photo(32)
+    if photo is not None:
+        win._heimdall_icon = photo  # référence, sinon Tk la libère
+        try:
+            win.iconphoto(False, photo)
+        except Exception:
+            pass
 
 # ─── Collecte Windows ─────────────────────────────────────────────────────────
 def _normalize_product_name(name: str) -> str:
@@ -572,6 +660,76 @@ def _collect_custom_rules() -> dict:
             logger.debug(f"Collecteur '{rid}' échoué : {e}")
     return out
 
+# ─── Logiciels à mettre à jour (winget) ──────────────────────────────────────
+# `winget upgrade` liste les applications dont une version plus récente existe.
+# L'agent ne fait que lire : il n'installe rien. Absent (winget non installé,
+# Windows Server ancien…) → la vérification est simplement indiquée « non disponible ».
+_UPDATE_CACHE = {"at": 0.0, "data": None}
+_MAX_UPDATE_ITEMS = 500
+
+def _parse_winget_table(text: str) -> list:
+    """Analyse la table de `winget upgrade`. Indépendant de la langue : les colonnes
+    sont repérées d'après la ligne d'en-tête située juste au-dessus des tirets."""
+    lines = [l.rstrip() for l in text.replace("\r", "\n").split("\n")]
+    sep = next((i for i, l in enumerate(lines) if re.fullmatch(r"-{5,}", l.strip())), None)
+    if not sep:
+        return []
+    starts = [m.start() for m in re.finditer(r"\S+(?: \S+)*", lines[sep - 1])]
+    if len(starts) < 4:            # Nom, Id, Version, Disponible (Source facultative)
+        return []
+    items = []
+    for line in lines[sep + 1:]:
+        if not line.strip():
+            break
+        if re.match(r"^\s*\d+\s+\S+", line) and len(line.split()) <= 6:
+            break                  # ligne récapitulative « 12 mises à niveau disponibles »
+        cells = [line[s:(starts[i + 1] if i + 1 < len(starts) else None)].strip()
+                 for i, s in enumerate(starts)]
+        if cells[0] and cells[3]:
+            items.append({"name": cells[0], "id": cells[1],
+                          "installed": cells[2], "available": cells[3]})
+    return items
+
+def collect_outdated_software() -> dict:
+    """Résultat : {manager, ok, count, items[], checked_at, error?}. Le résultat est
+    réutilisé pendant `update_check_hours` (défaut 6 h, 0 = désactivé)."""
+    hours = 6.0
+    if state.config is not None:
+        try:
+            hours = float(state.config.get("agent", "update_check_hours", fallback="6"))
+        except ValueError:
+            pass
+    if hours <= 0:
+        return {"manager": None, "ok": False, "error": "désactivé", "count": None, "items": []}
+    if _UPDATE_CACHE["data"] and time.time() - _UPDATE_CACHE["at"] < hours * 3600:
+        return _UPDATE_CACHE["data"]
+
+    result = {"manager": "winget", "ok": False, "error": "winget indisponible",
+              "count": None, "items": []}
+    try:
+        r = subprocess.run(
+            ["winget", "upgrade", "--include-unknown", "--accept-source-agreements"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        items = _parse_winget_table(r.stdout or "")
+        # « Aucune mise à jour applicable » (0x8A15002B) et « aucun paquet correspondant »
+        # (0x8A150014) sont des codes de retour ≠ 0 mais signifient : tout est à jour.
+        rc = (r.returncode or 0) & 0xFFFFFFFF
+        if items or rc in (0, 0x8A15002B, 0x8A150014) or re.search(r"-{5,}", r.stdout or ""):
+            result = {"manager": "winget", "ok": True, "count": len(items),
+                      "items": items[:_MAX_UPDATE_ITEMS],
+                      "checked_at": datetime.now().isoformat()}
+        else:
+            result["error"] = ((r.stderr or r.stdout or "").strip().splitlines() or ["sortie vide"])[0][:200]
+    except FileNotFoundError:
+        pass
+    except subprocess.TimeoutExpired:
+        result["error"] = "délai dépassé"
+    except Exception as e:
+        result["error"] = str(e)[:200]
+    _UPDATE_CACHE.update(at=time.time(), data=result)
+    return result
+
 # ─── Envoi du rapport ────────────────────────────────────────────────────────
 def send_report(max_attempts: int = 6):
     """Envoie le rapport avec retry exponentiel. Si le serveur est indisponible,
@@ -595,6 +753,9 @@ def send_report(max_attempts: int = 6):
     open_ports = scan_ports() if do_ports else []
     compliance = _collect_compliance()
     ip_addresses = _get_local_ips()
+    update_check = collect_outdated_software()
+    if update_check.get("ok"):
+        compliance.setdefault("pending_updates", update_check["count"])
 
     payload = {
         "hostname":      platform.node(),
@@ -607,6 +768,7 @@ def send_report(max_attempts: int = 6):
         "open_ports":    open_ports,
         "cve_api_key":   cve_key,
         "compliance":    compliance,
+        "update_check":  update_check,
         "ip_addresses":  ip_addresses,
     }
 
@@ -911,15 +1073,23 @@ def _make_icon(connected: bool = False, has_vulns: bool = False) -> "Image.Image
     img = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
     d   = ImageDraw.Draw(img)
 
-    # Bouclier
-    shield_col = (20, 90, 200) if connected else (80, 80, 80)
-    pts = [(sz // 2, 3), (sz - 5, sz // 5), (sz - 5, sz // 2),
-           (sz // 2, sz - 3), (5, sz // 2), (5, sz // 5)]
-    d.polygon(pts, fill=shield_col, outline=(180, 200, 255, 140))
-
-    # H (Heimdall)
-    for x1, y1, x2, y2 in [(18, 18, 18, 46), (46, 18, 46, 46), (18, 32, 46, 32)]:
-        d.line([(x1, y1), (x2, y2)], fill="white", width=5)
+    logo = _logo_image(sz - 8, eye_only=True)
+    if logo is not None:
+        # Logo Heimdall (œil), centré ; grisé tant que l'agent n'est pas connecté.
+        if logo.width > sz:
+            logo = logo.resize((sz, max(1, round(logo.height * sz / logo.width))), Image.LANCZOS)
+        if not connected:
+            alpha = logo.getchannel("A")
+            logo = Image.merge("RGBA", (*logo.convert("L").split() * 3, alpha))
+        img.paste(logo, ((sz - logo.width) // 2, (sz - logo.height) // 2), logo)
+    else:
+        # Repli si le logo est introuvable : bouclier + H
+        shield_col = (20, 90, 200) if connected else (80, 80, 80)
+        pts = [(sz // 2, 3), (sz - 5, sz // 5), (sz - 5, sz // 2),
+               (sz // 2, sz - 3), (5, sz // 2), (5, sz // 5)]
+        d.polygon(pts, fill=shield_col, outline=(180, 200, 255, 140))
+        for x1, y1, x2, y2 in [(18, 18, 18, 46), (46, 18, 46, 46), (18, 32, 46, 32)]:
+            d.line([(x1, y1), (x2, y2)], fill="white", width=5)
 
     # Badge statut (bas droite)
     badge = (240, 160, 0) if has_vulns else ((0, 200, 60) if connected else (200, 60, 60))
@@ -1047,11 +1217,13 @@ def _on_uninstall(_icon=None, _item=None):
 
 # ─── Dialogue de configuration ────────────────────────────────────────────────
 def _open_config_dialog():
+    P = _pal()
     dlg = tk.Toplevel(state.tk_root)
     dlg.title("Heimdall — Configuration")
-    dlg.geometry("460x370")
+    dlg.geometry("480x520")
     dlg.resizable(False, False)
-    dlg.configure(bg="#1e293b")
+    dlg.configure(bg=P["card"])
+    _apply_window_icon(dlg)
     dlg.grab_set()
     dlg.focus_force()
     dlg.lift()
@@ -1060,14 +1232,21 @@ def _open_config_dialog():
     dlg.update_idletasks()
     sw = dlg.winfo_screenwidth()
     sh = dlg.winfo_screenheight()
-    dlg.geometry(f"+{(sw - 460) // 2}+{(sh - 370) // 2}")
+    dlg.geometry(f"+{(sw - 480) // 2}+{(sh - 520) // 2}")
 
     cfg = state.config or configparser.ConfigParser()
 
-    tk.Label(dlg, text="[ H ]  Heimdall Security — Configuration Agent",
-             bg="#0f172a", fg="#60a5fa", font=("Segoe UI", 11, "bold"), pady=10).pack(fill="x")
+    header = tk.Frame(dlg, bg=P["bg"])
+    header.pack(fill="x")
+    logo = _logo_photo(44)
+    if logo is not None:
+        dlg._heimdall_logo = logo
+        tk.Label(header, image=logo, bg=P["bg"]).pack(side="left", padx=(16, 8), pady=8)
+    tk.Label(header, text="Heimdall Security — Configuration Agent",
+             bg=P["bg"], fg=P["title"], font=("Segoe UI", 11, "bold"),
+             pady=10).pack(side="left", fill="x", expand=True, anchor="w")
 
-    frame = tk.Frame(dlg, bg="#1e293b", padx=25, pady=12)
+    frame = tk.Frame(dlg, bg=P["card"], padx=25, pady=12)
     frame.pack(fill="both", expand=True)
 
     fields = [
@@ -1080,20 +1259,38 @@ def _open_config_dialog():
     entries = {}
 
     for i, (label, sec, key, val) in enumerate(fields):
-        tk.Label(frame, text=label, bg="#1e293b", fg="#94a3b8",
+        tk.Label(frame, text=label, bg=P["card"], fg=P["muted"],
                  font=("Segoe UI", 9)).grid(row=i, column=0, sticky="w", pady=7)
-        e = tk.Entry(frame, bg="#334155", fg="#e2e8f0", font=("Segoe UI", 10),
-                     bd=0, relief="flat", insertbackground="white", width=30,
+        e = tk.Entry(frame, bg=P["input"], fg=P["fg"], font=("Segoe UI", 10),
+                     bd=0, relief="flat", insertbackground=P["fg"], width=30,
                      show="*" if key == "token" else "")
         e.insert(0, val)
         e.grid(row=i, column=1, padx=(12, 0), pady=7, sticky="ew")
         entries[(sec, key)] = e
 
+    def _check(text, var, row):
+        tk.Checkbutton(frame, text=text, variable=var, bg=P["card"], fg=P["muted"],
+                       activebackground=P["card"], activeforeground=P["fg"],
+                       selectcolor=P["input"], font=("Segoe UI", 9)
+                       ).grid(row=row, column=0, columnspan=2, sticky="w", pady=5)
+
     ps_var = tk.BooleanVar(value=cfg.getboolean("agent", "port_scan", fallback=False))
-    tk.Checkbutton(frame, text="Activer le scan de ports réseau",
-                   variable=ps_var, bg="#1e293b", fg="#94a3b8",
-                   activebackground="#1e293b", selectcolor="#334155",
-                   font=("Segoe UI", 9)).grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=7)
+    _check("Activer le scan de ports réseau", ps_var, len(fields))
+
+    autostart_var = tk.BooleanVar(value=_is_autostart_enabled())
+    _check("Démarrer automatiquement avec Windows", autostart_var, len(fields) + 1)
+
+    # Apparence : sombre / clair / suivre le thème Windows
+    theme_row = len(fields) + 2
+    tk.Label(frame, text="Apparence", bg=P["card"], fg=P["muted"],
+             font=("Segoe UI", 9)).grid(row=theme_row, column=0, sticky="w", pady=7)
+    theme_var = tk.StringVar(value=THEME_LABELS[_theme_setting()])
+    theme_menu = tk.OptionMenu(frame, theme_var, *THEME_LABELS.values())
+    theme_menu.config(bg=P["input"], fg=P["fg"], activebackground=P["input"],
+                      activeforeground=P["fg"], relief="flat", bd=0,
+                      highlightthickness=0, font=("Segoe UI", 10), anchor="w")
+    theme_menu["menu"].config(bg=P["input"], fg=P["fg"], font=("Segoe UI", 10))
+    theme_menu.grid(row=theme_row, column=1, padx=(12, 0), pady=7, sticky="ew")
 
     frame.columnconfigure(1, weight=1)
 
@@ -1111,16 +1308,20 @@ def _open_config_dialog():
         except ValueError:
             _dlg_error("Erreur", "Le port doit être un entier.", parent=dlg)
             return
-        save_config(h, p, t, iv, ps_var.get(), ck)
-        _dlg_info("Sauvegardd", "Configuration mise \u00e0 jour.\nElle sera utilis\u00e9e d\u00e8s le prochain scan.", parent=dlg)
+        theme_key = next((k for k, v in THEME_LABELS.items() if v == theme_var.get()), "dark")
+        save_config(h, p, t, iv, ps_var.get(), ck, theme=theme_key)
+        if autostart_var.get() != _is_autostart_enabled():
+            _set_autostart(autostart_var.get())
+        _dlg_info("Sauvegarde", "Configuration mise \u00e0 jour.\nElle sera utilis\u00e9e d\u00e8s le prochain scan.\n"
+                                "L'apparence s'applique \u00e0 la prochaine ouverture de cette fen\u00eatre.", parent=dlg)
         dlg.destroy()
 
-    btn_bar = tk.Frame(dlg, bg="#1e293b", padx=25, pady=10)
+    btn_bar = tk.Frame(dlg, bg=P["card"], padx=25, pady=10)
     btn_bar.pack(fill="x", side="bottom")
-    tk.Button(btn_bar, text="Sauvegarder", bg="#3b82f6", fg="white",
+    tk.Button(btn_bar, text="Sauvegarder", bg=P["accent"], fg=P["accent_fg"],
               font=("Segoe UI", 10, "bold"), relief="flat", padx=20, pady=7,
               cursor="hand2", command=_save).pack(side="right", padx=(6, 0))
-    tk.Button(btn_bar, text="Annuler", bg="#334155", fg="#e2e8f0",
+    tk.Button(btn_bar, text="Annuler", bg=P["btn_bg"], fg=P["btn_fg"],
               font=("Segoe UI", 10), relief="flat", padx=20, pady=7,
               cursor="hand2", command=dlg.destroy).pack(side="right")
 
@@ -1130,25 +1331,32 @@ class SetupWizard(tk.Toplevel):
     """Wizard de configuration — Toplevel (jamais un second tk.Tk)."""
     def __init__(self, parent, default_host="", default_port="4000", default_token=""):
         super().__init__(parent)
+        P = self._P = _pal()
         self.title("Heimdall Agent — Installation")
-        self.geometry("480x500")
+        self.geometry("480x640")
         self.resizable(False, False)
-        self.configure(bg="#0f172a")
+        self.configure(bg=P["bg"])
+        _apply_window_icon(self)
         self.result = False
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Centrage
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"+{(sw - 480) // 2}+{(sh - 500) // 2}")
+        self.geometry(f"+{(sw - 480) // 2}+{(sh - 640) // 2}")
 
-        tk.Label(self, text="[ H ]", font=("Segoe UI", 42, "bold"), bg="#0f172a", fg="#3b82f6").pack(pady=(22, 4))
+        self._logo = _logo_photo(96)
+        if self._logo is not None:
+            tk.Label(self, image=self._logo, bg=P["bg"]).pack(pady=(18, 4))
+        else:
+            tk.Label(self, text="HEIMDALL", font=("Segoe UI", 28, "bold"),
+                     bg=P["bg"], fg=P["accent"]).pack(pady=(22, 4))
         tk.Label(self, text="Heimdall Security Agent",
-                 bg="#0f172a", fg="white", font=("Segoe UI", 16, "bold")).pack()
+                 bg=P["bg"], fg=P["fg"], font=("Segoe UI", 16, "bold")).pack()
         tk.Label(self, text="Configurez la connexion au serveur Heimdall",
-                 bg="#0f172a", fg="#94a3b8", font=("Segoe UI", 10)).pack(pady=(4, 16))
+                 bg=P["bg"], fg=P["muted"], font=("Segoe UI", 10)).pack(pady=(4, 12))
 
-        card = tk.Frame(self, bg="#1e293b", padx=28, pady=22)
+        card = tk.Frame(self, bg=P["card"], padx=28, pady=18)
         card.pack(fill="both", expand=True, padx=22)
 
         rows = [
@@ -1160,39 +1368,49 @@ class SetupWizard(tk.Toplevel):
         ]
         self._entries = []
         for i, (lbl, val, secret) in enumerate(rows):
-            tk.Label(card, text=lbl, bg="#1e293b", fg="#94a3b8",
-                     font=("Segoe UI", 9)).grid(row=i, column=0, sticky="w", pady=9)
-            e = tk.Entry(card, bg="#334155", fg="white", font=("Segoe UI", 11),
-                         bd=0, relief="flat", insertbackground="white", width=28,
+            tk.Label(card, text=lbl, bg=P["card"], fg=P["muted"],
+                     font=("Segoe UI", 9)).grid(row=i, column=0, sticky="w", pady=8)
+            e = tk.Entry(card, bg=P["input"], fg=P["fg"], font=("Segoe UI", 11),
+                         bd=0, relief="flat", insertbackground=P["fg"], width=28,
                          show="*" if secret else "")
             e.insert(0, val)
-            e.grid(row=i, column=1, padx=(16, 0), sticky="ew", pady=9)
+            e.grid(row=i, column=1, padx=(16, 0), sticky="ew", pady=8)
             self._entries.append(e)
 
+        def _check(text, var, row):
+            tk.Checkbutton(card, text=text, variable=var, bg=P["card"], fg=P["muted"],
+                           activebackground=P["card"], activeforeground=P["fg"],
+                           selectcolor=P["input"], font=("Segoe UI", 9)
+                           ).grid(row=row, column=0, columnspan=2, sticky="w", pady=4)
+
         self._ps_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(card, text="Activer le scan de ports réseau",
-                       variable=self._ps_var, bg="#1e293b", fg="#94a3b8",
-                       activebackground="#1e293b", selectcolor="#334155",
-                       font=("Segoe UI", 9)).grid(row=len(rows), column=0, columnspan=2, sticky="w", pady=9)
+        _check("Activer le scan de ports réseau", self._ps_var, len(rows))
         self._autostart_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(card, text="Démarrer automatiquement avec Windows",
-                       variable=self._autostart_var, bg="#1e293b", fg="#94a3b8",
-                       activebackground="#1e293b", selectcolor="#334155",
-                       font=("Segoe UI", 9)).grid(row=len(rows) + 1, column=0, columnspan=2, sticky="w", pady=4)
+        _check("Démarrer automatiquement avec Windows", self._autostart_var, len(rows) + 1)
+
+        tk.Label(card, text="Apparence", bg=P["card"], fg=P["muted"],
+                 font=("Segoe UI", 9)).grid(row=len(rows) + 2, column=0, sticky="w", pady=8)
+        self._theme_var = tk.StringVar(value=THEME_LABELS[_theme_setting()])
+        theme_menu = tk.OptionMenu(card, self._theme_var, *THEME_LABELS.values())
+        theme_menu.config(bg=P["input"], fg=P["fg"], activebackground=P["input"],
+                          activeforeground=P["fg"], relief="flat", bd=0,
+                          highlightthickness=0, font=("Segoe UI", 10), anchor="w")
+        theme_menu["menu"].config(bg=P["input"], fg=P["fg"], font=("Segoe UI", 10))
+        theme_menu.grid(row=len(rows) + 2, column=1, padx=(16, 0), pady=8, sticky="ew")
         card.columnconfigure(1, weight=1)
 
-        self._status_lbl = tk.Label(self, text="", bg="#0f172a", fg="#94a3b8",
+        self._status_lbl = tk.Label(self, text="", bg=P["bg"], fg=P["muted"],
                                     font=("Segoe UI", 9))
         self._status_lbl.pack(pady=(8, 0))
 
-        btn_frame = tk.Frame(self, bg="#0f172a")
+        btn_frame = tk.Frame(self, bg=P["bg"])
         btn_frame.pack(pady=12)
         tk.Button(btn_frame, text="  Tester la connexion  ",
-                  bg="#334155", fg="#e2e8f0", font=("Segoe UI", 10),
+                  bg=P["btn_bg"], fg=P["btn_fg"], font=("Segoe UI", 10),
                   relief="flat", padx=0, pady=9, cursor="hand2",
                   command=self._test).pack(side="left", padx=(0, 8))
         tk.Button(btn_frame, text="  Installer et démarrer  ",
-                  bg="#3b82f6", fg="white", font=("Segoe UI", 11, "bold"),
+                  bg=P["accent"], fg=P["accent_fg"], font=("Segoe UI", 11, "bold"),
                   relief="flat", padx=0, pady=9, cursor="hand2",
                   command=self._install).pack(side="left")
 
@@ -1202,7 +1420,8 @@ class SetupWizard(tk.Toplevel):
     def _test(self):
         fields = self._get_fields()
         host, port, token = fields[0], fields[1], fields[2]
-        self._status_lbl.config(text="Test en cours...", fg="#94a3b8")
+        P = self._P
+        self._status_lbl.config(text="Test en cours...", fg=P["muted"])
         self.update()
         try:
             r = requests.get(
@@ -1211,15 +1430,15 @@ class SetupWizard(tk.Toplevel):
                 timeout=5
             )
             if r.status_code == 200:
-                self._status_lbl.config(text="Connexion OK — token valide", fg="#4ade80")
+                self._status_lbl.config(text="Connexion OK — token valide", fg=P["ok"])
             elif r.status_code == 401:
-                self._status_lbl.config(text="Token incorrect (401 Unauthorized)", fg="#f87171")
+                self._status_lbl.config(text="Token incorrect (401 Unauthorized)", fg=P["err"])
             else:
-                self._status_lbl.config(text=f"Serveur repond {r.status_code}", fg="#fb923c")
+                self._status_lbl.config(text=f"Serveur repond {r.status_code}", fg=P["warn"])
         except requests.exceptions.ConnectionError:
-            self._status_lbl.config(text=f"Serveur inaccessible ({host}:{port})", fg="#f87171")
+            self._status_lbl.config(text=f"Serveur inaccessible ({host}:{port})", fg=P["err"])
         except Exception as e:
-            self._status_lbl.config(text=f"Erreur : {str(e)[:50]}", fg="#f87171")
+            self._status_lbl.config(text=f"Erreur : {str(e)[:50]}", fg=P["err"])
 
     def _install(self):
         host, port, token, interval, cve_key = self._get_fields()
@@ -1231,7 +1450,8 @@ class SetupWizard(tk.Toplevel):
         except ValueError:
             _dlg_error("Erreur", "Le port doit être un entier.", parent=self)
             return
-        save_config(host, port, token, interval, self._ps_var.get(), cve_key)
+        theme_key = next((k for k, v in THEME_LABELS.items() if v == self._theme_var.get()), "dark")
+        save_config(host, port, token, interval, self._ps_var.get(), cve_key, theme=theme_key)
         _set_autostart(getattr(self, "_autostart_var", None) and self._autostart_var.get())
         self.result = True
         self.destroy()

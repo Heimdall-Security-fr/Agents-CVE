@@ -563,6 +563,141 @@ def collect_custom_rules(config) -> dict:
     return out
 
 
+# ─── Logiciels à mettre à jour (versions installées vs disponibles) ───────────
+# On interroge le gestionnaire de paquets local (apt / dnf / yum / zypper / brew) :
+# c'est la source la plus fiable — pas de correspondance de noms approximative,
+# et l'agent ne modifie rien (aucun `apt update`, aucune installation).
+# Limite : la liste dépend du cache local du gestionnaire (cf. cache_age_hours).
+_UPDATE_CACHE = {"at": 0.0, "data": None}
+_MAX_UPDATE_ITEMS = 500
+_LC_ALL_C = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+
+
+def _apt_cache_age_hours():
+    for p in ("/var/lib/apt/periodic/update-success-stamp",
+              "/var/cache/apt/pkgcache.bin", "/var/lib/apt/lists"):
+        try:
+            return round((time.time() - os.path.getmtime(p)) / 3600, 1)
+        except OSError:
+            continue
+    return None
+
+
+def _outdated_apt(_installed):
+    r = subprocess.run(["apt", "list", "--upgradable"], capture_output=True,
+                       text=True, timeout=90, env=_LC_ALL_C)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "apt list a échoué").strip()[:200])
+    items = []
+    # ex : nginx/jammy-updates 1.24.0-2 amd64 [upgradable from: 1.18.0-6]
+    rx = re.compile(r'^([^/\s]+)/\S+\s+(\S+)\s+\S+\s+\[upgradable from:\s*([^\]]+)\]')
+    for line in r.stdout.splitlines():
+        m = rx.match(line)
+        if m:
+            items.append({"name": m.group(1), "installed": m.group(3).strip(),
+                          "available": m.group(2)})
+    return items, {"cache_age_hours": _apt_cache_age_hours()}
+
+
+def _outdated_dnf(installed, binary="dnf"):
+    r = subprocess.run([binary, "-q", "check-update"], capture_output=True,
+                       text=True, timeout=180, env=_LC_ALL_C)
+    if r.returncode not in (0, 100):        # 100 = des mises à jour existent
+        raise RuntimeError((r.stderr or f"{binary} check-update a échoué").strip()[:200])
+    items = []
+    for line in r.stdout.splitlines():
+        if line.lower().startswith("obsoleting"):
+            break
+        parts = line.split()
+        if len(parts) >= 3 and "." in parts[0]:
+            name = parts[0].rsplit(".", 1)[0]
+            items.append({"name": name, "installed": installed.get(name),
+                          "available": parts[1]})
+    return items, {}
+
+
+def _outdated_zypper(installed):
+    r = subprocess.run(["zypper", "--quiet", "--non-interactive", "list-updates"],
+                       capture_output=True, text=True, timeout=180, env=_LC_ALL_C)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "zypper a échoué").strip()[:200])
+    items = []
+    for line in r.stdout.splitlines():
+        cols = [c.strip() for c in line.split("|")]
+        # S | Repository | Name | Current Version | Available Version | Arch
+        if len(cols) >= 5 and cols[0] in ("v", "") and cols[2] and cols[2] != "Name":
+            items.append({"name": cols[2], "installed": cols[3], "available": cols[4]})
+    return items, {}
+
+
+def _outdated_brew(_installed):
+    r = subprocess.run(["brew", "outdated", "--json=v2"], capture_output=True,
+                       text=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "brew outdated a échoué").strip()[:200])
+    import json as _json
+    doc = _json.loads(r.stdout or "{}")
+    items = []
+    for kind in ("formulae", "casks"):
+        for p in doc.get(kind, []):
+            inst = p.get("installed_versions")
+            if isinstance(inst, list):
+                inst = ", ".join(inst)
+            items.append({"name": p.get("name"), "installed": inst,
+                          "available": p.get("current_version")})
+    return items, {}
+
+
+def _installed_versions(software_list) -> dict:
+    return {s.get("product"): s.get("version") for s in software_list or []
+            if s.get("product")}
+
+
+def collect_outdated_software(software_list, config=None) -> dict:
+    """Résultat : {manager, ok, count, items[], checked_at, cache_age_hours?, error?}.
+    Réutilise le dernier résultat pendant `update_check_hours` (défaut 6 h,
+    0 = désactivé) pour ne pas solliciter le gestionnaire de paquets à chaque cycle."""
+    hours = 6.0
+    if config is not None:
+        try:
+            hours = float(config.get("agent", "update_check_hours", fallback="6"))
+        except ValueError:
+            pass
+    if hours <= 0:
+        return {"manager": None, "ok": False, "error": "désactivé", "count": None, "items": []}
+    if _UPDATE_CACHE["data"] and time.time() - _UPDATE_CACHE["at"] < hours * 3600:
+        return _UPDATE_CACHE["data"]
+
+    system = platform.system()
+    if system == "Darwin":
+        candidates = [("brew", "brew", _outdated_brew)]
+    else:
+        candidates = [("apt", "apt", _outdated_apt),
+                      ("dnf", "dnf", _outdated_dnf),
+                      ("yum", "yum", lambda i: _outdated_dnf(i, "yum")),
+                      ("zypper", "zypper", _outdated_zypper)]
+
+    result = {"manager": None, "ok": False, "error": "aucun gestionnaire de paquets pris en charge",
+              "count": None, "items": []}
+    for manager, binary, fn in candidates:
+        if shutil.which(binary) is None:
+            continue
+        try:
+            items, extra = fn(_installed_versions(software_list))
+            result = {"manager": manager, "ok": True, "count": len(items),
+                      "items": items[:_MAX_UPDATE_ITEMS],
+                      "checked_at": datetime.now().isoformat(), **extra}
+        except subprocess.TimeoutExpired:
+            result = {"manager": manager, "ok": False, "error": "délai dépassé",
+                      "count": None, "items": []}
+        except Exception as e:
+            result = {"manager": manager, "ok": False, "error": str(e)[:200],
+                      "count": None, "items": []}
+        break
+    _UPDATE_CACHE.update(at=time.time(), data=result)
+    return result
+
+
 # ─── Helpers serveur ──────────────────────────────────────────────────────────
 def _server_url(config) -> str:
     host = config.get("main_server", "host",  fallback="127.0.0.1")
@@ -582,6 +717,9 @@ def _build_payload(config, software_list, open_ports) -> dict:
     custom = collect_custom_rules(config)
     for k, v in custom.items():
         compliance.setdefault(k, v)
+    update_check = collect_outdated_software(software_list, config)
+    if update_check.get("ok"):
+        compliance.setdefault("pending_updates", update_check["count"])
     return {
         "hostname":      platform.node(),
         "os":            platform.system(),
@@ -593,6 +731,7 @@ def _build_payload(config, software_list, open_ports) -> dict:
         "open_ports":    open_ports,
         "cve_api_key":   config.get("api", "cve_api_key", fallback=""),
         "compliance":    compliance,
+        "update_check":  update_check,
         "ip_addresses":  get_local_ips(),
     }
 

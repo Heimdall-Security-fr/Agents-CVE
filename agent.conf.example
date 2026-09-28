@@ -30,6 +30,13 @@ cve_api_key =
 interval_minutes = 60
 ; Activer le scan de ports à chaque collecte (true/false)
 port_scan = false
+; Vérification des logiciels à mettre à jour (winget / apt / dnf / yum / zypper / brew).
+; Intervalle en heures entre deux vérifications (0 = désactivée).
+update_check_hours = 6
+
+[ui]
+; Windows uniquement — apparence de l'agent : dark | light | auto (suit le thème Windows)
+theme = dark
 
 [dashboard]
 ; URL publique du frontend CVE (ex : http://localhost:3000 ou https://cve.mon-domaine.com)

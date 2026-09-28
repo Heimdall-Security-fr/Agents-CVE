@@ -22,33 +22,31 @@ Write-Host "✅ $pyVer" -ForegroundColor Green
 Write-Host "`n📦  Installation des dépendances..." -ForegroundColor Cyan
 pip install --quiet requests pystray pillow pyinstaller
 
-# ── 3. Créer l'icône .ico (si inexistante) ──────────────────
-if (-not (Test-Path "heimdall_icon.py")) {
-    @'
-from PIL import Image, ImageDraw
-import os
+# ── 3. Logo + icône .ico générée depuis le logo Heimdall ─────
+$LogoSrc = "server\static\heimdall-logo.png"
+if (-not (Test-Path $LogoSrc)) { $LogoSrc = "heimdall-logo.png" }
+if (-not (Test-Path $LogoSrc)) {
+    Write-Host "❌ Logo introuvable (server\static\heimdall-logo.png)." -ForegroundColor Red
+    exit 1
+}
+if ($LogoSrc -ne "heimdall-logo.png") { Copy-Item $LogoSrc "heimdall-logo.png" -Force }
+
+@'
+from PIL import Image
 
 def make_ico():
-    sizes = [16, 32,48, 64, 256]
-    images = []
-    for sz in sizes:
-        img = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        sc = (20, 90, 200)
-        pts = [(sz//2, 2), (sz-4, sz//5), (sz-4, sz//2), (sz//2, sz-2), (4, sz//2), (4, sz//5)]
-        d.polygon(pts, fill=sc, outline=(180, 210, 255, 160))
-        w = max(2, sz // 12)
-        for x1, y1, x2, y2 in [(int(sz*.28), int(sz*.27), int(sz*.28), int(sz*.73)),
-                                 (int(sz*.72), int(sz*.27), int(sz*.72), int(sz*.73)),
-                                 (int(sz*.28), int(sz*.50), int(sz*.72), int(sz*.50))]:
-            d.line([(x1,y1),(x2,y2)], fill="white", width=w)
-        images.append(img)
-    images[0].save("heimdall.ico", format="ICO", sizes=[(s,s) for s in sizes], append_images=images[1:])
-    print("heimdall.ico créé.")
+    logo = Image.open("heimdall-logo.png").convert("RGBA")
+    eye = logo.crop((0, 0, logo.width, int(logo.height * 0.70)))  # l'œil, sans le texte
+    sizes = [16, 32, 48, 64, 256]
+    canvas = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+    scale = 256 / eye.width
+    eye = eye.resize((256, max(1, round(eye.height * scale))), Image.LANCZOS)
+    canvas.paste(eye, (0, (256 - eye.height) // 2), eye)
+    canvas.save("heimdall.ico", format="ICO", sizes=[(s, s) for s in sizes])
+    print("heimdall.ico créé depuis le logo.")
 
 make_ico()
 '@ | Out-File -FilePath "heimdall_icon.py" -Encoding utf8
-}
 python heimdall_icon.py
 
 # ── 4. Build PyInstaller ─────────────────────────────────────
@@ -59,6 +57,7 @@ pyinstaller `
     --name "HeimdallAgent" `
     --icon "heimdall.ico" `
     --add-data "agent.conf;." `
+    --add-data "heimdall-logo.png;." `
     --hidden-import "pystray._win32" `
     --hidden-import "PIL._imaging" `
     windows_agent_tray.py
