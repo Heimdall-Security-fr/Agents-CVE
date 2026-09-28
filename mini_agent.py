@@ -31,7 +31,7 @@ import argparse
 from datetime import datetime
 
 # ─── Version ──────────────────────────────────────────────────────────────────
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.0.1"  # remplacé à chaque build par la CI (voir VERSION et server/Dockerfile)
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -43,7 +43,6 @@ logger = logging.getLogger("HeimdallAgent")
 # ─── Configuration ────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
     "main_server": {"host": "127.0.0.1", "port": "4000", "token": ""},
-    "api":         {"cve_api_key": ""},
     "agent":       {"interval_minutes": "60", "port_scan": "false"}
 }
 
@@ -752,7 +751,6 @@ def _build_payload(config, software_list, open_ports) -> dict:
         "timestamp":     datetime.now().isoformat(),
         "software":      software_list,
         "open_ports":    open_ports,
-        "cve_api_key":   config.get("api", "cve_api_key", fallback=""),
         "compliance":    compliance,
         "update_check":  update_check,
         "ip_addresses":  get_local_ips(),

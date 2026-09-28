@@ -53,7 +53,7 @@ def _windows_release() -> str:
     return platform.release()
 from datetime import datetime
 
-AGENT_VERSION = "1.0.0"  # mis à jour à chaque build
+AGENT_VERSION = "1.0.1"  # remplacé à chaque build par la CI (voir VERSION et server/Dockerfile)
 
 # ─── Dépendances tierces ──────────────────────────────────────────────────────
 def _msgbox(title, msg, icon=0x40):
@@ -126,8 +126,7 @@ CONFIG_PATHS = [
 
 DEFAULT_CONFIG = {
     "main_server": {"host": "127.0.0.1", "port": "4000", "token": "changeme-secret-token"},
-    "api":         {"cve_api_key": ""},
-    "agent":       {"interval_minutes": "60", "port_scan": "false"},
+    "agent":      {"interval_minutes": "60", "port_scan": "false"},
     "ui":          {"theme": "dark"},
 }
 
@@ -208,8 +207,7 @@ def _config_write_path() -> str:
     return os.path.join(_LOG_DIR, "agent.conf")
 
 def save_config(host: str, port: str, token: str, interval: str, port_scan: bool,
-                cve_api_key: str = "", theme: str = None,
-                use_https: bool = None, verify_ssl: bool = None):
+                theme: str = None, use_https: bool = None, verify_ssl: bool = None):
     path = _config_write_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # HTTPS / vérification du certificat : valeur fournie, sinon celle déjà en config.
@@ -226,7 +224,6 @@ def save_config(host: str, port: str, token: str, interval: str, port_scan: bool
     cfg["main_server"] = {"host": host.strip(), "port": port.strip(), "token": token.strip(),
                           "use_https": "true" if use_https else "false",
                           "verify_ssl": "true" if verify_ssl else "false"}
-    cfg["api"]         = {"cve_api_key": cve_api_key.strip()}
     cfg["agent"]       = {"interval_minutes": interval.strip(), "port_scan": "true" if port_scan else "false"}
     if state.config is not None and state.config.has_option("agent", "update_check_hours"):
         cfg["agent"]["update_check_hours"] = state.config.get("agent", "update_check_hours")
@@ -808,7 +805,6 @@ def send_report(max_attempts: int = 6):
         load_config()
     cfg      = state.config
     token    = cfg.get("main_server", "token",      fallback="changeme-secret-token")
-    cve_key  = cfg.get("api",         "cve_api_key", fallback="")
     do_ports = cfg.getboolean("agent", "port_scan",  fallback=False)
     url      = f"{_base_url(cfg)}/api/agents/report"
     verify   = _tls_verify(cfg)
@@ -832,7 +828,6 @@ def send_report(max_attempts: int = 6):
         "timestamp":     datetime.now().isoformat(),
         "software":      software,
         "open_ports":    open_ports,
-        "cve_api_key":   cve_key,
         "compliance":    compliance,
         "update_check":  update_check,
         "ip_addresses":  ip_addresses,
@@ -1325,7 +1320,6 @@ def _open_config_dialog():
         ("Port",             "main_server", "port",             cfg.get("main_server", "port",             fallback="4000")),
         ("Token secret",     "main_server", "token",            cfg.get("main_server", "token",            fallback="changeme-secret-token")),
         ("Intervalle (min)", "agent",       "interval_minutes", cfg.get("agent",       "interval_minutes", fallback="60")),
-        ("Clé API CVE",     "api",         "cve_api_key",       cfg.get("api",         "cve_api_key",       fallback="")),
     ]
     entries = {}
 
@@ -1375,7 +1369,6 @@ def _open_config_dialog():
         p  = entries[("main_server", "port")].get().strip()
         t  = entries[("main_server", "token")].get().strip()
         iv = entries[("agent", "interval_minutes")].get().strip()
-        ck = entries[("api", "cve_api_key")].get().strip()
         if not h or not p or not t:
             _dlg_error("Erreur", "Tous les champs sont obligatoires.", parent=dlg)
             return
@@ -1385,7 +1378,7 @@ def _open_config_dialog():
             _dlg_error("Erreur", "Le port doit être un entier.", parent=dlg)
             return
         theme_key = next((k for k, v in THEME_LABELS.items() if v == theme_var.get()), "dark")
-        save_config(h, p, t, iv, ps_var.get(), ck, theme=theme_key,
+        save_config(h, p, t, iv, ps_var.get(), theme=theme_key,
                     use_https=https_var.get(), verify_ssl=verify_var.get())
         if autostart_var.get() != _is_autostart_enabled():
             _set_autostart(autostart_var.get())
@@ -1442,7 +1435,6 @@ class SetupWizard(tk.Toplevel):
             ("Port",               default_port or "4000",       False),
             ("Token secret",       default_token or "",           True),
             ("Intervalle (min)",   "60",                          False),
-            ("Clé API CVE",       "",                            False),
         ]
         self._entries = []
         for i, (lbl, val, secret) in enumerate(rows):
@@ -1536,7 +1528,7 @@ class SetupWizard(tk.Toplevel):
             self._status_lbl.config(text=f"Erreur : {str(e)[:50]}", fg=P["err"])
 
     def _install(self):
-        host, port, token, interval, cve_key = self._get_fields()
+        host, port, token, interval = self._get_fields()
         if not host or not port:
             _dlg_error("Erreur", "Adresse et port sont obligatoires.", parent=self)
             return
@@ -1551,7 +1543,7 @@ class SetupWizard(tk.Toplevel):
             return
         interval = interval or "60"
         theme_key = next((k for k, v in THEME_LABELS.items() if v == self._theme_var.get()), "dark")
-        save_config(host, port, token, interval, self._ps_var.get(), cve_key, theme=theme_key,
+        save_config(host, port, token, interval, self._ps_var.get(), theme=theme_key,
                     use_https=self._https_var.get(), verify_ssl=self._verify_var.get())
         _set_autostart(getattr(self, "_autostart_var", None) and self._autostart_var.get())
         self.result = True
@@ -1597,7 +1589,6 @@ def _apply_cli_config(args):
         args.server.strip(), args.port, token,
         prev.get("agent", "interval_minutes", fallback="60"),
         prev.getboolean("agent", "port_scan", fallback=False),
-        prev.get("api", "cve_api_key", fallback=""),
         use_https=use_https, verify_ssl=verify_ssl,
     )
     logger.info(f"Serveur configuré : {_base_url()}")

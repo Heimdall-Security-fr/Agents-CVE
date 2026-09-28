@@ -355,7 +355,23 @@ SERVER_PUBLIC_HOST = os.getenv("SERVER_PUBLIC_HOST", "127.0.0.1")
 SERVER_PUBLIC_PORT = int(os.getenv("SERVER_PUBLIC_PORT", 4000))
 AGENT_AUTH_TOKEN   = os.getenv("AGENT_AUTH_TOKEN", "")
 HEIMDALL_FRONT_URL = os.getenv("HEIMDALL_FRONT_URL", "http://localhost:3000")
-AGENT_VERSION      = os.getenv("AGENT_VERSION", "1.0.0")
+def _read_agent_version() -> str:
+    """Version des agents publiée par ce serveur : variable d'environnement si définie,
+    sinon le fichier .agent_version écrit au build de l'image, sinon la valeur par défaut."""
+    env = os.getenv("AGENT_VERSION", "").strip()
+    if env:
+        return env
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".agent_version"),
+                  encoding="utf-8") as f:
+            v = f.read().strip()
+            if v:
+                return v
+    except OSError:
+        pass
+    return "1.0.1"
+
+AGENT_VERSION      = _read_agent_version()
 
 app = Flask(__name__)
 app.config["MONGO_URI"] = MONGO_URI
@@ -956,7 +972,9 @@ def agent_report():
     hostname = data.get("hostname", "Unknown")
     software_list = data.get("software", [])
     open_ports    = data.get("open_ports", [])
-    cve_api_key   = data.get("cve_api_key", "") or SERVER_CVE_API_KEY
+    # La clé API CVE est une donnée SERVEUR (CVE_API_KEY) : on ignore volontairement
+    # toute clé envoyée par un agent (ancien agent, machine compromise ou mal configurée).
+    cve_api_key   = SERVER_CVE_API_KEY
     os_build      = data.get("os_build", "")
     compliance    = data.get("compliance", {})          # NEW: agent-sent compliance data
     ip_addresses  = data.get("ip_addresses", [])        # NEW: agent's own IPs

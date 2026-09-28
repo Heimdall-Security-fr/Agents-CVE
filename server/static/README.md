@@ -37,8 +37,7 @@
     port  = 4000
     token = <valeur de AGENT_AUTH_TOKEN>
 
-    [api]
-    cve_api_key = <clé API générée sur http://localhost:3000/api-key>
+    (la clé API CVE se définit côté serveur : variable CVE_API_KEY, pas dans l'agent)
 
     [agent]
     interval_minutes = 60   # envoi toutes les 60 min

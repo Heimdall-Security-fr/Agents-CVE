@@ -19,11 +19,12 @@ port = 4000
 ; Doit correspondre à AGENT_AUTH_TOKEN défini côté serveur agent.
 ; Générez-en un fort, par ex. : python -c "import secrets; print(secrets.token_hex(32))"
 token = changeme-secret-token
-
-[api]
-; Clé API du site CVE Heimdall (générée sur la page « API Key » du frontend).
-; Laissez vide si vous n'utilisez pas les corrélations CVE côté agent.
-cve_api_key =
+; Connexion chiffrée au serveur (true/false) et vérification de son certificat.
+; verify_ssl = false accepte un certificat auto-signé (déconseillé hors réseau interne).
+use_https = false
+verify_ssl = true
+; NB : la clé API CVE n'est PAS configurée sur les agents. Elle se définit uniquement
+; côté serveur agent (variable CVE_API_KEY).
 
 [agent]
 ; Intervalle en minutes entre deux envois en mode démon

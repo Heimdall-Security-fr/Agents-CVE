@@ -9,6 +9,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
 name: agentscve
 
+# Version des agents publiée à chaque push : <AGENT_VERSION_BASE>.<numéro de run>
+# (ex. 1.0.57). Elle est toujours plus récente que la précédente : les agents déjà
+# installés détectent la nouvelle version et se mettent à jour tout seuls.
+# Changez AGENT_VERSION_BASE (et le fichier VERSION) pour un changement mineur/majeur.
+env:
+  AGENT_VERSION_BASE: "1.0"
+
 on:
   push:
     branches:
@@ -65,7 +72,10 @@ jobs:
           context: .
           file: ./server/Dockerfile
           push: true
+          build-args: |
+            AGENT_VERSION=${{ env.AGENT_VERSION_BASE }}.${{ gitea.run_number }}
           tags: |
             192.168.1.178:37777/agentscve:latest
             heimdallsecurity/agent-cve:latest
+            heimdallsecurity/agent-cve:${{ env.AGENT_VERSION_BASE }}.${{ gitea.run_number }}
             heimdallsecurity/agent-cve:${{ gitea.sha }}
