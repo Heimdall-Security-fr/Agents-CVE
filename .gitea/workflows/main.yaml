@@ -48,11 +48,17 @@ jobs:
             [registry."192.168.1.178:37777"]
               https = true
               insecure = true
+      # docker/login-action exige le binaire `docker`, absent du runner (seul
+      # buildx standalone y est). On écrit donc directement le fichier d'auth
+      # que buildx lit au moment du push.
       - name: Login Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          mkdir -p ~/.docker
+          AUTH=$(printf '%s:%s' "$DOCKERHUB_USERNAME" "$DOCKERHUB_TOKEN" | base64 -w0)
+          printf '{"auths":{"https://index.docker.io/v1/":{"auth":"%s"}}}' "$AUTH" > ~/.docker/config.json
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
