@@ -5,7 +5,8 @@
 #  Les agents installés sur vos postes envoient leur inventaire ici ; le serveur
 #  corrèle ensuite avec le site CVE Heimdall.
 #
-#  Démarrage :   docker compose up -d --build
+#  Démarrage :   docker compose up -d          (image Docker Hub)
+#                docker compose up -d --build  (build depuis les sources)
 #  Dashboard :   http://localhost:4000/admin
 #
 #  ⚠️  AVANT LA PROD : changez AGENT_AUTH_TOKEN, DEFAULT_ADMIN_PASSWORD et
@@ -13,6 +14,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 services:
   agent_server:
+    # Image publiée sur Docker Hub (tirée automatiquement). `--build` reconstruit
+    # depuis les sources locales et l'étiquette avec ce même nom.
+    image: heimdallsecurity/agent-cve:${AGENT_CVE_VERSION:-latest}
     build:
       context: .
       dockerfile: server/Dockerfile
@@ -24,7 +28,7 @@ services:
       MONGO_URI: "mongodb://mongodb:27017/heimdall_agents"
       SERVER_PUBLIC_PORT: "4000"
       # IP/domaine public de CE serveur (utilisé dans les liens de téléchargement agent)
-      SERVER_PUBLIC_HOST: "127.0.0.1"
+      SERVER_PUBLIC_HOST: "${SERVER_PUBLIC_HOST:-127.0.0.1}"
       # Token partagé serveur <-> agents — À CHANGER
       AGENT_AUTH_TOKEN: "${AGENT_AUTH_TOKEN:?Set AGENT_AUTH_TOKEN (32+ characters)}"
       # Clé de signature des sessions du dashboard — À CHANGER
@@ -34,12 +38,12 @@ services:
       DEFAULT_ADMIN_PASSWORD: "${DEFAULT_ADMIN_PASSWORD:?Set DEFAULT_ADMIN_PASSWORD (12+ characters)}"
       DASHBOARD_ALLOWED_ORIGINS: "${DASHBOARD_ALLOWED_ORIGINS:-}"
       # URL publique du frontend CVE Heimdall
-      HEIMDALL_FRONT_URL: "http://localhost:3000"
+      HEIMDALL_FRONT_URL: "${HEIMDALL_FRONT_URL:-http://localhost:3000}"
       # API CVE Heimdall (site) interrogée pour les corrélations
-      HEIMDALL_CVE_API: "http://cve_api:5000"
-      HEIMDALL_RSS_URL: "http://cve_api:5000/cves/rss"
+      HEIMDALL_CVE_API: "${HEIMDALL_CVE_API:-http://cve_api:5000}"
+      HEIMDALL_RSS_URL: "${HEIMDALL_RSS_URL:-http://cve_api:5000/cves/rss}"
       # Clé API CVE (optionnelle, plan premium)
-      CVE_API_KEY: ""
+      CVE_API_KEY: "${CVE_API_KEY:-}"
     depends_on:
       - mongodb
 

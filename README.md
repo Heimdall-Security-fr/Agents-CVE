@@ -25,29 +25,87 @@ présente un tableau de bord des vulnérabilités de votre parc.
 | `windows_agent_tray.py`     | Agent Windows (icône dans la barre système, configuration in-app) |
 | `build_windows.ps1`         | Compile `HeimdallAgent.exe` (PyInstaller)                       |
 | `server/`                   | Serveur agent : dashboard web, API d'ingestion, corrélation CVE |
-| `docker-compose.yaml`       | Déploiement du serveur agent + MongoDB en une commande          |
+| `docker-compose.yaml`       | Déploiement du serveur agent + MongoDB (image Docker Hub `heimdallsecurity/agent-cve`) |
 | `agent.conf.example`        | Modèle de configuration agent (à copier en `agent.conf`)        |
 
 ---
 
 ## 🚀 1. Déployer le serveur agent (auto-hébergé)
 
-**Prérequis :** Docker + Docker Compose.
+**Prérequis :** Docker (+ Docker Compose pour l'option A).
+
+L'image du serveur est publiée sur Docker Hub :
+[`heimdallsecurity/agent-cve`](https://hub.docker.com/r/heimdallsecurity/agent-cve).
+Elle embarque le dashboard, l'API d'ingestion et l'agent Windows précompilé
+(`heimdall-agent.exe`) — **aucun build local nécessaire**.
+
+| Tag                                  | Contenu                                            |
+| ------------------------------------ | -------------------------------------------------- |
+| `latest`                             | Dernière version de la branche principale          |
+| `<sha-du-commit>`                    | Version figée (recommandé en production)           |
+
+### Option A — Docker Compose (recommandé)
 
 ```bash
 git clone https://github.com/Heimdall-Security-fr/Agents-CVE.git
 cd Agents-CVE
 
-# ⚠️ Éditez docker-compose.yaml et changez AU MINIMUM :
-#   AGENT_AUTH_TOKEN, DEFAULT_ADMIN_PASSWORD, DASHBOARD_JWT_SECRET
-docker compose up -d --build
+# Créez un fichier .env avec vos secrets (le compose refuse de démarrer sans eux)
+cat > .env <<'EOF'
+AGENT_AUTH_TOKEN=<32+ caractères aléatoires>
+DASHBOARD_JWT_SECRET=<32+ caractères aléatoires>
+DEFAULT_ADMIN_EMAIL=admin@votre-domaine.tld
+DEFAULT_ADMIN_PASSWORD=<12+ caractères>
+# Optionnel : figer une version précise
+# AGENT_CVE_VERSION=<sha-du-commit>
+EOF
+
+docker compose up -d
 ```
 
-Une fois démarré :
+> Générer un secret : `openssl rand -hex 32`
+>
+> `docker compose up -d` tire l'image Docker Hub. Pour construire depuis les sources
+> à la place : `docker compose up -d --build`.
 
-- **Dashboard admin :** http://localhost:4000/admin
-- **Identifiants par défaut :** définis dans `docker-compose.yaml`
-  (`DEFAULT_ADMIN_EMAIL` / `DEFAULT_ADMIN_PASSWORD`) — **changez-les à la première connexion**.
+### Option B — Docker sans Compose
+
+```bash
+docker network create heimdall_agents
+
+docker run -d --name heimdall_agent_mongo --network heimdall_agents \
+  --restart unless-stopped -v agent_mongo_data:/data/db mongo:7
+
+docker run -d --name heimdall_agent_server --network heimdall_agents \
+  --restart unless-stopped -p 4000:4000 \
+  -e MONGO_URI="mongodb://heimdall_agent_mongo:27017/heimdall_agents" \
+  -e SERVER_PUBLIC_HOST="<ip-ou-domaine-du-serveur>" \
+  -e AGENT_AUTH_TOKEN="<32+ caractères>" \
+  -e DASHBOARD_JWT_SECRET="<32+ caractères>" \
+  -e DEFAULT_ADMIN_EMAIL="admin@votre-domaine.tld" \
+  -e DEFAULT_ADMIN_PASSWORD="<12+ caractères>" \
+  -e HEIMDALL_CVE_API="https://cve.heimdall-security.com" \
+  -e CVE_API_KEY="<votre clé API CVE>" \
+  heimdallsecurity/agent-cve:latest
+```
+
+### Mise à jour du serveur
+
+```bash
+docker compose pull && docker compose up -d      # Option A
+# ou : docker pull heimdallsecurity/agent-cve:latest, puis recréer le conteneur (Option B)
+```
+
+Les données (MongoDB) sont conservées dans le volume `agent_mongo_data`. Les agents
+s'auto-mettent à jour sur la version exposée par le serveur.
+
+### Après le démarrage
+
+- **Dashboard admin :** `http://<serveur>:4000/admin`
+- **Identifiants :** ceux définis dans `DEFAULT_ADMIN_EMAIL` / `DEFAULT_ADMIN_PASSWORD`
+  — **changez-les à la première connexion**.
+- **Production :** placez le serveur derrière un reverse proxy HTTPS. Les agents envoient
+  leur token et l'inventaire du parc, ils ne doivent pas transiter en clair sur Internet.
 
 ### Variables d'environnement principales (serveur)
 
@@ -58,7 +116,7 @@ Une fois démarré :
 | `DEFAULT_ADMIN_EMAIL`    | `admin@heimdall.local`     | Compte admin créé au 1er démarrage           |
 | `DEFAULT_ADMIN_PASSWORD` | _(à définir)_              | Mot de passe admin — définissez-le dans votre `.env`/compose |
 | `HEIMDALL_FRONT_URL`     | `http://localhost:3000`    | URL publique du site CVE Heimdall            |
-| `HEIMDALL_CVE_API`       | `http://cve_api:5000`      | API CVE interrogée pour les corrélations     |
+| `HEIMDALL_CVE_API`       | `http://cve_api:5000`      | API CVE interrogée pour les corrélations (hors réseau Docker Heimdall : `https://cve.heimdall-security.com`) |
 | `CVE_API_KEY`            | _(vide)_                   | Clé API CVE (optionnelle, plan premium)      |
 | `SERVER_PUBLIC_HOST`     | `127.0.0.1`                | IP/domaine public de ce serveur              |
 
@@ -102,7 +160,11 @@ Pour compiler l'exe vous-même (PowerShell admin) :
 
 ### c. Linux / macOS 🐧🍎
 
+Récupérez l'agent directement depuis votre serveur (ou clonez ce dépôt) :
+
 ```bash
+curl -O http://<serveur>:4000/static/mini_agent.py
+
 # Dépendances
 pip3 install requests
 
