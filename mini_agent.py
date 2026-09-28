@@ -771,7 +771,8 @@ def send_report(config, software_list, open_ports, max_attempts: int = 6) -> dic
     for attempt in range(1, max_attempts + 1):
         try:
             logger.info(f"Envoi du rapport à {url} (essai {attempt}/{max_attempts}, {len(software_list)} logiciels)…")
-            resp = requests.post(url, json=payload, headers=headers, timeout=30,
+            # La corrélation CVE peut être longue sur un inventaire important.
+            resp = requests.post(url, json=payload, headers=headers, timeout=(10, 300),
                                  verify=_tls_verify(config))
             resp.raise_for_status()
             data = resp.json()
@@ -781,8 +782,9 @@ def send_report(config, software_list, open_ports, max_attempts: int = 6) -> dic
                 logger.warning(f"  ⚠️  {v['software']} → {v['cves_count']} CVE "
                                f"(CRITIQUE: {v.get('critical',0)}, HAUTE: {v.get('high',0)})")
             return data
+        except requests.exceptions.Timeout as e:
+            logger.warning(f"Analyse serveur trop longue ({type(e).__name__}). Retry dans {delay}s…")
         except (requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
                 requests.exceptions.ChunkedEncodingError) as e:
             logger.warning(f"Serveur injoignable ({type(e).__name__}). Retry dans {delay}s…")
         except requests.exceptions.HTTPError as e:

@@ -836,8 +836,11 @@ def send_report(max_attempts: int = 6):
     delay = 5
     for attempt in range(1, max_attempts + 1):
         try:
+            # La corrélation CVE est effectuée par le serveur avant sa réponse.
+            # Sur un poste avec beaucoup de logiciels, 30 s ne suffit pas et
+            # provoquait un faux « serveur injoignable » malgré un rapport reçu.
             resp = requests.post(url, json=payload, headers={"x-agent-token": token},
-                                 timeout=30, verify=verify)
+                                 timeout=(10, 300), verify=verify)
             resp.raise_for_status()
             data  = resp.json()
             vulns = data.get("vulnerable_count", 0)
@@ -848,7 +851,10 @@ def send_report(max_attempts: int = 6):
             _set_status(msg, connected=True, vulns=vulns > 0)
             logger.info(f"Rapport envoyé — {msg}")
             return data
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        except requests.exceptions.Timeout as e:
+            _set_status(f"⏳ Analyse serveur trop longue — retry {delay}s (essai {attempt}/{max_attempts})", connected=False)
+            logger.warning(f"Délai d'attente du rapport: {type(e).__name__}")
+        except requests.exceptions.ConnectionError as e:
             if isinstance(e, requests.exceptions.SSLError):
                 _set_status(f"❌ Certificat HTTPS refusé — retry {delay}s (Configurer → vérification du certificat)", connected=False)
                 logger.warning(f"Erreur TLS: {str(e)[:200]}")

@@ -1480,6 +1480,25 @@ async function downloadAgent(os) {
   } catch (e) { alert('Erreur réseau : ' + e.message); }
 }
 
+// L'installateur Windows est généré par le serveur après authentification : il
+// contient déjà l'hôte, le port et le jeton de l'agent.
+async function downloadWindowsInstaller() {
+  try {
+    const res = await fetch('/api/install/windows.ps1', { headers: { Authorization: 'Bearer ' + tok() } });
+    if (res.status === 401) { logout(); return; }
+    if (!res.ok) {
+      const b = await res.json().catch(function(){ return {}; });
+      alert(b.error || ('Téléchargement impossible (HTTP ' + res.status + ')'));
+      return;
+    }
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement('a');
+    a.href = url; a.download = 'Install-HeimdallAgent.ps1';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+  } catch (e) { alert('Erreur réseau : ' + e.message); }
+}
+
 async function loadDeploy() {
   const el = document.getElementById('deploy-content');
   el.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
@@ -1497,7 +1516,7 @@ async function loadDeploy() {
 
       +'<div class="deploy-step"><h3>📥 Télécharger un agent</h3>'
       +'<div class="dl-grid">'
-      +'<div class="dl-card"><div class="di">🪟</div><strong>Windows</strong><p>Agent graphique (tray) — HeimdallAgent.exe</p><button class="btn btn-primary btn-sm" onclick="downloadAgent(\'windows\')">Télécharger .exe</button></div>'
+      +'<div class="dl-card"><div class="di">🪟</div><strong>Windows</strong><p>Installation préconfigurée : serveur et token inclus.</p><button class="btn btn-primary btn-sm" onclick="downloadWindowsInstaller()">Télécharger l\'installateur</button><button class="btn btn-sm" style="margin-top:8px" onclick="downloadAgent(\'windows\')">EXE seul (manuel)</button></div>'
       +'<div class="dl-card"><div class="di">🐧</div><strong>Linux</strong><p>Agent daemon Python</p><button class="btn btn-primary btn-sm" onclick="downloadAgent(\'linux\')">Télécharger</button></div>'
       +'<div class="dl-card"><div class="di">🍎</div><strong>macOS</strong><p>Agent daemon Python</p><button class="btn btn-primary btn-sm" onclick="downloadAgent(\'macos\')">Télécharger</button></div>'
       +'</div></div>'
@@ -1509,10 +1528,9 @@ async function loadDeploy() {
       +'<label style="margin-top:16px">Service systemd</label>'
       +'<div class="code-block">[Unit]\nDescription=Heimdall Security Agent\nAfter=network.target\n\n[Service]\nWorkingDirectory=/opt/heimdall\nExecStart=/usr/bin/python3 /opt/heimdall/mini_agent.py --daemon\nRestart=always\n\n[Install]\nWantedBy=multi-user.target</div></div>'
 
-      +'<div class="deploy-step"><h3>🪟 Installation Windows (PowerShell)</h3>'
-      +'<p class="text-muted" style="font-size:12px;margin-bottom:8px">Recommandé : pas besoin d\'être administrateur, pas d\'écran « Windows a protégé votre ordinateur » (SmartScreen) ni d\'invite « éditeur inconnu ». Le serveur, le port et le token sont déjà renseignés dans le script. Remplacez <code>&lt;AGENT_AUTH_TOKEN&gt;</code> par le token de votre serveur.</p>'
-      +'<div class="code-block">irm -Headers @{ \'x-agent-token\' = \'&lt;AGENT_AUTH_TOKEN&gt;\' } '+scheme+'://'+esc(host)+':'+esc(port)+'/api/install/windows.ps1 | iex</div>'
-      +'<p class="text-muted" style="font-size:12px;margin-top:8px">Le bouton « Télécharger .exe » ci-dessus passe par le navigateur : Windows peut alors afficher un avertissement SmartScreen (« Informations complémentaires » → « Exécuter quand même »), car l\'exécutable n\'est pas encore signé. Il faudra alors lancer l\'exe avec <code>--silent --server '+esc(host)+' --port '+esc(port)+' --token …'+httpsFlag+'</code> ou remplir l\'assistant. Le HTTPS et la vérification du certificat se règlent aussi dans <em>Configurer…</em> (icône de l\'agent).</p></div>';
+      +'<div class="deploy-step"><h3>🪟 Installation Windows</h3>'
+      +'<p class="text-muted" style="font-size:12px;margin-bottom:8px">Téléchargez puis exécutez <code>Install-HeimdallAgent.ps1</code>. Il configure automatiquement le serveur, le port et le token, sans saisie manuelle.</p>'
+      +'<p class="text-muted" style="font-size:12px;margin-top:8px">L\'option « EXE seul » reste disponible pour un déploiement manuel ; dans ce cas, il faut renseigner le token dans l\'assistant.</p></div>';
   } catch(err) { el.innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>'; }
 }
 
