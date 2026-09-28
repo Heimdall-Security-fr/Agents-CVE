@@ -538,6 +538,7 @@ def collect_custom_rules(config) -> dict:
             params={"os": os_param},
             headers=_agent_headers(config),
             timeout=10,
+            verify=_tls_verify(config),
         )
         if r.status_code != 200:
             return {}
@@ -699,10 +700,32 @@ def collect_outdated_software(software_list, config=None) -> dict:
 
 
 # ─── Helpers serveur ──────────────────────────────────────────────────────────
+def _cfg_bool(config, key: str, default: bool) -> bool:
+    try:
+        return config.getboolean("main_server", key, fallback=default)
+    except ValueError:
+        return default
+
 def _server_url(config) -> str:
+    """http(s)://hôte:port selon `[main_server] use_https`."""
     host = config.get("main_server", "host",  fallback="127.0.0.1")
     port = config.get("main_server", "port",  fallback="4000")
-    return f"http://{host}:{port}"
+    scheme = "https" if _cfg_bool(config, "use_https", False) else "http"
+    return f"{scheme}://{host}:{port}"
+
+def _tls_verify(config) -> bool:
+    """Vérifier le certificat du serveur ? Sans effet en HTTP. `verify_ssl = false`
+    accepte un certificat auto-signé/expiré (déconseillé hors réseau interne)."""
+    if not _cfg_bool(config, "use_https", False):
+        return True
+    verify = _cfg_bool(config, "verify_ssl", True)
+    if not verify:
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
+    return verify
 
 def _agent_headers(config) -> dict:
     token = config.get("main_server", "token", fallback="")
@@ -750,7 +773,8 @@ def send_report(config, software_list, open_ports, max_attempts: int = 6) -> dic
     for attempt in range(1, max_attempts + 1):
         try:
             logger.info(f"Envoi du rapport à {url} (essai {attempt}/{max_attempts}, {len(software_list)} logiciels)…")
-            resp = requests.post(url, json=payload, headers=headers, timeout=30)
+            resp = requests.post(url, json=payload, headers=headers, timeout=30,
+                                 verify=_tls_verify(config))
             resp.raise_for_status()
             data = resp.json()
             vuln_count = data.get("vulnerable_count", 0)
@@ -788,7 +812,8 @@ def send_heartbeat(config) -> bool:
             json={"os": platform.system(), "release": platform.release(),
                    "os_build": platform.version(), "agent_version": AGENT_VERSION},
             headers=_agent_headers(config),
-            timeout=5
+            timeout=5,
+            verify=_tls_verify(config),
         )
         return r.status_code == 200
     except Exception:
@@ -840,6 +865,7 @@ def check_for_update(config) -> bool:
             f"{_server_url(config)}/api/agent/version",
             headers=_agent_headers(config),
             timeout=10,
+            verify=_tls_verify(config),
         )
         if r.status_code != 200:
             return False
@@ -858,6 +884,7 @@ def check_for_update(config) -> bool:
             f"{_server_url(config)}/static/mini_agent.py",
             headers=_agent_headers(config),
             timeout=60,
+            verify=_tls_verify(config),
         )
         r.raise_for_status()
         new_source = r.content
@@ -1020,6 +1047,14 @@ if __name__ == "__main__":
     parser.add_argument("--version",    action="store_true", help="Afficher la version puis exit")
     parser.add_argument("--check-update", action="store_true", help="Forcer la vérification d'une mise à jour puis exit")
     parser.add_argument("--uninstall",  action="store_true", help="Désinstaller l'agent (stop service, supprime les fichiers)")
+    # Surcharges de connexion (prioritaires sur agent.conf, non enregistrées)
+    parser.add_argument("--server",     default="", help="Hôte/IP du serveur Heimdall")
+    parser.add_argument("--port",       default="", help="Port du serveur Heimdall")
+    parser.add_argument("--token",      default="", help="Token secret (AGENT_AUTH_TOKEN, 32+ caractères)")
+    parser.add_argument("--https",      action="store_true", help="Se connecter en HTTPS")
+    parser.add_argument("--http",       action="store_true", help="Se connecter en HTTP (désactive HTTPS)")
+    parser.add_argument("--no-verify-ssl", action="store_true",
+                        help="HTTPS : ne pas vérifier le certificat (certificat auto-signé)")
     args = parser.parse_args()
 
     if args.version:
@@ -1029,6 +1064,15 @@ if __name__ == "__main__":
         sys.exit(uninstall_agent())
 
     cfg = load_config()
+    if not cfg.has_section("main_server"):
+        cfg.add_section("main_server")
+    for key, val in (("host", args.server), ("port", args.port), ("token", args.token)):
+        if val:
+            cfg.set("main_server", key, val)
+    if args.https or args.http:
+        cfg.set("main_server", "use_https", "true" if args.https and not args.http else "false")
+    if args.no_verify_ssl:
+        cfg.set("main_server", "verify_ssl", "false")
     if args.check_update:
         check_for_update(cfg)
         sys.exit(0)

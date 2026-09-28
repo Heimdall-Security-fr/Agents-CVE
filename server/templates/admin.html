@@ -1487,6 +1487,9 @@ async function loadDeploy() {
     const info = await api('/api/server-info');
     const host = info.host || window.location.hostname;
     const port = info.port || '4000';
+    // Schéma vu par le navigateur (derrière un reverse proxy HTTPS → https)
+    const scheme = window.location.protocol === 'https:' ? 'https' : 'http';
+    const httpsFlag = scheme === 'https' ? ' --https' : '';
     el.innerHTML =
       '<div class="deploy-step"><h3>⚙️ Informations du serveur</h3>'
       +'<div class="grid-2"><div><label style="margin-top:0">Hôte public</label><div class="code-block">'+esc(host)+'</div></div>'
@@ -1500,12 +1503,16 @@ async function loadDeploy() {
       +'</div></div>'
 
       +'<div class="deploy-step"><h3>🚀 Installation Linux / macOS</h3>'
-      +'<div class="code-block">curl -sSL -H "x-agent-token: &lt;AGENT_AUTH_TOKEN&gt;" http://'+esc(host)+':'+esc(port)+'/api/download/agent/linux -o heimdall.zip\nunzip heimdall.zip -d heimdall &amp;&amp; cd heimdall\npip install -r requirements.txt\npython mini_agent.py --server '+esc(host)+' --port '+esc(port)+'</div>'
+      +'<div class="code-block">curl -sSL -H "x-agent-token: &lt;AGENT_AUTH_TOKEN&gt;" '+scheme+'://'+esc(host)+':'+esc(port)+'/api/download/agent/linux -o heimdall.zip\nunzip heimdall.zip -d heimdall &amp;&amp; cd heimdall\npip install -r requirements.txt\npython mini_agent.py --daemon</div>'
+      +'<p class="text-muted" style="font-size:12px;margin-top:8px">L\'archive contient déjà <code>agent.conf</code> (serveur, port, token, HTTP/HTTPS). Pour un certificat auto-signé, ajoutez <code>verify_ssl = false</code> dans <code>[main_server]</code> ou lancez avec <code>--no-verify-ssl</code>.</p></div>'
+      +'<div class="deploy-step" style="margin-top:-8px">'
       +'<label style="margin-top:16px">Service systemd</label>'
-      +'<div class="code-block">[Unit]\nDescription=Heimdall Security Agent\nAfter=network.target\n\n[Service]\nExecStart=/usr/bin/python3 /opt/heimdall/mini_agent.py --server '+esc(host)+' --port '+esc(port)+'\nRestart=always\n\n[Install]\nWantedBy=multi-user.target</div></div>'
+      +'<div class="code-block">[Unit]\nDescription=Heimdall Security Agent\nAfter=network.target\n\n[Service]\nWorkingDirectory=/opt/heimdall\nExecStart=/usr/bin/python3 /opt/heimdall/mini_agent.py --daemon\nRestart=always\n\n[Install]\nWantedBy=multi-user.target</div></div>'
 
-      +'<div class="deploy-step"><h3>🪟 Installation Windows (PowerShell admin)</h3>'
-      +'<div class="code-block">$url = "http://'+esc(host)+':'+esc(port)+'/api/download/agent/windows"\n$out = "$env:TEMP\\HeimdallAgent.exe"\nInvoke-WebRequest -Uri $url -Headers @{ \'x-agent-token\' = \'&lt;AGENT_AUTH_TOKEN&gt;\' } -OutFile $out\nStart-Process $out -Verb RunAs</div></div>';
+      +'<div class="deploy-step"><h3>🪟 Installation Windows (PowerShell)</h3>'
+      +'<p class="text-muted" style="font-size:12px;margin-bottom:8px">Recommandé : pas besoin d\'être administrateur, pas d\'écran « Windows a protégé votre ordinateur » (SmartScreen) ni d\'invite « éditeur inconnu ». Le serveur, le port et le token sont déjà renseignés dans le script. Remplacez <code>&lt;AGENT_AUTH_TOKEN&gt;</code> par le token de votre serveur.</p>'
+      +'<div class="code-block">irm -Headers @{ \'x-agent-token\' = \'&lt;AGENT_AUTH_TOKEN&gt;\' } '+scheme+'://'+esc(host)+':'+esc(port)+'/api/install/windows.ps1 | iex</div>'
+      +'<p class="text-muted" style="font-size:12px;margin-top:8px">Le bouton « Télécharger .exe » ci-dessus passe par le navigateur : Windows peut alors afficher un avertissement SmartScreen (« Informations complémentaires » → « Exécuter quand même »), car l\'exécutable n\'est pas encore signé. Il faudra alors lancer l\'exe avec <code>--silent --server '+esc(host)+' --port '+esc(port)+' --token …'+httpsFlag+'</code> ou remplir l\'assistant. Le HTTPS et la vérification du certificat se règlent aussi dans <em>Configurer…</em> (icône de l\'agent).</p></div>';
   } catch(err) { el.innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>'; }
 }
 

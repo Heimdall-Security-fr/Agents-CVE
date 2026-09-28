@@ -143,14 +143,40 @@ Renseignez au minimum, dans `agent.conf` :
 
 ### b. Windows 🪟
 
-Téléchargez l'exécutable servi par votre serveur :
+**Installation recommandée (une commande, sans droits administrateur).** Dans PowerShell,
+en remplaçant `<serveur>`, `<port>` et `<AGENT_AUTH_TOKEN>` (le dashboard, page
+*Déploiement*, affiche la commande avec le serveur et le port déjà remplis) :
+
+```powershell
+irm -Headers @{ 'x-agent-token' = '<AGENT_AUTH_TOKEN>' } http://<serveur>:<port>/api/install/windows.ps1 | iex
+```
+
+Le script installe l'agent dans `%LOCALAPPDATA%\HeimdallAgent`, enregistre le serveur, le
+port et le token, l'active au démarrage de Windows et le lance (icône dans la zone de
+notification). Aucune invite « éditeur inconnu » ni écran SmartScreen : un téléchargement
+par PowerShell n'est pas marqué comme venant d'Internet, contrairement à un téléchargement
+par navigateur.
+
+> ℹ️ `<port>` doit être le port **publié** du serveur (ex. `4012` si votre compose fait
+> `4012:4000`) et `SERVER_PUBLIC_PORT` doit avoir la même valeur, sinon les agents
+> installés contactent un mauvais port.
+
+**Installation manuelle.** Téléchargez l'exe depuis le dashboard (page *Déploiement*).
+Le navigateur peut afficher un avertissement SmartScreen tant que l'exécutable n'est pas
+signé (*Informations complémentaires* → *Exécuter quand même*). Options en ligne de commande :
 
 ```
-http://<serveur>:4000/static/heimdall-agent.exe
+HeimdallAgent.exe --silent --autostart --server <serveur> --port <port> --token <token>
 ```
 
-Placez `heimdall-agent.exe` et `agent.conf` dans le même dossier, puis lancez l'exe :
-une icône apparaît dans la barre système (configuration et état accessibles via le menu).
+| Option        | Effet                                                                 |
+| ------------- | --------------------------------------------------------------------- |
+| `--server/--port/--token` | Enregistre la connexion au serveur (sans assistant avec `--silent`) |
+| `--silent`    | Pas d'assistant graphique : enregistre et démarre                     |
+| `--autostart` | Démarrer avec Windows                                                 |
+| `--once`      | Un seul envoi puis sortie                                             |
+
+Sans options, un assistant graphique demande le serveur, le port et le token.
 
 Dans **Configuration** (clic droit sur l'icône), vous pouvez aussi choisir l'**apparence**
 (sombre, clair ou automatique selon le thème Windows) et activer le **démarrage avec Windows**.

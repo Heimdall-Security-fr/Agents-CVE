@@ -159,23 +159,73 @@ def config_exists() -> bool:
     return _config_path_existing() is not None
 
 def load_config() -> configparser.ConfigParser:
+    """Lit UN seul fichier : le premier trouvé dans CONFIG_PATHS (dossier de l'exe,
+    puis %APPDATA%, puis ProgramData). Fusionner plusieurs fichiers laissait une
+    vieille config écraser la nouvelle."""
     cfg = configparser.ConfigParser()
-    loaded = cfg.read(CONFIG_PATHS)
-    if not loaded:
+    path = _config_path_existing()
+    if path:
+        cfg.read(path, encoding="utf-8")
+    else:
         cfg.read_dict(DEFAULT_CONFIG)
     state.config = cfg
     return cfg
 
+def _cfg_bool(cfg, section: str, key: str, default: bool) -> bool:
+    try:
+        return cfg.getboolean(section, key, fallback=default)
+    except ValueError:
+        return default
+
+def _base_url(cfg=None) -> str:
+    """URL de base du serveur : http(s)://hôte:port selon `[main_server] use_https`."""
+    cfg = cfg or state.config or configparser.ConfigParser()
+    host   = cfg.get("main_server", "host", fallback="127.0.0.1")
+    port   = cfg.get("main_server", "port", fallback="4000")
+    scheme = "https" if _cfg_bool(cfg, "main_server", "use_https", False) else "http"
+    return f"{scheme}://{host}:{port}"
+
+def _tls_verify(cfg=None) -> bool:
+    """Vérifier le certificat du serveur ? Sans effet en HTTP. `verify_ssl = false`
+    accepte un certificat auto-signé/expiré (déconseillé hors réseau interne)."""
+    cfg = cfg or state.config or configparser.ConfigParser()
+    if not _cfg_bool(cfg, "main_server", "use_https", False):
+        return True
+    verify = _cfg_bool(cfg, "main_server", "verify_ssl", True)
+    if not verify:
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
+    return verify
+
+def _config_write_path() -> str:
+    """Fichier à écrire : celui qui est réellement lu (s'il est modifiable), sinon %APPDATA%."""
+    existing = _config_path_existing()
+    if existing and os.access(existing, os.W_OK):
+        return existing
+    return os.path.join(_LOG_DIR, "agent.conf")
+
 def save_config(host: str, port: str, token: str, interval: str, port_scan: bool,
-                cve_api_key: str = "", theme: str = None):
-    path = os.path.join(_LOG_DIR, "agent.conf")
+                cve_api_key: str = "", theme: str = None,
+                use_https: bool = None, verify_ssl: bool = None):
+    path = _config_write_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    # HTTPS / vérification du certificat : valeur fournie, sinon celle déjà en config.
+    prev = state.config if state.config is not None else configparser.ConfigParser()
+    if use_https is None:
+        use_https = _cfg_bool(prev, "main_server", "use_https", False)
+    if verify_ssl is None:
+        verify_ssl = _cfg_bool(prev, "main_server", "verify_ssl", True)
     # Thème : valeur fournie, sinon celle déjà en config, sinon sombre.
     if theme is None:
         theme = (state.config.get("ui", "theme", fallback="dark")
                  if state.config is not None else "dark")
     cfg = configparser.ConfigParser()
-    cfg["main_server"] = {"host": host.strip(), "port": port.strip(), "token": token.strip()}
+    cfg["main_server"] = {"host": host.strip(), "port": port.strip(), "token": token.strip(),
+                          "use_https": "true" if use_https else "false",
+                          "verify_ssl": "true" if verify_ssl else "false"}
     cfg["api"]         = {"cve_api_key": cve_api_key.strip()}
     cfg["agent"]       = {"interval_minutes": interval.strip(), "port_scan": "true" if port_scan else "false"}
     if state.config is not None and state.config.has_option("agent", "update_check_hours"):
@@ -254,6 +304,24 @@ def _logo_photo(height: int):
         return tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
     except Exception:
         return None
+
+def _add_https_options(parent, P: dict, row: int, use_var, verify_var):
+    """Cases « Utiliser HTTPS » et « Vérifier le certificat » (grille `parent`, lignes
+    row et row+1). La seconde n'a de sens qu'avec HTTPS : elle est grisée sinon."""
+    def _mk(text, var, r, **kw):
+        cb = tk.Checkbutton(parent, text=text, variable=var, bg=P["card"], fg=P["muted"],
+                            activebackground=P["card"], activeforeground=P["fg"],
+                            selectcolor=P["input"], disabledforeground=P["muted"],
+                            font=("Segoe UI", 9), **kw)
+        cb.grid(row=r, column=0, columnspan=2, sticky="w", pady=4)
+        return cb
+    verify_cb = None
+    def _sync():
+        verify_cb.config(state="normal" if use_var.get() else "disabled")
+    _mk("Utiliser HTTPS (connexion chiffrée au serveur)", use_var, row, command=_sync)
+    verify_cb = _mk("Vérifier le certificat du serveur (décocher = accepter un certificat auto-signé)",
+                    verify_var, row + 1)
+    _sync()
 
 def _apply_window_icon(win):
     """Icône de la barre de titre = logo Heimdall (si disponible)."""
@@ -626,15 +694,14 @@ def _collect_custom_rules() -> dict:
     if not state.config:
         return {}
     cfg   = state.config
-    host  = cfg.get("main_server", "host",  fallback="127.0.0.1")
-    port  = cfg.get("main_server", "port",  fallback="4000")
     token = cfg.get("main_server", "token", fallback="")
     try:
         r = requests.get(
-            f"http://{host}:{port}/api/compliance/agent-rules",
+            f"{_base_url(cfg)}/api/compliance/agent-rules",
             params={"os": "windows"},
             headers={"x-agent-token": token},
             timeout=10,
+            verify=_tls_verify(cfg),
         )
         if r.status_code != 200:
             return {}
@@ -740,12 +807,11 @@ def send_report(max_attempts: int = 6):
     if not state.config:
         load_config()
     cfg      = state.config
-    host     = cfg.get("main_server", "host",       fallback="127.0.0.1")
-    port     = cfg.get("main_server", "port",       fallback="4000")
     token    = cfg.get("main_server", "token",      fallback="changeme-secret-token")
     cve_key  = cfg.get("api",         "cve_api_key", fallback="")
     do_ports = cfg.getboolean("agent", "port_scan",  fallback=False)
-    url      = f"http://{host}:{port}/api/agents/report"
+    url      = f"{_base_url(cfg)}/api/agents/report"
+    verify   = _tls_verify(cfg)
 
     _set_status("Collecte en cours…")
 
@@ -775,7 +841,8 @@ def send_report(max_attempts: int = 6):
     delay = 5
     for attempt in range(1, max_attempts + 1):
         try:
-            resp = requests.post(url, json=payload, headers={"x-agent-token": token}, timeout=30)
+            resp = requests.post(url, json=payload, headers={"x-agent-token": token},
+                                 timeout=30, verify=verify)
             resp.raise_for_status()
             data  = resp.json()
             vulns = data.get("vulnerable_count", 0)
@@ -787,8 +854,12 @@ def send_report(max_attempts: int = 6):
             logger.info(f"Rapport envoyé — {msg}")
             return data
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-            _set_status(f"❌ Serveur injoignable — retry {delay}s (essai {attempt}/{max_attempts})", connected=False)
-            logger.warning(f"Connexion serveur échouée: {type(e).__name__}")
+            if isinstance(e, requests.exceptions.SSLError):
+                _set_status(f"❌ Certificat HTTPS refusé — retry {delay}s (Configurer → vérification du certificat)", connected=False)
+                logger.warning(f"Erreur TLS: {str(e)[:200]}")
+            else:
+                _set_status(f"❌ Serveur injoignable — retry {delay}s (essai {attempt}/{max_attempts})", connected=False)
+                logger.warning(f"Connexion serveur échouée: {type(e).__name__}")
         except requests.exceptions.HTTPError as e:
             code = e.response.status_code
             if 500 <= code < 600:
@@ -825,7 +896,10 @@ def agent_loop():
     while state.running:
         send_report()
         cfg      = state.config or configparser.ConfigParser()
-        interval = int(cfg.get("agent", "interval_minutes", fallback=60)) * 60
+        try:
+            interval = max(1, int(cfg.get("agent", "interval_minutes", fallback="60"))) * 60
+        except ValueError:   # champ vide ou invalide : ne pas tuer le thread d'envoi
+            interval = 3600
         for i in range(interval, 0, -1):
             if not state.running or state.scan_event.is_set():
                 break
@@ -842,16 +916,15 @@ def send_heartbeat():
     if not state.config:
         return
     cfg   = state.config
-    host  = cfg.get("main_server", "host",  fallback="127.0.0.1")
-    port  = cfg.get("main_server", "port",  fallback="4000")
     token = cfg.get("main_server", "token", fallback="changeme-secret-token")
     try:
         requests.post(
-            f"http://{host}:{port}/api/agents/{platform.node()}/heartbeat",
+            f"{_base_url(cfg)}/api/agents/{platform.node()}/heartbeat",
             json={"os": platform.system(), "release": _windows_release(),
                    "os_build": platform.version()},
             headers={"x-agent-token": token},
-            timeout=5
+            timeout=5,
+            verify=_tls_verify(cfg),
         )
     except Exception:
         pass
@@ -885,14 +958,14 @@ def check_for_update(silent: bool = False) -> bool:
     if not state.config:
         return False
     cfg   = state.config
-    host  = cfg.get("main_server", "host",  fallback="127.0.0.1")
-    port  = cfg.get("main_server", "port",  fallback="4000")
     token = cfg.get("main_server", "token", fallback="changeme-secret-token")
+    base  = _base_url(cfg)
     try:
         r = requests.get(
-            f"http://{host}:{port}/api/agent/version",
+            f"{base}/api/agent/version",
             headers={"x-agent-token": token},
             timeout=10,
+            verify=_tls_verify(cfg),
         )
         if r.status_code != 200:
             if not silent:
@@ -918,12 +991,12 @@ def check_for_update(silent: bool = False) -> bool:
                     def _gui_ask():
                         if _tk_msgbox.askyesno("Heimdall — Mise à jour", msg, parent=state.tk_root):
                             threading.Thread(
-                                target=lambda: _do_self_update(host, port, token, data.get("download_url", "")),
+                                target=lambda: _do_self_update(base, token, data.get("download_url", "")),
                                 daemon=True, name="SelfUpdate"
                             ).start()
                     state.tk_root.after(0, _gui_ask)
                 else:
-                    _do_self_update(host, port, token, data.get("download_url", ""))
+                    _do_self_update(base, token, data.get("download_url", ""))
             _ask_and_update()
             return True
         else:
@@ -938,7 +1011,7 @@ def check_for_update(silent: bool = False) -> bool:
     return False
 
 
-def _do_self_update(host: str, port: str, token: str, url: str):
+def _do_self_update(base: str, token: str, url: str):
     """Télécharge le nouvel exe, écrit un .bat de remplacement et quitte."""
     if not getattr(sys, "frozen", False):
         logger.warning("Auto-update: non disponible en mode source Python.")
@@ -949,7 +1022,7 @@ def _do_self_update(host: str, port: str, token: str, url: str):
     curr_exe     = os.path.abspath(sys.executable)
     new_exe      = curr_exe + ".update"
     bat_path     = curr_exe + ".upd.bat"
-    download_url = url or f"http://{host}:{port}/api/download/agent/windows/exe"
+    download_url = url or f"{base}/api/download/agent/windows/exe"
     try:
         _set_status("⬇️  Téléchargement de la mise à jour…")
         resp = requests.get(
@@ -957,6 +1030,7 @@ def _do_self_update(host: str, port: str, token: str, url: str):
             headers={"x-agent-token": token},
             timeout=120,
             stream=True,
+            verify=_tls_verify(),
         )
         resp.raise_for_status()
         with open(new_exe, "wb") as f:
@@ -1109,10 +1183,7 @@ def _on_scan_now(_icon=None, _item=None):
     state.scan_event.set()
 
 def _on_open_dashboard(_icon=None, _item=None):
-    cfg  = state.config or configparser.ConfigParser()
-    host = cfg.get("main_server", "host", fallback="127.0.0.1")
-    port = cfg.get("main_server", "port", fallback="4000")
-    webbrowser.open(f"http://{host}:{port}")
+    webbrowser.open(_base_url())
 
 def _on_configure(_icon=None, _item=None):
     if not TKINTER_OK:
@@ -1220,7 +1291,7 @@ def _open_config_dialog():
     P = _pal()
     dlg = tk.Toplevel(state.tk_root)
     dlg.title("Heimdall — Configuration")
-    dlg.geometry("480x520")
+    dlg.geometry("480x610")
     dlg.resizable(False, False)
     dlg.configure(bg=P["card"])
     _apply_window_icon(dlg)
@@ -1232,7 +1303,7 @@ def _open_config_dialog():
     dlg.update_idletasks()
     sw = dlg.winfo_screenwidth()
     sh = dlg.winfo_screenheight()
-    dlg.geometry(f"+{(sw - 480) // 2}+{(sh - 520) // 2}")
+    dlg.geometry(f"+{(sw - 480) // 2}+{max(0, (sh - 610) // 2)}")
 
     cfg = state.config or configparser.ConfigParser()
 
@@ -1280,8 +1351,13 @@ def _open_config_dialog():
     autostart_var = tk.BooleanVar(value=_is_autostart_enabled())
     _check("Démarrer automatiquement avec Windows", autostart_var, len(fields) + 1)
 
+    # Connexion chiffrée : HTTPS et vérification du certificat du serveur
+    https_var  = tk.BooleanVar(value=_cfg_bool(cfg, "main_server", "use_https", False))
+    verify_var = tk.BooleanVar(value=_cfg_bool(cfg, "main_server", "verify_ssl", True))
+    _add_https_options(frame, P, len(fields) + 2, https_var, verify_var)
+
     # Apparence : sombre / clair / suivre le thème Windows
-    theme_row = len(fields) + 2
+    theme_row = len(fields) + 4
     tk.Label(frame, text="Apparence", bg=P["card"], fg=P["muted"],
              font=("Segoe UI", 9)).grid(row=theme_row, column=0, sticky="w", pady=7)
     theme_var = tk.StringVar(value=THEME_LABELS[_theme_setting()])
@@ -1309,7 +1385,8 @@ def _open_config_dialog():
             _dlg_error("Erreur", "Le port doit être un entier.", parent=dlg)
             return
         theme_key = next((k for k, v in THEME_LABELS.items() if v == theme_var.get()), "dark")
-        save_config(h, p, t, iv, ps_var.get(), ck, theme=theme_key)
+        save_config(h, p, t, iv, ps_var.get(), ck, theme=theme_key,
+                    use_https=https_var.get(), verify_ssl=verify_var.get())
         if autostart_var.get() != _is_autostart_enabled():
             _set_autostart(autostart_var.get())
         _dlg_info("Sauvegarde", "Configuration mise \u00e0 jour.\nElle sera utilis\u00e9e d\u00e8s le prochain scan.\n"
@@ -1329,11 +1406,12 @@ def _open_config_dialog():
 # ─── Assistant premier lancement ─────────────────────────────────────────────
 class SetupWizard(tk.Toplevel):
     """Wizard de configuration — Toplevel (jamais un second tk.Tk)."""
-    def __init__(self, parent, default_host="", default_port="4000", default_token=""):
+    def __init__(self, parent, default_host="", default_port="4000", default_token="",
+                 default_https=False, default_verify=True):
         super().__init__(parent)
         P = self._P = _pal()
         self.title("Heimdall Agent — Installation")
-        self.geometry("480x640")
+        self.geometry("480x730")
         self.resizable(False, False)
         self.configure(bg=P["bg"])
         _apply_window_icon(self)
@@ -1343,7 +1421,7 @@ class SetupWizard(tk.Toplevel):
         # Centrage
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"+{(sw - 480) // 2}+{(sh - 640) // 2}")
+        self.geometry(f"+{(sw - 480) // 2}+{max(0, (sh - 730) // 2)}")
 
         self._logo = _logo_photo(96)
         if self._logo is not None:
@@ -1388,15 +1466,19 @@ class SetupWizard(tk.Toplevel):
         self._autostart_var = tk.BooleanVar(value=True)
         _check("Démarrer automatiquement avec Windows", self._autostart_var, len(rows) + 1)
 
+        self._https_var  = tk.BooleanVar(value=default_https)
+        self._verify_var = tk.BooleanVar(value=default_verify)
+        _add_https_options(card, P, len(rows) + 2, self._https_var, self._verify_var)
+
         tk.Label(card, text="Apparence", bg=P["card"], fg=P["muted"],
-                 font=("Segoe UI", 9)).grid(row=len(rows) + 2, column=0, sticky="w", pady=8)
+                 font=("Segoe UI", 9)).grid(row=len(rows) + 4, column=0, sticky="w", pady=8)
         self._theme_var = tk.StringVar(value=THEME_LABELS[_theme_setting()])
         theme_menu = tk.OptionMenu(card, self._theme_var, *THEME_LABELS.values())
         theme_menu.config(bg=P["input"], fg=P["fg"], activebackground=P["input"],
                           activeforeground=P["fg"], relief="flat", bd=0,
                           highlightthickness=0, font=("Segoe UI", 10), anchor="w")
         theme_menu["menu"].config(bg=P["input"], fg=P["fg"], font=("Segoe UI", 10))
-        theme_menu.grid(row=len(rows) + 2, column=1, padx=(16, 0), pady=8, sticky="ew")
+        theme_menu.grid(row=len(rows) + 4, column=1, padx=(16, 0), pady=8, sticky="ew")
         card.columnconfigure(1, weight=1)
 
         self._status_lbl = tk.Label(self, text="", bg=P["bg"], fg=P["muted"],
@@ -1423,11 +1505,20 @@ class SetupWizard(tk.Toplevel):
         P = self._P
         self._status_lbl.config(text="Test en cours...", fg=P["muted"])
         self.update()
+        use_https = self._https_var.get()
+        verify    = self._verify_var.get() if use_https else True
+        if use_https and not verify:
+            try:
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            except Exception:
+                pass
         try:
             r = requests.get(
-                f"http://{host}:{port}/api/ping",
+                f"{'https' if use_https else 'http'}://{host}:{port}/api/ping",
                 headers={"x-agent-token": token},
-                timeout=5
+                timeout=5,
+                verify=verify,
             )
             if r.status_code == 200:
                 self._status_lbl.config(text="Connexion OK — token valide", fg=P["ok"])
@@ -1435,6 +1526,10 @@ class SetupWizard(tk.Toplevel):
                 self._status_lbl.config(text="Token incorrect (401 Unauthorized)", fg=P["err"])
             else:
                 self._status_lbl.config(text=f"Serveur repond {r.status_code}", fg=P["warn"])
+        except requests.exceptions.SSLError:
+            self._status_lbl.config(
+                text="Certificat HTTPS refusé — décochez « Vérifier le certificat » ou installez un certificat valide",
+                fg=P["err"], wraplength=420)
         except requests.exceptions.ConnectionError:
             self._status_lbl.config(text=f"Serveur inaccessible ({host}:{port})", fg=P["err"])
         except Exception as e:
@@ -1445,13 +1540,19 @@ class SetupWizard(tk.Toplevel):
         if not host or not port:
             _dlg_error("Erreur", "Adresse et port sont obligatoires.", parent=self)
             return
+        if not token:
+            _dlg_error("Erreur", "Le token secret est obligatoire (AGENT_AUTH_TOKEN du serveur).", parent=self)
+            return
         try:
             int(port)
+            int(interval or "60")
         except ValueError:
-            _dlg_error("Erreur", "Le port doit être un entier.", parent=self)
+            _dlg_error("Erreur", "Le port et l'intervalle doivent être des nombres entiers.", parent=self)
             return
+        interval = interval or "60"
         theme_key = next((k for k, v in THEME_LABELS.items() if v == self._theme_var.get()), "dark")
-        save_config(host, port, token, interval, self._ps_var.get(), cve_key, theme=theme_key)
+        save_config(host, port, token, interval, self._ps_var.get(), cve_key, theme=theme_key,
+                    use_https=self._https_var.get(), verify_ssl=self._verify_var.get())
         _set_autostart(getattr(self, "_autostart_var", None) and self._autostart_var.get())
         self.result = True
         self.destroy()
@@ -1477,6 +1578,31 @@ def install_scheduled_task():
         return False
 
 
+# ─── Configuration depuis la ligne de commande ────────────────────────────────
+def _apply_cli_config(args):
+    """Enregistre --server/--port/--token dans agent.conf (sans assistant), en
+    conservant les autres réglages déjà présents (intervalle, clé API CVE…)."""
+    had_config = config_exists()
+    prev  = load_config()
+    token = args.token or (prev.get("main_server", "token", fallback="") if had_config else "")
+    if not token or token == "changeme-secret-token":
+        msg = "Token manquant : ajoutez --token <AGENT_AUTH_TOKEN> (visible côté serveur)."
+        logger.error(msg)
+        _msgbox("Heimdall Agent — Configuration", msg, 0x10)
+        sys.exit(2)
+    # None = conserver la valeur déjà en config (défaut : HTTP, certificat vérifié)
+    use_https  = True if args.https else (False if args.http else None)
+    verify_ssl = False if args.no_verify_ssl else None
+    save_config(
+        args.server.strip(), args.port, token,
+        prev.get("agent", "interval_minutes", fallback="60"),
+        prev.getboolean("agent", "port_scan", fallback=False),
+        prev.get("api", "cve_api_key", fallback=""),
+        use_https=use_https, verify_ssl=verify_ssl,
+    )
+    logger.info(f"Serveur configuré : {_base_url()}")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Heimdall Mini Agent (Windows)")
@@ -1487,6 +1613,13 @@ def main():
     parser.add_argument("--server",     default="",          help="IP du serveur Heimdall")
     parser.add_argument("--port",       default="4000",      help="Port du serveur Heimdall")
     parser.add_argument("--token",      default="",          help="Token secret")
+    parser.add_argument("--silent",     action="store_true",
+                        help="Installation sans assistant : enregistre --server/--port/--token puis démarre")
+    parser.add_argument("--autostart",  action="store_true", help="Démarrer automatiquement avec Windows")
+    parser.add_argument("--https",      action="store_true", help="Se connecter au serveur en HTTPS")
+    parser.add_argument("--http",       action="store_true", help="Se connecter au serveur en HTTP (désactive HTTPS)")
+    parser.add_argument("--no-verify-ssl", action="store_true",
+                        help="HTTPS : ne pas vérifier le certificat (certificat auto-signé)")
     args = parser.parse_args()
 
     if args.install:
@@ -1499,31 +1632,37 @@ def main():
         root.title("HeimdallAgent")
         state.tk_root = root
 
-    # Premier lancement (ou reconfiguration forcée avec --server)
-    if not config_exists() or args.server:
-        if not (args.once or args.no_tray):
-            if TKINTER_OK:
-                wizard = SetupWizard(
-                    state.tk_root,
-                    default_host=args.server,
-                    default_port=args.port,
-                    default_token=args.token,
-                )
-                state.tk_root.wait_window(wizard)
-                if not wizard.result:
-                    sys.exit(0)
-            else:
-                # Fallback sans tkinter : auto-config depuis les args CLI
-                host  = args.server or "127.0.0.1"
-                token = args.token  or "changeme-secret-token"
-                save_config(host, args.port, token, "60", False)
-                _msgbox(
-                    "Heimdall Agent - Configuration",
-                    f"Agent configure pour {host}:{args.port}\n\n"
-                    f"Pour modifier les parametres, editez :\n"
-                    f"%APPDATA%\\HeimdallAgent\\agent.conf",
-                    0x40
-                )
+    # Les paramètres de connexion passés en ligne de commande sont TOUJOURS pris en
+    # compte. Sans assistant graphique (--silent, --once, --no-tray, tkinter absent)
+    # on les enregistre directement ; sinon ils pré-remplissent l'assistant.
+    headless = args.silent or args.once or args.no_tray or not TKINTER_OK
+    if args.server and headless:
+        _apply_cli_config(args)
+    elif (not config_exists() or args.server) and not (args.once or args.no_tray):
+        if TKINTER_OK:
+            wizard = SetupWizard(
+                state.tk_root,
+                default_host=args.server,
+                default_port=args.port,
+                default_token=args.token,
+                default_https=args.https and not args.http,
+                default_verify=not args.no_verify_ssl,
+            )
+            state.tk_root.wait_window(wizard)
+            if not wizard.result:
+                sys.exit(0)
+        else:
+            # Ni tkinter ni --server : configuration par défaut à éditer à la main
+            save_config("127.0.0.1", args.port, "changeme-secret-token", "60", False)
+            _msgbox(
+                "Heimdall Agent - Configuration",
+                f"Agent configure avec les valeurs par defaut.\n\n"
+                f"Editez le fichier :\n%APPDATA%\\HeimdallAgent\\agent.conf",
+                0x40
+            )
+
+    if args.autostart:
+        _set_autostart(True)
 
     load_config()
 

@@ -1,0 +1,105 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Heimdall Agent Server — PRODUCTION
+#
+#  Image Docker Hub + MongoDB avec authentification, non exposé, données
+#  persistées sur l'hôte dans /srv/docker/agents/mongodb.
+#
+#  1. Préparer l'hôte (une seule fois) :
+#       sudo mkdir -p /srv/docker/agents/mongodb
+#       sudo chown -R 999:999 /srv/docker/agents/mongodb
+#  2. Créer un fichier .env à côté de ce compose (voir la liste ci-dessous).
+#  3. Démarrer / mettre à jour :
+#       docker compose -f docker-compose.prod.yaml up -d --pull always
+#
+#  Variables .env OBLIGATOIRES (le compose refuse de démarrer sans elles) :
+#    AGENT_AUTH_TOKEN        token partagé serveur <-> agents      (openssl rand -hex 32)
+#    DASHBOARD_JWT_SECRET    signature des sessions du dashboard   (openssl rand -hex 32)
+#    DEFAULT_ADMIN_EMAIL     compte admin créé au 1er démarrage
+#    DEFAULT_ADMIN_PASSWORD  mot de passe admin (12+ caractères)
+#    SERVER_PUBLIC_HOST      domaine/IP que les agents utiliseront pour joindre ce serveur
+#    MONGO_USER              utilisateur MongoDB                   (ex. heimdall)
+#    MONGO_PASSWORD          mot de passe MongoDB — caractères hexadécimaux
+#                            (openssl rand -hex 24) : il est inséré tel quel dans une URL
+#  Variables facultatives :
+#    AGENT_CVE_VERSION       tag de l'image (défaut latest — épinglez un SHA en prod)
+#    HEIMDALL_CVE_API        URL de l'API CVE     (défaut https://cve.heimdall-security.com)
+#    CVE_API_KEY             clé API CVE (recommandée : sans elle, quota du plan gratuit)
+#    HEIMDALL_FRONT_URL      URL publique du site CVE (liens vers les fiches CVE)
+#    DASHBOARD_ALLOWED_ORIGINS  origines autorisées pour le dashboard
+#    BIND_ADDR               interface d'écoute (défaut 0.0.0.0 ; 127.0.0.1 derrière un reverse proxy)
+#
+#  ⚠️  MONGO_USER / MONGO_PASSWORD ne sont pris en compte qu'à la CRÉATION de la
+#      base (dossier de données vide). Changez-les ensuite depuis mongosh.
+#  ⚠️  Les agents envoient leur token et l'inventaire du parc : placez le serveur
+#      derrière un reverse proxy HTTPS et exposez-le en 127.0.0.1 (BIND_ADDR).
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  agent_server:
+    image: heimdallsecurity/agent-cve:${AGENT_CVE_VERSION:-latest}
+    container_name: heimdall_agent_server
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:4000:4000"
+    environment:
+      MONGO_URI: "mongodb://${MONGO_USER:?Set MONGO_USER}:${MONGO_PASSWORD:?Set MONGO_PASSWORD}@mongodb:27017/heimdall_agents?authSource=admin"
+      SERVER_PUBLIC_HOST: "${SERVER_PUBLIC_HOST:?Set SERVER_PUBLIC_HOST (domaine ou IP publique de ce serveur)}"
+      SERVER_PUBLIC_PORT: "4000"
+      AGENT_AUTH_TOKEN: "${AGENT_AUTH_TOKEN:?Set AGENT_AUTH_TOKEN (32+ characters)}"
+      DASHBOARD_JWT_SECRET: "${DASHBOARD_JWT_SECRET:?Set DASHBOARD_JWT_SECRET (32+ characters)}"
+      DEFAULT_ADMIN_EMAIL: "${DEFAULT_ADMIN_EMAIL:?Set DEFAULT_ADMIN_EMAIL}"
+      DEFAULT_ADMIN_PASSWORD: "${DEFAULT_ADMIN_PASSWORD:?Set DEFAULT_ADMIN_PASSWORD (12+ characters)}"
+      DASHBOARD_ALLOWED_ORIGINS: "${DASHBOARD_ALLOWED_ORIGINS:-}"
+      HEIMDALL_FRONT_URL: "${HEIMDALL_FRONT_URL:-https://cve.heimdall-security.com}"
+      HEIMDALL_CVE_API: "${HEIMDALL_CVE_API:-https://cve.heimdall-security.com}"
+      HEIMDALL_RSS_URL: "${HEIMDALL_RSS_URL:-${HEIMDALL_CVE_API:-https://cve.heimdall-security.com}/cves/rss}"
+      CVE_API_KEY: "${CVE_API_KEY:-}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4000/api/server-info"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - agents
+
+  mongodb:
+    image: mongo:7
+    container_name: heimdall_agent_mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: "${MONGO_USER:?Set MONGO_USER}"
+      MONGO_INITDB_ROOT_PASSWORD: "${MONGO_PASSWORD:?Set MONGO_PASSWORD}"
+    volumes:
+      - /srv/docker/agents/mongodb:/data/db
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - agents
+    # MongoDB n'est volontairement PAS exposé : seul le serveur agent y accède.
+
+networks:
+  agents:
+    driver: bridge

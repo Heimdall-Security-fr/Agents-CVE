@@ -1234,12 +1234,15 @@ def download_agent(target_os):
     server_host = SERVER_PUBLIC_HOST
     server_port = str(SERVER_PUBLIC_PORT)
     auth_token  = AGENT_AUTH_TOKEN
+    use_https   = "true" if _public_scheme() == "https" else "false"
 
     config_content = textwrap.dedent(f"""\
         [main_server]
         host = {server_host}
         port = {server_port}
         token = {auth_token}
+        use_https = {use_https}
+        verify_ssl = true
 
         [agent]
         interval_minutes = 60
@@ -1481,6 +1484,60 @@ def agent_version_info():
         "version":      AGENT_VERSION,
         "download_url": f"http://{SERVER_PUBLIC_HOST}:{SERVER_PUBLIC_PORT}/api/download/agent/windows/exe",
     })
+
+def _public_scheme() -> str:
+    """« https » si la requête est arrivée en HTTPS (directement ou via un reverse
+    proxy qui pose X-Forwarded-Proto), sinon « http »."""
+    proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "http")
+    return "https" if proto.split(",")[0].strip().lower() == "https" else "http"
+
+@app.route('/api/install/windows.ps1', methods=['GET'])
+@require_admin_or_agent_token
+def install_script_windows():
+    """Script PowerShell d'installation pré-configuré (serveur, port, token).
+
+    Installe l'agent pour l'utilisateur courant, SANS droits administrateur (donc
+    sans invite UAC « éditeur inconnu »). Le téléchargement par PowerShell n'ajoute
+    pas de « marque du web » : pas d'écran SmartScreen, contrairement à un
+    téléchargement par navigateur. Le script contient le token : il n'est servi
+    qu'à un appelant authentifié (session admin ou token agent).
+    """
+    q = lambda v: str(v).replace("'", "''")          # échappement PowerShell '…'
+    scheme = _public_scheme()
+    https_arg = ",'--https'" if scheme == "https" else ""
+    script = textwrap.dedent(f"""\
+        # Heimdall Agent — installation (utilisateur courant, sans droits administrateur)
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference    = 'SilentlyContinue'
+        $server = '{q(SERVER_PUBLIC_HOST)}'
+        $port   = '{q(SERVER_PUBLIC_PORT)}'
+        $token  = '{q(AGENT_AUTH_TOKEN)}'
+
+        $dir = Join-Path $env:LOCALAPPDATA 'HeimdallAgent'
+        $exe = Join-Path $dir 'HeimdallAgent.exe'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+        # Ferme une instance déjà en cours avant de remplacer l'exécutable
+        Get-Process -Name HeimdallAgent -ErrorAction SilentlyContinue | Stop-Process -Force
+        Start-Sleep -Milliseconds 500
+
+        Write-Host "Téléchargement de l'agent depuis $server`:$port ..."
+        try {{
+            Invoke-WebRequest -UseBasicParsing -Uri "{scheme}://${{server}}:${{port}}/api/download/agent/windows/exe" `
+                -Headers @{{ 'x-agent-token' = $token }} -OutFile $exe
+        }} catch {{
+            Write-Host "Échec du téléchargement : $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "Vérifiez que le serveur est joignable sur $server`:$port et que le token est valide." -ForegroundColor Yellow
+            exit 1
+        }}
+        Unblock-File -Path $exe
+
+        # Enregistre le serveur, démarre l'agent et active le lancement avec Windows
+        Start-Process -FilePath $exe -ArgumentList @('--silent','--autostart','--server',$server,'--port',$port,'--token',$token{https_arg})
+        Write-Host "Agent Heimdall installé et démarré (icône dans la zone de notification)." -ForegroundColor Green
+        """)
+    return Response(script, mimetype="text/plain; charset=utf-8")
+
 
 @app.route('/api/download/agent/windows/exe', methods=['GET'])
 @require_agent_token
