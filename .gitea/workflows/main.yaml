@@ -1,3 +1,12 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  CI Agents CVE — build sur push vers la branche `agents`.
+#
+#  Secrets Gitea requis (Repo → Settings → Actions → Secrets) :
+#    DOCKERHUB_USERNAME   compte Docker Hub (namespace heimdallsecurity)
+#    DOCKERHUB_TOKEN      Access Token Docker Hub (PAS le mot de passe du compte)
+#    GH_MIRROR_TOKEN       Personal Access Token GitHub, scope "repo",
+#                          autorisé à pousser sur Heimdall-Security-fr/Agents-CVE
+# ─────────────────────────────────────────────────────────────────────────────
 name: agentscve
 
 on:
@@ -11,6 +20,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+  # Miroir automatique vers GitHub — le repo GitHub reste à jour à chaque push,
+  # sans étape manuelle. C'est un simple miroir (personne ne commit dessus
+  # directement) donc on force-push : l'historique GitHub est remplacé par
+  # celui de Gitea à chaque run.
+  mirror-github:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Push mirror vers GitHub
+        run: |
+          git remote add github "https://x-access-token:${{ secrets.GH_MIRROR_TOKEN }}@github.com/Heimdall-Security-fr/Agents-CVE.git"
+          git push github HEAD:main --force
+
   publish:
     runs-on: ubuntu-latest
     needs: build
@@ -23,10 +48,18 @@ jobs:
             [registry."192.168.1.178:37777"]
               https = true
               insecure = true
+      - name: Login Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./server/Dockerfile
           push: true
-          tags: "192.168.1.178:37777/agentscve:latest"
+          tags: |
+            192.168.1.178:37777/agentscve:latest
+            heimdallsecurity/agent-cve:latest
+            heimdallsecurity/agent-cve:${{ gitea.sha }}
