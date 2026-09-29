@@ -105,16 +105,28 @@ def _dlg_info(title, msg, parent=None):
 # ─── Logging ──────────────────────────────────────────────────────────────────
 _LOG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "HeimdallAgent")
 os.makedirs(_LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(_LOG_DIR, "agent.log")
 
+from logging.handlers import RotatingFileHandler
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(os.path.join(_LOG_DIR, "agent.log"), encoding="utf-8")
+        RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=2, encoding="utf-8"),
     ]
 )
 logger = logging.getLogger("HeimdallAgent")
+
+def read_log_tail(n: int = 200) -> list:
+    """Dernières `n` lignes du log local — envoyées au serveur (debug centralisé)
+    et affichées par le menu tray / `--logs`."""
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return [l.rstrip("\n") for l in lines[-n:]]
+    except FileNotFoundError:
+        return []
 
 # ─── Chemins de config ────────────────────────────────────────────────────────
 _EXE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
@@ -835,6 +847,7 @@ def send_report(max_attempts: int = 6):
         "compliance":    compliance,
         "update_check":  update_check,
         "ip_addresses":  ip_addresses,
+        "log_tail":      read_log_tail(80),
     }
 
     delay = 5
@@ -1206,6 +1219,17 @@ def _on_scan_now(_icon=None, _item=None):
 
 def _on_open_dashboard(_icon=None, _item=None):
     webbrowser.open(_base_url())
+
+def _on_view_logs(_icon=None, _item=None):
+    """Ouvre le fichier de log local — inspection rapide en cas de souci."""
+    try:
+        os.startfile(LOG_FILE)
+    except Exception:
+        try:
+            subprocess.Popen(["notepad.exe", LOG_FILE])
+        except Exception as e:
+            logger.error(f"Impossible d'ouvrir le fichier de log: {e}")
+            _msgbox("Heimdall — Logs", f"Fichier de log :\n{LOG_FILE}", 0x40)
 
 def _on_configure(_icon=None, _item=None):
     if not TKINTER_OK:
@@ -1648,7 +1672,29 @@ def main():
                         help="HTTPS : ne pas vérifier le certificat (certificat auto-signé)")
     parser.add_argument("--no-auto-update", action="store_true",
                         help="Désactiver la mise à jour automatique (demande confirmation à la place)")
+    parser.add_argument("--logs",       action="store_true", help="Afficher les derniers logs locaux puis exit")
+    parser.add_argument("-f", "--follow", action="store_true", help="Avec --logs : suivre en direct")
+    parser.add_argument("--lines",      type=int, default=200, help="Avec --logs : nombre de lignes (défaut 200)")
     args = parser.parse_args()
+
+    if args.logs:
+        print(f"# {LOG_FILE}\n")
+        for line in read_log_tail(args.lines):
+            print(line)
+        if args.follow:
+            print("\n--- Suivi en direct (Ctrl+C pour arrêter) ---")
+            try:
+                with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(0, os.SEEK_END)
+                    while True:
+                        line = f.readline()
+                        if line:
+                            print(line, end="")
+                        else:
+                            time.sleep(0.5)
+            except (FileNotFoundError, KeyboardInterrupt):
+                pass
+        sys.exit(0)
 
     if args.install:
         install_scheduled_task()
@@ -1722,6 +1768,7 @@ def main():
         pystray.MenuItem("🔍  Scanner maintenant",   _on_scan_now),
         pystray.MenuItem("⚙️   Configurer…",          _on_configure),
         pystray.MenuItem("📊  Ouvrir le dashboard",  _on_open_dashboard),
+        pystray.MenuItem("📄  Voir les logs",        _on_view_logs),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("⬆️  Vérifier les mises à jour", _on_check_update),
         pystray.MenuItem("🗑  Désinstaller…", _on_uninstall),

@@ -985,6 +985,24 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
             })
     return vulns
 
+# ─── Logs locaux des agents (debug centralisé) ────────────────────────────────
+_LOG_TAIL_MAX_LINES = 200
+_LOG_TAIL_MAX_CHARS = 50_000  # borne dure — entrée non fiable, un agent ne doit pas pouvoir gonfler Mongo
+
+def _sanitize_log_tail(raw):
+    """Valide/borne les lignes de log envoyées par l'agent (entrée non fiable :
+    liste de chaînes, comptage et taille totale plafonnés)."""
+    if not isinstance(raw, list):
+        return None
+    lines, total = [], 0
+    for line in raw[-_LOG_TAIL_MAX_LINES:]:
+        s = str(line)[:1000]
+        total += len(s)
+        if total > _LOG_TAIL_MAX_CHARS:
+            break
+        lines.append(s)
+    return lines
+
 # ─── Logiciels à mettre à jour (rapporté par les agents) ─────────────────────
 def _sanitize_update_check(raw):
     """Valide/borne le bloc `update_check` envoyé par l'agent (entrée non fiable)."""
@@ -1029,6 +1047,7 @@ def agent_report():
     ip_addresses  = data.get("ip_addresses", [])        # NEW: agent's own IPs
     agent_version = data.get("agent_version", "")        # NEW: version reportée
     update_check  = _sanitize_update_check(data.get("update_check"))
+    log_tail      = _sanitize_log_tail(data.get("log_tail"))
     remote_ip     = request.remote_addr or ""           # server-observed IP as fallback
 
     # Fusion IP : on prend ce que l'agent envoie + l'IP source vue par Flask.
@@ -1095,6 +1114,12 @@ def agent_report():
         # Si la corrélation n'a rien retourné (ex: rate limit côté API), on conserve
         # les vulnérabilités précédemment connues plutôt que de les écraser par []
         update_fields = {**report, "last_seen": datetime.utcnow()}
+        # log_tail n'entre PAS dans `report`/agent_reports (historique) : à ~8 ko par
+        # rapport, ça gonflerait Mongo inutilement pour une donnée qui n'a d'intérêt
+        # que « fraîche ». Seul le dernier snapshot (mongo.db.agents) le garde.
+        if log_tail is not None:
+            update_fields["log_tail"] = log_tail
+            update_fields["log_tail_received_at"] = datetime.utcnow()
         if not vulns:
             existing = mongo.db.agents.find_one({"hostname": hostname},
                                                  {"vulnerabilities": 1, "vulnerable_count": 1})
@@ -1135,8 +1160,10 @@ def agent_heartbeat(hostname):
 
 @app.route('/api/agents', methods=['GET'])
 def list_agents():
+    # log_tail exclu : peut contenir des chemins/IP internes, servi séparément
+    # (endpoint authentifié dédié) — cette route n'est pas protégée par un rôle.
     with db_lock:
-        agents = list(mongo.db.agents.find({}, {"_id": 0}))
+        agents = list(mongo.db.agents.find({}, {"_id": 0, "log_tail": 0}))
     for a in agents:
         a["online"] = _is_online(a)
         a["agent_up_to_date"] = _agent_is_up_to_date(a.get("agent_version", ""))
@@ -1145,11 +1172,27 @@ def list_agents():
 @app.route('/api/agents/<hostname>', methods=['GET'])
 def get_agent(hostname):
     with db_lock:
-        agent = mongo.db.agents.find_one({"hostname": hostname}, {"_id": 0})
+        agent = mongo.db.agents.find_one({"hostname": hostname}, {"_id": 0, "log_tail": 0})
     if not agent:
         return {"error": "Agent not found"}, 404
     agent["online"] = _is_online(agent)
     return jsonify(_clean(agent))
+
+@app.route('/api/agents/<hostname>/logs', methods=['GET'])
+@require_role("admin", "inspection_logs", "codir")
+def agent_logs(hostname):
+    """Derniers logs locaux de l'agent (débogage) — endpoint authentifié séparé :
+    peut contenir des chemins de fichiers, IP, messages d'erreur internes."""
+    with db_lock:
+        agent = mongo.db.agents.find_one(
+            {"hostname": hostname}, {"_id": 0, "log_tail": 1, "log_tail_received_at": 1})
+    if not agent:
+        return {"error": "Agent not found"}, 404
+    return jsonify(_clean({
+        "hostname": hostname,
+        "log_tail": agent.get("log_tail") or [],
+        "received_at": agent.get("log_tail_received_at"),
+    }))
 
 @app.route('/api/agents/<hostname>/history', methods=['GET'])
 def agent_history(hostname):
@@ -1925,7 +1968,7 @@ def list_servers():
     """List all agents with IPs, OS, online status and subnet grouping.
     Docker IPs (172.16-31.x.x) are already filtered when agents report in."""
     with db_lock:
-        agents = list(mongo.db.agents.find({}, {"_id": 0, "software": 0}))
+        agents = list(mongo.db.agents.find({}, {"_id": 0, "software": 0, "log_tail": 0}))
 
     servers = []
     subnet_map: dict = {}  # subnet -> [hostname, ...]

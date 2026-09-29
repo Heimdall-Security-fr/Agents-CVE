@@ -182,6 +182,7 @@ HeimdallAgent.exe --silent --autostart --server <serveur> --port <port> --token 
 | `--autostart` | Démarrer avec Windows                                                 |
 | `--once`      | Un seul envoi puis sortie                                             |
 | `--no-auto-update` | Redemander confirmation avant chaque mise à jour, au lieu de l'appliquer automatiquement |
+| `--logs`      | Derniers logs locaux (`--logs -f` pour suivre en direct) — aussi accessible depuis le menu de l'icône (*Voir les logs*) |
 
 Sans options, un assistant graphique demande le serveur, le port et le token.
 
@@ -221,6 +222,7 @@ piloter ensuite :
 | `heimdall --scan`            | Scanner maintenant (un seul rapport)                     |
 | `heimdall --status`          | État de l'agent : config, service, connexion au serveur  |
 | `heimdall --configuration`   | Voir / modifier la configuration (édite `agent.conf`)    |
+| `heimdall --logs`            | Derniers logs locaux (`--logs -f` pour suivre en direct) |
 | `heimdall --daemon`          | Mode démon (normalement géré par le service, pas à lancer à la main) |
 | `heimdall --check-update`    | Forcer la vérification d'une mise à jour                 |
 | `heimdall --uninstall`       | Désinstaller proprement (service + fichiers + commande)  |
@@ -259,14 +261,37 @@ recevoir la mise à jour automatique.
 
 ---
 
-## 📋 Logs centralisés
+## 📋 Logs
+
+Deux choses distinctes portent le nom « logs » ici :
+
+### Logs du serveur agent (monitoring de l'infra)
 
 Optionnel. En renseignant `LOGS_API_URL` / `LOGS_API_KEY` (voir tableau des variables
 d'environnement ci-dessus) — la même API que celle utilisée par le site CVE — les logs
-du serveur agent (erreurs, connexions, résultats de corrélation…) sont expédiés vers
-votre plateforme de monitoring centralisée, en plus de `docker logs`. Envoi non bloquant
-(file + thread dédié) : un souci réseau sur cette API ne ralentit jamais le serveur, et
-les logs perdus ne sont pas retentés.
+du **serveur agent lui-même** (erreurs, connexions, résultats de corrélation…) sont
+expédiés vers votre plateforme de monitoring centralisée, en plus de `docker logs`.
+Envoi non bloquant (file + thread dédié) : un souci réseau sur cette API ne ralentit
+jamais le serveur, et les logs perdus ne sont pas retentés.
+
+### Logs des agents installés (débogage d'un poste)
+
+Chaque agent (Windows, Linux, macOS) écrit ses propres logs localement — inspection
+directe sur la machine :
+
+```bash
+heimdall --logs        # dernières lignes
+heimdall --logs -f     # suivi en direct (comme tail -f)
+```
+
+Sur Windows, le menu de l'icône propose aussi *Voir les logs* (ouvre le fichier).
+
+À chaque rapport, l'agent envoie aussi ses ~80 dernières lignes de log au serveur
+(borné niveau serveur : 200 lignes / 50 ko max, jamais conservé dans l'historique des
+rapports — uniquement le dernier snapshot). Depuis le dashboard, page *Serveurs*, le
+lien **📄 logs** sous chaque hôte ouvre ces logs pour déboguer sans accès SSH/RDP au
+poste. Réservé aux rôles admin/inspection — l'API `/api/agents/<hôte>/logs` n'est pas
+publique, contrairement à certains autres endpoints `/api/agents*` de ce serveur.
 
 ---
 

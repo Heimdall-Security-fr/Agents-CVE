@@ -34,11 +34,40 @@ from datetime import datetime
 AGENT_VERSION = "1.0.1"  # remplacé à chaque build par la CI (voir VERSION et server/Dockerfile)
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
+# Fichier local pour l'inspection sur la machine (heimdall --logs) ET base du
+# log_tail envoyé au serveur à chaque rapport (débogage centralisé, dashboard).
+def _log_file_path() -> str:
+    for d in ("/opt/heimdall-agent", os.path.dirname(os.path.abspath(__file__))):
+        if os.path.isdir(d) and os.access(d, os.W_OK):
+            return os.path.join(d, "agent.log")
+    home_dir = os.path.join(os.path.expanduser("~"), ".heimdall-agent")
+    os.makedirs(home_dir, exist_ok=True)
+    return os.path.join(home_dir, "agent.log")
+
+LOG_FILE = _log_file_path()
+_handlers = [logging.StreamHandler()]
+try:
+    from logging.handlers import RotatingFileHandler
+    _handlers.append(RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=2, encoding="utf-8"))
+except Exception:
+    pass  # pas de droits d'écriture — on garde au moins la sortie console/journald
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=_handlers,
 )
 logger = logging.getLogger("HeimdallAgent")
+
+def read_log_tail(n: int = 200) -> list[str]:
+    """Dernières `n` lignes du log local — envoyées au serveur (debug centralisé)
+    et affichées par `heimdall --logs`."""
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return [l.rstrip("\n") for l in lines[-n:]]
+    except FileNotFoundError:
+        return []
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
@@ -761,6 +790,7 @@ def _build_payload(config, software_list, open_ports) -> dict:
         "compliance":    compliance,
         "update_check":  update_check,
         "ip_addresses":  get_local_ips(),
+        "log_tail":      read_log_tail(80),
     }
 
 def send_report(config, software_list, open_ports, max_attempts: int = 6) -> dict | None:
@@ -991,23 +1021,45 @@ def cmd_status(cfg):
     print(f"Heimdall Mini Agent v{AGENT_VERSION}")
     print(f"Configuration : {path or '(par défaut)'}")
     print(f"Serveur       : {_server_url(cfg)}  (vérif. certificat : {_tls_verify(cfg)})")
+    print(f"Fichier de log: {LOG_FILE}  (voir aussi : heimdall --logs)")
     system = platform.system()
     if system == "Linux":
         r = subprocess.run(["systemctl", "is-active", "heimdall-agent"],
                            capture_output=True, text=True)
         print(f"Service       : {r.stdout.strip() or 'introuvable'}")
-        print("Logs          : journalctl -u heimdall-agent -f")
     elif system == "Darwin":
         r = subprocess.run(["launchctl", "list", "com.heimdall.agent"],
                            capture_output=True, text=True)
         print(f"Service       : {'actif' if r.returncode == 0 else 'introuvable'}")
-        print("Logs          : tail -f /var/log/heimdall-agent.log")
     try:
         r = requests.get(f"{_server_url(cfg)}/api/ping", headers=_agent_headers(cfg),
                          timeout=5, verify=_tls_verify(cfg))
         print(f"Connexion     : {'OK' if r.status_code == 200 else f'HTTP {r.status_code}'}")
     except Exception as e:
         print(f"Connexion     : échec ({type(e).__name__})")
+
+def cmd_logs(n: int, follow: bool):
+    """Affiche les dernières lignes du log local — inspection sur la machine
+    sans dépendre de journalctl (fonctionne même hors service systemd)."""
+    print(f"# {LOG_FILE}\n")
+    for line in read_log_tail(n):
+        print(line)
+    if not follow:
+        return
+    print("\n--- Suivi en direct (Ctrl+C pour arrêter) ---")
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, os.SEEK_END)
+            while True:
+                line = f.readline()
+                if line:
+                    print(line, end="")
+                else:
+                    time.sleep(0.5)
+    except FileNotFoundError:
+        print("Fichier de log introuvable.")
+    except KeyboardInterrupt:
+        pass
 
 # ─── Désinstallation ──────────────────────────────────────────────────────────
 def uninstall_agent() -> int:
@@ -1126,6 +1178,7 @@ if __name__ == "__main__":
             "Commandes courantes :\n"
             "  heimdall --scan            Scanner maintenant (un seul rapport)\n"
             "  heimdall --status          Voir l'état de l'agent et du service\n"
+            "  heimdall --logs            Voir les derniers logs (--logs -f pour suivre en direct)\n"
             "  heimdall --configuration   Voir / modifier la configuration\n"
             "  heimdall --daemon          Lancer en mode démon (généralement via le service)\n"
             "  heimdall --check-update    Vérifier une mise à jour\n"
@@ -1140,6 +1193,9 @@ if __name__ == "__main__":
     parser.add_argument("--daemon",     action="store_true", help="Mode démon continu")
     parser.add_argument("--version",    action="store_true", help="Afficher la version puis exit")
     parser.add_argument("--status",     action="store_true", help="Afficher l'état de l'agent (config, service, connexion) puis exit")
+    parser.add_argument("--logs",       action="store_true", help="Afficher les derniers logs locaux puis exit")
+    parser.add_argument("-f", "--follow", action="store_true", help="Avec --logs : suivre en direct (comme tail -f)")
+    parser.add_argument("--lines", type=int, default=200, help="Avec --logs : nombre de lignes (défaut 200)")
     parser.add_argument("--configuration", "--configure", dest="configuration", action="store_true",
                         help="Afficher / modifier la configuration puis exit")
     parser.add_argument("--check-update", action="store_true", help="Forcer la vérification d'une mise à jour puis exit")
@@ -1159,6 +1215,9 @@ if __name__ == "__main__":
         sys.exit(0)
     if args.uninstall:
         sys.exit(uninstall_agent())
+    if args.logs:
+        cmd_logs(args.lines, args.follow)
+        sys.exit(0)
 
     cfg = load_config()
     if not cfg.has_section("main_server"):
