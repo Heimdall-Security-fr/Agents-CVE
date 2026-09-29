@@ -119,6 +119,9 @@ s'auto-mettent à jour sur la version exposée par le serveur.
 | `HEIMDALL_CVE_API`       | `http://cve_api:5000`      | API CVE interrogée pour les corrélations (hors réseau Docker Heimdall : `https://cve.heimdall-security.com`) |
 | `CVE_API_KEY`            | _(vide)_                   | Clé API CVE (optionnelle, plan premium)      |
 | `SERVER_PUBLIC_HOST`     | `127.0.0.1`                | IP/domaine public de ce serveur              |
+| `LOGS_API_URL`           | _(vide)_                   | API de logs centralisée — la même que le site CVE. Vide = désactivé (logs stdout / `docker logs` uniquement) |
+| `LOGS_API_KEY`           | _(vide)_                   | Clé de cette API de logs                     |
+| `LOGS_SERVER_NAME`       | `Agents-CVE`                | Nom affiché dans les logs centralisés        |
 
 ---
 
@@ -178,8 +181,13 @@ HeimdallAgent.exe --silent --autostart --server <serveur> --port <port> --token 
 | `--silent`    | Pas d'assistant graphique : enregistre et démarre                     |
 | `--autostart` | Démarrer avec Windows                                                 |
 | `--once`      | Un seul envoi puis sortie                                             |
+| `--no-auto-update` | Redemander confirmation avant chaque mise à jour, au lieu de l'appliquer automatiquement |
 
 Sans options, un assistant graphique demande le serveur, le port et le token.
+
+**Mise à jour** : automatique par défaut (comme Linux/macOS), sans confirmation — une
+notification s'affiche après application. Réglable depuis *Configurer…* (case « Mise à
+jour automatique ») ou `[agent] auto_update = false` dans `agent.conf`.
 
 Dans **Configuration** (clic droit sur l'icône), vous pouvez aussi choisir l'**apparence**
 (sombre, clair ou automatique selon le thème Windows) et activer le **démarrage avec Windows**.
@@ -193,28 +201,41 @@ Pour compiler l'exe vous-même (PowerShell admin) :
 
 ### c. Linux / macOS 🐧🍎
 
-Récupérez l'agent directement depuis votre serveur (ou clonez ce dépôt) :
+**Installation recommandée (une commande).** Dans un terminal, en remplaçant `<serveur>`,
+`<port>` et `<AGENT_AUTH_TOKEN>` (le dashboard, page *Déploiement*, affiche la commande
+avec le serveur et le port déjà remplis) :
+
+```bash
+curl -fsSL -H "x-agent-token: <AGENT_AUTH_TOKEN>" http://<serveur>:<port>/api/download/agent/linux \
+  -o heimdall.zip && unzip -o heimdall.zip -d heimdall && sudo bash heimdall/install.sh
+```
+
+Le script installe l'agent dans `/opt/heimdall-agent`, écrit `agent.conf` (serveur, port,
+token — déjà renseignés), installe la seule dépendance nécessaire (`requests`, aucun
+`requirements.txt` à gérer à la main), crée le service (**systemd** sur Linux, **launchd**
+sur macOS), le démarre, et pose une commande **`heimdall`** dans `/usr/local/bin` pour le
+piloter ensuite :
+
+| Commande                    | Effet                                                    |
+| ---------------------------- | -------------------------------------------------------- |
+| `heimdall --scan`            | Scanner maintenant (un seul rapport)                     |
+| `heimdall --status`          | État de l'agent : config, service, connexion au serveur  |
+| `heimdall --configuration`   | Voir / modifier la configuration (édite `agent.conf`)    |
+| `heimdall --daemon`          | Mode démon (normalement géré par le service, pas à lancer à la main) |
+| `heimdall --check-update`    | Forcer la vérification d'une mise à jour                 |
+| `heimdall --uninstall`       | Désinstaller proprement (service + fichiers + commande)  |
+| `heimdall --version`         | Afficher la version installée                            |
+| `heimdall --help`            | Toutes les options                                       |
+
+Logs : `journalctl -u heimdall-agent -f` (Linux) ou `tail -f /var/log/heimdall-agent.log` (macOS).
+
+**Installation manuelle**, sans service ni commande `heimdall` (utile pour un test ponctuel) :
 
 ```bash
 curl -O http://<serveur>:4000/static/mini_agent.py
-
-# Dépendances
 pip3 install requests
-
-# Envoi unique (test)
-python3 mini_agent.py --once
-
-# Mode démon (envoi périodique selon interval_minutes)
-python3 mini_agent.py
+python3 mini_agent.py --server <serveur> --port <port> --token <AGENT_AUTH_TOKEN> --scan
 ```
-
-Options utiles :
-
-| Commande                          | Effet                                            |
-| --------------------------------- | ------------------------------------------------ |
-| `python3 mini_agent.py --once`    | Une collecte + un envoi, puis sortie             |
-| `python3 mini_agent.py`           | Mode démon (boucle + heartbeat + auto-update)    |
-| `python3 mini_agent.py --uninstall` | Désinstalle proprement (service + fichiers)    |
 
 L'agent gère l'**auto-update** (récupération de la dernière version auprès du serveur)
 et la **résilience réseau** (backoff exponentiel si le serveur est injoignable).
@@ -229,6 +250,23 @@ est disponible (winget, apt, dnf, yum, zypper, brew).
 
 📘 **[Guide utilisateur — Conformité et mises à jour](docs/GUIDE_CONFORMITE.md)** :
 fonctionnement, liste des règles, règles personnalisées, droits nécessaires, dépannage.
+
+**Version des agents** : le Dashboard affiche une carte « Agents à jour » (combien sont
+sur la dernière version publiée par ce serveur), et chaque agent porte un badge **à
+jour** / **en retard** sur la page *Serveurs*. Les agents se mettent à jour tout seuls
+(section 2), ce badge sert surtout à repérer ceux restés éteints trop longtemps pour
+recevoir la mise à jour automatique.
+
+---
+
+## 📋 Logs centralisés
+
+Optionnel. En renseignant `LOGS_API_URL` / `LOGS_API_KEY` (voir tableau des variables
+d'environnement ci-dessus) — la même API que celle utilisée par le site CVE — les logs
+du serveur agent (erreurs, connexions, résultats de corrélation…) sont expédiés vers
+votre plateforme de monitoring centralisée, en plus de `docker logs`. Envoi non bloquant
+(file + thread dédié) : un souci réseau sur cette API ne ralentit jamais le serveur, et
+les logs perdus ne sont pas retentés.
 
 ---
 

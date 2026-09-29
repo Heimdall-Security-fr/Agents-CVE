@@ -721,6 +721,8 @@ async function loadDashboard() {
       { l:'En ligne',      v:s.agents_online,     c:'color:var(--green)',  sub:'/ '+s.agents_total },
       { l:'Hors ligne',    v:s.agents_offline,    c:'color:var(--red)',    sub:'/ '+s.agents_total },
       { l:'Vulnérables',   v:s.vulnerable_agents, c:'color:var(--orange)', sub:'au moins 1 CVE' },
+      { l:'Agents à jour', v:s.agents_up_to_date, c:s.agents_outdated?'color:var(--orange)':'color:var(--green)',
+        sub:(s.agents_outdated?s.agents_outdated+' en retard · ':'')+'serveur v'+(s.server_agent_version||'?') },
       { l:'CVE critiques', v:s.total_critical,    c:'color:var(--red)',    sub:'CVSS >= 9.0' },
       { l:'CVE élevées',   v:s.total_high,        c:'color:var(--orange)', sub:'CVSS >= 7.0' },
       { l:'Rapports',      v:s.reports_total,     c:'',                    sub:'' },
@@ -820,10 +822,13 @@ function renderServers() {
         + (s.release ? ' <span style="font-size:10px;opacity:.7">'+esc(s.release)+'</span>' : '')
         + '</div>'
         + (s.os_build ? '<div style="font-size:10px;color:var(--muted);opacity:.7">'+esc(s.os_build)+'</div>' : '');
+      const verBadge = s.agent_up_to_date === true  ? ' <span class="badge badge-green" style="font-size:9px" title="Agent à jour">à jour</span>'
+                      : s.agent_up_to_date === false ? ' <span class="badge badge-orange" style="font-size:9px" title="Une version plus récente est disponible">en retard</span>'
+                      : '';
       const hostLine = '<span class="dot '+(s.online?'dot-green':'dot-red')+'"></span>'
         + '<strong class="code" style="background:none;font-size:13px">'+esc(s.hostname)+'</strong>'
         + (s.agent_version
-            ? '<div style="font-size:10px;color:var(--muted);margin-top:2px">agent v'+esc(s.agent_version)+(swCount?' · '+swCount+' logiciels':'')+'</div>'
+            ? '<div style="font-size:10px;color:var(--muted);margin-top:2px">agent v'+esc(s.agent_version)+(swCount?' · '+swCount+' logiciels':'')+verBadge+'</div>'
             : (swCount?'<div style="font-size:10px;color:var(--muted);margin-top:2px">'+swCount+' logiciels</div>':''));
       return '<tr>'
         +'<td>'+hostLine+'</td>'
@@ -1522,11 +1527,11 @@ async function loadDeploy() {
       +'</div></div>'
 
       +'<div class="deploy-step"><h3>🚀 Installation Linux / macOS</h3>'
-      +'<div class="code-block">curl -sSL -H "x-agent-token: &lt;AGENT_AUTH_TOKEN&gt;" '+scheme+'://'+esc(host)+':'+esc(port)+'/api/download/agent/linux -o heimdall.zip\nunzip heimdall.zip -d heimdall &amp;&amp; cd heimdall\npip install -r requirements.txt\npython mini_agent.py --daemon</div>'
-      +'<p class="text-muted" style="font-size:12px;margin-top:8px">L\'archive contient déjà <code>agent.conf</code> (serveur, port, token, HTTP/HTTPS). Pour un certificat auto-signé, ajoutez <code>verify_ssl = false</code> dans <code>[main_server]</code> ou lancez avec <code>--no-verify-ssl</code>.</p></div>'
-      +'<div class="deploy-step" style="margin-top:-8px">'
-      +'<label style="margin-top:16px">Service systemd</label>'
-      +'<div class="code-block">[Unit]\nDescription=Heimdall Security Agent\nAfter=network.target\n\n[Service]\nWorkingDirectory=/opt/heimdall\nExecStart=/usr/bin/python3 /opt/heimdall/mini_agent.py --daemon\nRestart=always\n\n[Install]\nWantedBy=multi-user.target</div></div>'
+      +'<p class="text-muted" style="font-size:12px;margin-bottom:8px">Une seule commande, aucune dépendance à installer à la main (seul <code>requests</code> est nécessaire, installé automatiquement). Le script configure le service (systemd sur Linux, launchd sur macOS), le démarre, et pose une commande <code>heimdall</code> pour le piloter ensuite. Remplacez <code>&lt;AGENT_AUTH_TOKEN&gt;</code> par le token de votre serveur.</p>'
+      +'<div class="code-block">curl -fsSL -H "x-agent-token: &lt;AGENT_AUTH_TOKEN&gt;" '+scheme+'://'+esc(host)+':'+esc(port)+'/api/download/agent/linux -o heimdall.zip &amp;&amp; unzip -o heimdall.zip -d heimdall &amp;&amp; sudo bash heimdall/install.sh</div>'
+      +'<p class="text-muted" style="font-size:12px;margin-top:12px">Une fois installé, pilotez l\'agent avec :</p>'
+      +'<div class="code-block">heimdall --scan            # scanner maintenant\nheimdall --status          # état de l\'agent et du service\nheimdall --configuration   # voir / modifier la configuration\nheimdall --uninstall       # désinstaller\nheimdall --help             # toutes les options</div>'
+      +'<p class="text-muted" style="font-size:12px;margin-top:8px">Pour un certificat HTTPS auto-signé, ajoutez <code>verify_ssl = false</code> dans <code>[main_server]</code> de <code>/opt/heimdall-agent/agent.conf</code> (ou <code>heimdall --configuration</code>) puis <code>sudo systemctl restart heimdall-agent</code>.</p></div>'
 
       +'<div class="deploy-step"><h3>🪟 Installation Windows</h3>'
       +'<p class="text-muted" style="font-size:12px;margin-bottom:8px">Téléchargez puis exécutez <code>Install-HeimdallAgent.ps1</code>. Il configure automatiquement le serveur, le port et le token, sans saisie manuelle.</p>'

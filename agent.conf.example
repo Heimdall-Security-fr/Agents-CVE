@@ -34,6 +34,10 @@ port_scan = false
 ; Vérification des logiciels à mettre à jour (winget / apt / dnf / yum / zypper / brew).
 ; Intervalle en heures entre deux vérifications (0 = désactivée).
 update_check_hours = 6
+; Mise à jour AUTOMATIQUE de l'agent lui-même (recommandé). Sur Linux/macOS, se fait
+; toujours sans confirmation. Sur Windows, auto_update = false redemande confirmation
+; avant chaque mise à jour au lieu de l'appliquer directement.
+auto_update = true
 
 [ui]
 ; Windows uniquement — apparence de l'agent : dark | light | auto (suit le thème Windows)

@@ -46,14 +46,21 @@ DEFAULT_CONFIG = {
     "agent":       {"interval_minutes": "60", "port_scan": "false"}
 }
 
+CONFIG_SEARCH_PATHS = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.conf"),
+    "/opt/heimdall-agent/agent.conf",
+    r"C:\ProgramData\HeimdallAgent\agent.conf",
+]
+
+def _config_path_existing():
+    for p in CONFIG_SEARCH_PATHS:
+        if os.path.exists(p):
+            return p
+    return None
+
 def load_config():
     config = configparser.ConfigParser()
-    search_paths = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.conf"),
-        "/opt/heimdall-agent/agent.conf",
-        r"C:\ProgramData\HeimdallAgent\agent.conf"
-    ]
-    loaded = config.read(search_paths)
+    loaded = config.read(CONFIG_SEARCH_PATHS)
     if not loaded:
         logger.warning("agent.conf introuvable — utilisation des valeurs par défaut")
         config.read_dict(DEFAULT_CONFIG)
@@ -932,6 +939,76 @@ def check_for_update(config) -> bool:
         os.execv(sys.executable, [sys.executable, script_path] + sys.argv[1:])
     return True
 
+def _remove_heimdall_shortcut(errors: list):
+    path = "/usr/local/bin/heimdall"
+    if os.path.exists(path) or os.path.islink(path):
+        try:
+            os.remove(path)
+        except PermissionError:
+            errors.append(f"Impossible de supprimer {path} (sudo requis ?)")
+
+# ─── Configuration / statut (commande `heimdall`) ─────────────────────────────
+def _mask_token(token: str) -> str:
+    return f"{token[:4]}…{token[-4:]}" if len(token) > 10 else ("****" if token else "(vide)")
+
+def cmd_configuration(cfg):
+    path = _config_path_existing()
+    print(f"Heimdall Mini Agent v{AGENT_VERSION}")
+    print(f"Fichier de configuration : {path or '(introuvable — valeurs par défaut)'}")
+    print()
+    print(f"  Serveur          : {_server_url(cfg)}")
+    print(f"  Token            : {_mask_token(cfg.get('main_server', 'token', fallback=''))}")
+    print(f"  Vérifier certif. : {_tls_verify(cfg)}")
+    print(f"  Intervalle       : {cfg.get('agent', 'interval_minutes', fallback='60')} min")
+    print(f"  Scan de ports    : {cfg.getboolean('agent', 'port_scan', fallback=False)}")
+    print()
+    if not path:
+        print("Aucune configuration trouvée. Créez-en une avec, par exemple :")
+        print("  heimdall --server <IP> --port 4000 --token <AGENT_AUTH_TOKEN> --scan")
+        return
+    print("Pour modifier une valeur sans éditer le fichier :")
+    print("  heimdall --server <IP> --port <PORT> --token <TOKEN> [--https] [--no-verify-ssl] --scan")
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            ans = input(f"\nOuvrir {path} dans un éditeur maintenant ? [o/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans == "o":
+            editor = os.environ.get("EDITOR") or next(
+                (e for e in ("nano", "vi", "vim") if shutil.which(e)), None)
+            if not editor:
+                print(f"Aucun éditeur trouvé — éditez {path} manuellement.")
+                return
+            subprocess.call([editor, path])
+    print("\nAprès modification, redémarrez le service :")
+    if platform.system() == "Darwin":
+        print("  sudo launchctl kickstart -k system/com.heimdall.agent")
+    else:
+        print("  sudo systemctl restart heimdall-agent")
+
+def cmd_status(cfg):
+    path = _config_path_existing()
+    print(f"Heimdall Mini Agent v{AGENT_VERSION}")
+    print(f"Configuration : {path or '(par défaut)'}")
+    print(f"Serveur       : {_server_url(cfg)}  (vérif. certificat : {_tls_verify(cfg)})")
+    system = platform.system()
+    if system == "Linux":
+        r = subprocess.run(["systemctl", "is-active", "heimdall-agent"],
+                           capture_output=True, text=True)
+        print(f"Service       : {r.stdout.strip() or 'introuvable'}")
+        print("Logs          : journalctl -u heimdall-agent -f")
+    elif system == "Darwin":
+        r = subprocess.run(["launchctl", "list", "com.heimdall.agent"],
+                           capture_output=True, text=True)
+        print(f"Service       : {'actif' if r.returncode == 0 else 'introuvable'}")
+        print("Logs          : tail -f /var/log/heimdall-agent.log")
+    try:
+        r = requests.get(f"{_server_url(cfg)}/api/ping", headers=_agent_headers(cfg),
+                         timeout=5, verify=_tls_verify(cfg))
+        print(f"Connexion     : {'OK' if r.status_code == 200 else f'HTTP {r.status_code}'}")
+    except Exception as e:
+        print(f"Connexion     : échec ({type(e).__name__})")
+
 # ─── Désinstallation ──────────────────────────────────────────────────────────
 def uninstall_agent() -> int:
     """Désinstalle proprement l'agent. Retourne 0 si OK, 1 sinon."""
@@ -952,6 +1029,7 @@ def uninstall_agent() -> int:
                 subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=10)
         except PermissionError:
             errors.append(f"Impossible de retirer {unit} (sudo requis ?)")
+        _remove_heimdall_shortcut(errors)
         # Supprime le dossier d'install
         for d in ("/opt/heimdall-agent",):
             if os.path.isdir(d):
@@ -972,6 +1050,7 @@ def uninstall_agent() -> int:
                     errors.append(f"Impossible de retirer {plist} (sudo requis ?)")
                 except Exception as e:
                     errors.append(f"launchctl unload {plist}: {e}")
+        _remove_heimdall_shortcut(errors)
         # Dossier d'install (utilisateur ou système)
         for d in (os.path.expanduser("~/Library/Application Support/HeimdallAgent"),
                   "/opt/heimdall-agent"):
@@ -1040,11 +1119,29 @@ def run_daemon(config):
         time.sleep(interval)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Heimdall Mini Agent")
-    parser.add_argument("--once",       action="store_true", help="Un seul rapport puis exit")
+    parser = argparse.ArgumentParser(
+        prog="heimdall",
+        description="Heimdall Security Agent — surveillance de parc et corrélation CVE.",
+        epilog=(
+            "Commandes courantes :\n"
+            "  heimdall --scan            Scanner maintenant (un seul rapport)\n"
+            "  heimdall --status          Voir l'état de l'agent et du service\n"
+            "  heimdall --configuration   Voir / modifier la configuration\n"
+            "  heimdall --daemon          Lancer en mode démon (généralement via le service)\n"
+            "  heimdall --check-update    Vérifier une mise à jour\n"
+            "  heimdall --uninstall       Désinstaller l'agent\n"
+            "  heimdall --version         Afficher la version"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--scan", "--once", dest="once", action="store_true",
+                        help="Scanner maintenant : un seul rapport puis exit")
     parser.add_argument("--scan-ports", action="store_true", help="Activer le scan de ports réseau")
     parser.add_argument("--daemon",     action="store_true", help="Mode démon continu")
     parser.add_argument("--version",    action="store_true", help="Afficher la version puis exit")
+    parser.add_argument("--status",     action="store_true", help="Afficher l'état de l'agent (config, service, connexion) puis exit")
+    parser.add_argument("--configuration", "--configure", dest="configuration", action="store_true",
+                        help="Afficher / modifier la configuration puis exit")
     parser.add_argument("--check-update", action="store_true", help="Forcer la vérification d'une mise à jour puis exit")
     parser.add_argument("--uninstall",  action="store_true", help="Désinstaller l'agent (stop service, supprime les fichiers)")
     # Surcharges de connexion (prioritaires sur agent.conf, non enregistrées)
@@ -1073,6 +1170,12 @@ if __name__ == "__main__":
         cfg.set("main_server", "use_https", "true" if args.https and not args.http else "false")
     if args.no_verify_ssl:
         cfg.set("main_server", "verify_ssl", "false")
+    if args.status:
+        cmd_status(cfg)
+        sys.exit(0)
+    if args.configuration:
+        cmd_configuration(cfg)
+        sys.exit(0)
     if args.check_update:
         check_for_update(cfg)
         sys.exit(0)

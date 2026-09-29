@@ -207,15 +207,18 @@ def _config_write_path() -> str:
     return os.path.join(_LOG_DIR, "agent.conf")
 
 def save_config(host: str, port: str, token: str, interval: str, port_scan: bool,
-                theme: str = None, use_https: bool = None, verify_ssl: bool = None):
+                theme: str = None, use_https: bool = None, verify_ssl: bool = None,
+                auto_update: bool = None):
     path = _config_write_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # HTTPS / vérification du certificat : valeur fournie, sinon celle déjà en config.
+    # HTTPS / vérification du certificat / auto-update : valeur fournie, sinon celle déjà en config.
     prev = state.config if state.config is not None else configparser.ConfigParser()
     if use_https is None:
         use_https = _cfg_bool(prev, "main_server", "use_https", False)
     if verify_ssl is None:
         verify_ssl = _cfg_bool(prev, "main_server", "verify_ssl", True)
+    if auto_update is None:
+        auto_update = _cfg_bool(prev, "agent", "auto_update", True)
     # Thème : valeur fournie, sinon celle déjà en config, sinon sombre.
     if theme is None:
         theme = (state.config.get("ui", "theme", fallback="dark")
@@ -224,7 +227,8 @@ def save_config(host: str, port: str, token: str, interval: str, port_scan: bool
     cfg["main_server"] = {"host": host.strip(), "port": port.strip(), "token": token.strip(),
                           "use_https": "true" if use_https else "false",
                           "verify_ssl": "true" if verify_ssl else "false"}
-    cfg["agent"]       = {"interval_minutes": interval.strip(), "port_scan": "true" if port_scan else "false"}
+    cfg["agent"]       = {"interval_minutes": interval.strip(), "port_scan": "true" if port_scan else "false",
+                          "auto_update": "true" if auto_update else "false"}
     if state.config is not None and state.config.has_option("agent", "update_check_hours"):
         cfg["agent"]["update_check_hours"] = state.config.get("agent", "update_check_hours")
     cfg["ui"]          = {"theme": theme}
@@ -980,6 +984,23 @@ def check_for_update(silent: bool = False) -> bool:
         if _version_newer(server_version, AGENT_VERSION):
             logger.info(f"Mise à jour disponible: {AGENT_VERSION} → {server_version}")
             _set_status(f"⬆️  Mise à jour v{server_version} disponible…")
+            # Automatique par défaut (même comportement que les agents Linux/macOS).
+            # `[agent] auto_update = false` dans agent.conf repasse en confirmation manuelle.
+            auto = _cfg_bool(cfg, "agent", "auto_update", True)
+            if auto:
+                if state.tray_icon and TRAY_OK:
+                    try:
+                        state.tray_icon.notify(
+                            f"Mise à jour v{server_version} installée automatiquement.",
+                            "Heimdall Security Agent")
+                    except Exception:
+                        pass
+                threading.Thread(
+                    target=lambda: _do_self_update(base, token, data.get("download_url", "")),
+                    daemon=True, name="SelfUpdate"
+                ).start()
+                return True
+
             def _ask_and_update():
                 msg = (
                     f"Une nouvelle version est disponible !\n\n"
@@ -1292,7 +1313,7 @@ def _open_config_dialog():
     P = _pal()
     dlg = tk.Toplevel(state.tk_root)
     dlg.title("Heimdall — Configuration")
-    dlg.geometry("480x610")
+    dlg.geometry("480x640")
     dlg.resizable(False, False)
     dlg.configure(bg=P["card"])
     _apply_window_icon(dlg)
@@ -1304,7 +1325,7 @@ def _open_config_dialog():
     dlg.update_idletasks()
     sw = dlg.winfo_screenwidth()
     sh = dlg.winfo_screenheight()
-    dlg.geometry(f"+{(sw - 480) // 2}+{max(0, (sh - 610) // 2)}")
+    dlg.geometry(f"+{(sw - 480) // 2}+{max(0, (sh - 640) // 2)}")
 
     cfg = state.config or configparser.ConfigParser()
 
@@ -1351,13 +1372,16 @@ def _open_config_dialog():
     autostart_var = tk.BooleanVar(value=_is_autostart_enabled())
     _check("Démarrer automatiquement avec Windows", autostart_var, len(fields) + 1)
 
+    auto_update_var = tk.BooleanVar(value=_cfg_bool(cfg, "agent", "auto_update", True))
+    _check("Mise à jour automatique (sans confirmation)", auto_update_var, len(fields) + 2)
+
     # Connexion chiffrée : HTTPS et vérification du certificat du serveur
     https_var  = tk.BooleanVar(value=_cfg_bool(cfg, "main_server", "use_https", False))
     verify_var = tk.BooleanVar(value=_cfg_bool(cfg, "main_server", "verify_ssl", True))
-    _add_https_options(frame, P, len(fields) + 2, https_var, verify_var)
+    _add_https_options(frame, P, len(fields) + 3, https_var, verify_var)
 
     # Apparence : sombre / clair / suivre le thème Windows
-    theme_row = len(fields) + 4
+    theme_row = len(fields) + 5
     tk.Label(frame, text="Apparence", bg=P["card"], fg=P["muted"],
              font=("Segoe UI", 9)).grid(row=theme_row, column=0, sticky="w", pady=7)
     theme_var = tk.StringVar(value=THEME_LABELS[_theme_setting()])
@@ -1385,7 +1409,8 @@ def _open_config_dialog():
             return
         theme_key = next((k for k, v in THEME_LABELS.items() if v == theme_var.get()), "dark")
         save_config(h, p, t, iv, ps_var.get(), theme=theme_key,
-                    use_https=https_var.get(), verify_ssl=verify_var.get())
+                    use_https=https_var.get(), verify_ssl=verify_var.get(),
+                    auto_update=auto_update_var.get())
         if autostart_var.get() != _is_autostart_enabled():
             _set_autostart(autostart_var.get())
         _dlg_info("Sauvegarde", "Configuration mise \u00e0 jour.\nElle sera utilis\u00e9e d\u00e8s le prochain scan.\n"
@@ -1410,7 +1435,7 @@ class SetupWizard(tk.Toplevel):
         super().__init__(parent)
         P = self._P = _pal()
         self.title("Heimdall Agent — Installation")
-        self.geometry("480x730")
+        self.geometry("480x770")
         self.resizable(False, False)
         self.configure(bg=P["bg"])
         _apply_window_icon(self)
@@ -1420,7 +1445,7 @@ class SetupWizard(tk.Toplevel):
         # Centrage
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"+{(sw - 480) // 2}+{max(0, (sh - 730) // 2)}")
+        self.geometry(f"+{(sw - 480) // 2}+{max(0, (sh - 770) // 2)}")
 
         self._logo = _logo_photo(96)
         if self._logo is not None:
@@ -1463,20 +1488,22 @@ class SetupWizard(tk.Toplevel):
         _check("Activer le scan de ports réseau", self._ps_var, len(rows))
         self._autostart_var = tk.BooleanVar(value=True)
         _check("Démarrer automatiquement avec Windows", self._autostart_var, len(rows) + 1)
+        self._auto_update_var = tk.BooleanVar(value=True)
+        _check("Mise à jour automatique (sans confirmation)", self._auto_update_var, len(rows) + 2)
 
         self._https_var  = tk.BooleanVar(value=default_https)
         self._verify_var = tk.BooleanVar(value=default_verify)
-        _add_https_options(card, P, len(rows) + 2, self._https_var, self._verify_var)
+        _add_https_options(card, P, len(rows) + 3, self._https_var, self._verify_var)
 
         tk.Label(card, text="Apparence", bg=P["card"], fg=P["muted"],
-                 font=("Segoe UI", 9)).grid(row=len(rows) + 4, column=0, sticky="w", pady=8)
+                 font=("Segoe UI", 9)).grid(row=len(rows) + 5, column=0, sticky="w", pady=8)
         self._theme_var = tk.StringVar(value=THEME_LABELS[_theme_setting()])
         theme_menu = tk.OptionMenu(card, self._theme_var, *THEME_LABELS.values())
         theme_menu.config(bg=P["input"], fg=P["fg"], activebackground=P["input"],
                           activeforeground=P["fg"], relief="flat", bd=0,
                           highlightthickness=0, font=("Segoe UI", 10), anchor="w")
         theme_menu["menu"].config(bg=P["input"], fg=P["fg"], font=("Segoe UI", 10))
-        theme_menu.grid(row=len(rows) + 4, column=1, padx=(16, 0), pady=8, sticky="ew")
+        theme_menu.grid(row=len(rows) + 5, column=1, padx=(16, 0), pady=8, sticky="ew")
         card.columnconfigure(1, weight=1)
 
         self._status_lbl = tk.Label(self, text="", bg=P["bg"], fg=P["muted"],
@@ -1550,7 +1577,8 @@ class SetupWizard(tk.Toplevel):
         interval = interval or "60"
         theme_key = next((k for k, v in THEME_LABELS.items() if v == self._theme_var.get()), "dark")
         save_config(host, port, token, interval, self._ps_var.get(), theme=theme_key,
-                    use_https=self._https_var.get(), verify_ssl=self._verify_var.get())
+                    use_https=self._https_var.get(), verify_ssl=self._verify_var.get(),
+                    auto_update=self._auto_update_var.get())
         _set_autostart(getattr(self, "_autostart_var", None) and self._autostart_var.get())
         self.result = True
         self.destroy()
@@ -1589,13 +1617,14 @@ def _apply_cli_config(args):
         _msgbox("Heimdall Agent — Configuration", msg, 0x10)
         sys.exit(2)
     # None = conserver la valeur déjà en config (défaut : HTTP, certificat vérifié)
-    use_https  = True if args.https else (False if args.http else None)
-    verify_ssl = False if args.no_verify_ssl else None
+    use_https   = True if args.https else (False if args.http else None)
+    verify_ssl  = False if args.no_verify_ssl else None
+    auto_update = False if args.no_auto_update else None
     save_config(
         args.server.strip(), args.port, token,
         prev.get("agent", "interval_minutes", fallback="60"),
         prev.getboolean("agent", "port_scan", fallback=False),
-        use_https=use_https, verify_ssl=verify_ssl,
+        use_https=use_https, verify_ssl=verify_ssl, auto_update=auto_update,
     )
     logger.info(f"Serveur configuré : {_base_url()}")
 
@@ -1617,6 +1646,8 @@ def main():
     parser.add_argument("--http",       action="store_true", help="Se connecter au serveur en HTTP (désactive HTTPS)")
     parser.add_argument("--no-verify-ssl", action="store_true",
                         help="HTTPS : ne pas vérifier le certificat (certificat auto-signé)")
+    parser.add_argument("--no-auto-update", action="store_true",
+                        help="Désactiver la mise à jour automatique (demande confirmation à la place)")
     args = parser.parse_args()
 
     if args.install:

@@ -8,6 +8,7 @@ import hmac
 import uuid
 import secrets
 import threading
+import queue
 import requests
 import re
 import json
@@ -32,6 +33,54 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# ─── Logs centralisés (même API que le site CVE : logs.int.heimdall-security.com) ──
+# Optionnel : sans LOGS_API_URL, ce handler reste inactif — seuls les logs stdout
+# (docker logs) existent, comme avant. Non bloquant : file + thread dédié, échec
+# silencieux (jamais planter/ralentir une requête pour un log qui ne part pas).
+LOGS_API_URL     = os.getenv('LOGS_API_URL', '')
+LOGS_API_KEY     = os.getenv('LOGS_API_KEY', '')
+LOGS_SERVER_NAME = os.getenv('LOGS_SERVER_NAME', 'Agents-CVE')
+
+class _LogsApiHandler(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.INFO)
+        self._q = queue.Queue(maxsize=5000)
+        if LOGS_API_URL:
+            threading.Thread(target=self._worker, daemon=True, name="LogsApiShipper").start()
+
+    def emit(self, record):
+        if not LOGS_API_URL:
+            return
+        try:
+            self._q.put_nowait({
+                "server_name": LOGS_SERVER_NAME,
+                "level":       record.levelname,
+                "message":     self.format(record),
+                "timestamp":   datetime.utcnow().isoformat(),
+                "source":      "Agents-CVE-Server",
+            })
+        except queue.Full:
+            pass  # file pleine (API de logs down) : on abandonne plutôt que bloquer
+
+    def _worker(self):
+        while True:
+            batch = [self._q.get()]  # bloque jusqu'au 1er log, puis vide le reste
+            while len(batch) < 25:
+                try:
+                    batch.append(self._q.get_nowait())
+                except queue.Empty:
+                    break
+            try:
+                requests.post(LOGS_API_URL, json=batch,
+                              headers={"X-API-Key": LOGS_API_KEY, "Content-Type": "application/json"},
+                              timeout=10)
+            except Exception:
+                pass  # perte d'un batch de logs — pas fatal, jamais remonté à l'appelant
+
+if LOGS_API_URL:
+    logging.getLogger().addHandler(_LogsApiHandler())
+    logger.info(f"Logs centralisés activés → {LOGS_API_URL} (source={LOGS_SERVER_NAME})")
 
 # ─── Parsing de version ───────────────────────────────────────────────────────
 try:
@@ -1090,6 +1139,7 @@ def list_agents():
         agents = list(mongo.db.agents.find({}, {"_id": 0}))
     for a in agents:
         a["online"] = _is_online(a)
+        a["agent_up_to_date"] = _agent_is_up_to_date(a.get("agent_version", ""))
     return jsonify([_clean(a) for a in agents])
 
 @app.route('/api/agents/<hostname>', methods=['GET'])
@@ -1361,6 +1411,13 @@ CONFIG
         curl -fsSL "$SERVER_BASE/static/mini_agent.py" -o "$INSTALL_DIR/mini_agent.py"
         chmod 755 "$INSTALL_DIR/mini_agent.py"
 
+        # ── Commande `heimdall` (heimdall --scan / --status / --configuration / ...) ──
+        cat > /usr/local/bin/heimdall << WRAPPER
+#!/usr/bin/env bash
+exec python3 "$INSTALL_DIR/mini_agent.py" "\\$@"
+WRAPPER
+        chmod 755 /usr/local/bin/heimdall
+
         # ── uninstall.sh embarqué (réutilisable) ────────────────────────────
         cat > "$INSTALL_DIR/uninstall.sh" << 'UNINSTALL'
 #!/usr/bin/env bash
@@ -1379,6 +1436,7 @@ elif [ "$OS_KIND" = "Darwin" ]; then
   launchctl unload "$PLIST" 2>/dev/null
   rm -f "$PLIST"
 fi
+rm -f /usr/local/bin/heimdall
 rm -rf "$INSTALL_DIR"
 echo "✅  Agent Heimdall désinstallé."
 UNINSTALL
@@ -1590,7 +1648,18 @@ def ping():
 @app.route('/api/server-info', methods=['GET'])
 def server_info():
     """Retourne les infos publiques du serveur (sans le token)."""
-    return jsonify({"host": SERVER_PUBLIC_HOST, "port": SERVER_PUBLIC_PORT})
+    return jsonify({"host": SERVER_PUBLIC_HOST, "port": SERVER_PUBLIC_PORT,
+                    "agent_version": AGENT_VERSION})
+
+def _agent_is_up_to_date(agent_version: str):
+    """True/False, ou None si la version de l'agent est inconnue/illisible (agent
+    trop ancien pour la reporter, ou format inattendu) — ni « à jour » ni « en retard »,
+    affiché à part dans le dashboard plutôt que compté comme obsolète."""
+    v = _parse_ver(agent_version)
+    server_v = _parse_ver(AGENT_VERSION)
+    if v is None or server_v is None:
+        return None
+    return v >= server_v
 
 # ─── Entrée principale → admin authentifié ───────────────────────────────────────────
 @app.route('/', methods=['GET'])
@@ -1651,6 +1720,19 @@ def stats():
     report_count = mongo.db.agent_reports.estimated_document_count()
     cve_count    = mongo.db.cve_cache.estimated_document_count()
 
+    # Conformité de version — lecture légère (juste la version), pas de re-scan complet.
+    with db_lock:
+        versions = list(mongo.db.agents.find({}, {"_id": 0, "agent_version": 1}))
+    up_to_date = outdated = unknown_version = 0
+    for v in versions:
+        state = _agent_is_up_to_date(v.get("agent_version", ""))
+        if state is True:
+            up_to_date += 1
+        elif state is False:
+            outdated += 1
+        else:
+            unknown_version += 1
+
     return jsonify({
         "agents_total":      agent_count,
         "agents_online":     online_count,
@@ -1663,6 +1745,10 @@ def stats():
         "total_critical":    total_critical,
         "total_high":        total_high,
         "os_distribution":   os_dist,
+        "server_agent_version": AGENT_VERSION,
+        "agents_up_to_date":    up_to_date,
+        "agents_outdated":      outdated,
+        "agents_version_unknown": unknown_version,
     })
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1846,6 +1932,7 @@ def list_servers():
 
     for a in agents:
         a["online"] = _is_online(a)
+        a["agent_up_to_date"] = _agent_is_up_to_date(a.get("agent_version", ""))
         ips = a.get("ip_addresses", [])
         # Build subnet groups
         for ip in ips:
