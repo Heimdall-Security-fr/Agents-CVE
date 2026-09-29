@@ -29,9 +29,6 @@
 #    HEIMDALL_FRONT_URL      URL publique du site CVE (liens vers les fiches CVE)
 #    DASHBOARD_ALLOWED_ORIGINS  origines autorisées pour le dashboard
 #    BIND_ADDR               interface d'écoute (défaut 0.0.0.0 ; 127.0.0.1 derrière un reverse proxy)
-#    LOGS_API_URL            API de logs centralisée (même que le site CVE) — vide = désactivé
-#    LOGS_API_KEY             clé de cette API de logs
-#    LOGS_SERVER_NAME        nom affiché dans les logs centralisés (défaut Agents-CVE)
 #
 #  ⚠️  MONGO_USER / MONGO_PASSWORD ne sont pris en compte qu'à la CRÉATION de la
 #      base (dossier de données vide). Changez-les ensuite depuis mongosh.
@@ -61,9 +58,6 @@ services:
       HEIMDALL_CVE_API: "${HEIMDALL_CVE_API:-https://cve.heimdall-security.com}"
       HEIMDALL_RSS_URL: "${HEIMDALL_RSS_URL:-${HEIMDALL_CVE_API:-https://cve.heimdall-security.com}/cves/rss}"
       CVE_API_KEY: "${CVE_API_KEY:-}"
-      LOGS_API_URL: "${LOGS_API_URL:-}"
-      LOGS_API_KEY: "${LOGS_API_KEY:-}"
-      LOGS_SERVER_NAME: "${LOGS_SERVER_NAME:-Agents-CVE}"
     security_opt:
       - no-new-privileges:true
     cap_drop:

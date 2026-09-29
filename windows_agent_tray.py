@@ -37,7 +37,6 @@ sys.excepthook = _excepthook
 import threading
 import time
 import configparser
-import platform
 import re
 import socket
 import subprocess
@@ -45,12 +44,46 @@ import logging
 import argparse
 import webbrowser
 
+# Aucune commande console (net, ipconfig, schtasks, `cmd /c ver` lancé par platform…)
+# ne doit ouvrir de fenêtre visible : on force CREATE_NO_WINDOW pour tout le processus,
+# y compris les appels faits par des bibliothèques. Sans effet sur les apps graphiques (notepad).
+if sys.platform == "win32":
+    _popen_init = subprocess.Popen.__init__
+
+    def _popen_no_window(self, *args, **kwargs):
+        if not kwargs.get("creationflags"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        _popen_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = _popen_no_window
+
+# Version/nom de la machine lus directement (sys/socket) : le module `platform`
+# lance `cmd /c ver` en arrière-plan pour obtenir ces infos.
+def _win_version() -> tuple:
+    # Le registre donne le build réel (ex. 26200 en 25H2) ; sys.getwindowsversion()
+    # peut renvoyer celui de kernel32.dll (26100), en retard sur les mises à jour d'activation.
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as k:
+            return (int(winreg.QueryValueEx(k, "CurrentMajorVersionNumber")[0]),
+                    int(winreg.QueryValueEx(k, "CurrentMinorVersionNumber")[0]),
+                    int(winreg.QueryValueEx(k, "CurrentBuildNumber")[0]))
+    except (OSError, ValueError):
+        v = sys.getwindowsversion()
+        return getattr(v, "platform_version", None) or (v.major, v.minor, v.build)
+
+def _os_build() -> str:
+    return "%d.%d.%d" % _win_version()[:3]
+
 def _windows_release() -> str:
-    """Return '11' on Windows 11+, fallback to platform.release() otherwise."""
-    m = re.search(r'\d+\.\d+\.(\d+)', platform.version())
-    if m and int(m.group(1)) >= 22000:
+    major, minor, build = _win_version()[:3]
+    if major == 10 and build >= 22000:
         return "11"
-    return platform.release()
+    return {(6, 3): "8.1", (6, 2): "8", (6, 1): "7"}.get((major, minor), str(major))
+
+def _hostname() -> str:
+    return socket.gethostname()
 from datetime import datetime
 
 AGENT_VERSION = "1.0.1"  # remplacé à chaque build par la CI (voir VERSION et server/Dockerfile)
@@ -420,6 +453,10 @@ def _registry_software():
 
 def _pip_packages():
     packages = []
+    # Dans l'exe PyInstaller, sys.executable est HeimdallAgent.exe lui-même :
+    # « -m pip » relancerait l'agent au lieu de pip.
+    if getattr(sys, "frozen", False):
+        return packages
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "list", "--format=columns"],
@@ -492,21 +529,73 @@ def _get_local_ips() -> list:
     except Exception:
         pass
 
-    # 4) Fallback `ipconfig` parse — dernière chance si rien n'a marché
-    if not ips:
-        try:
-            r = subprocess.run(
-                ["ipconfig"], capture_output=True, text=True, timeout=5,
-                encoding="utf-8", errors="ignore"
-            )
-            for m in re.finditer(r'(?:IPv4|IP Address).*?:\s*(\d+\.\d+\.\d+\.\d+)', r.stdout):
-                ip = m.group(1)
-                if not ip.startswith("127.") and ip != "0.0.0.0":
-                    ips.add(ip)
-        except Exception:
-            pass
-
     return sorted(ips)
+
+# ─── Politique de comptes via netapi32 (équivalent de `net accounts` / `net user`) ──
+# Appels API directs : aucune console, et indépendant de la langue de Windows.
+_TIMEQ_FOREVER = 0xFFFFFFFF
+_UF_ACCOUNTDISABLE = 0x2
+_DOMAIN_USER_RID_GUEST = 501
+
+def _netapi():
+    import ctypes
+    from ctypes import wintypes
+    net = ctypes.WinDLL("netapi32")
+    net.NetUserModalsGet.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    net.NetUserModalsGet.restype = wintypes.DWORD
+    net.NetUserEnum.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                ctypes.POINTER(ctypes.c_void_p), wintypes.DWORD,
+                                ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+                                ctypes.POINTER(wintypes.DWORD)]
+    net.NetUserEnum.restype = wintypes.DWORD
+    net.NetApiBufferFree.argtypes = [ctypes.c_void_p]
+    return net
+
+def _account_policy() -> dict:
+    """{min_passwd_len, lockout_threshold, lockout_duration_s} — USER_MODALS_INFO_0 / _3."""
+    import ctypes
+    from ctypes import wintypes
+    net, out = _netapi(), {}
+    for level, fields in ((0, {0: "min_passwd_len"}),
+                          (3, {0: "lockout_duration_s", 2: "lockout_threshold"})):
+        buf = ctypes.c_void_p()
+        if net.NetUserModalsGet(None, level, ctypes.byref(buf)) != 0 or not buf.value:
+            continue
+        try:
+            dwords = ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD))
+            for idx, name in fields.items():
+                out[name] = int(dwords[idx])
+        finally:
+            net.NetApiBufferFree(buf)
+    return out
+
+def _guest_account_disabled():
+    """True/False selon l'état du compte Invité (RID 501, quel que soit son nom), None si inconnu."""
+    import ctypes
+    from ctypes import wintypes
+
+    class USER_INFO_20(ctypes.Structure):
+        _fields_ = [("name", wintypes.LPWSTR), ("full_name", wintypes.LPWSTR),
+                    ("comment", wintypes.LPWSTR), ("flags", wintypes.DWORD),
+                    ("user_id", wintypes.DWORD)]
+
+    net = _netapi()
+    buf = ctypes.c_void_p()
+    read, total, resume = wintypes.DWORD(), wintypes.DWORD(), wintypes.DWORD(0)
+    rc = net.NetUserEnum(None, 20, 2, ctypes.byref(buf), 0xFFFFFFFF,
+                         ctypes.byref(read), ctypes.byref(total), ctypes.byref(resume))
+    if not buf.value:
+        return None
+    try:
+        if rc not in (0, 234):  # NERR_Success, ERROR_MORE_DATA
+            return None
+        users = ctypes.cast(buf, ctypes.POINTER(USER_INFO_20))
+        for i in range(read.value):
+            if users[i].user_id == _DOMAIN_USER_RID_GUEST:
+                return bool(users[i].flags & _UF_ACCOUNTDISABLE)
+    finally:
+        net.NetApiBufferFree(buf)
+    return None
 
 # ─── Collecte de la conformité Windows ───────────────────────────────────────
 def _collect_compliance() -> dict:
@@ -524,14 +613,12 @@ def _collect_compliance() -> dict:
             pass
         except Exception:
             pass
-        if "password_min_length" not in data:
-            try:
-                r = subprocess.run(["net", "accounts"], capture_output=True, text=True, timeout=5)
-                m = re.search(r"Minimum password length\s+(\d+)", r.stdout, re.IGNORECASE)
-                if m:
-                    data["password_min_length"] = int(m.group(1))
-            except Exception:
-                pass
+        try:
+            policy = _account_policy()
+        except Exception:
+            policy = {}
+        if "password_min_length" not in data and "min_passwd_len" in policy:
+            data["password_min_length"] = policy["min_passwd_len"]
 
         # ── Protocoles TLS activés ───────────────────────────────────────────
         tls_enabled = []
@@ -625,26 +712,19 @@ def _collect_compliance() -> dict:
 
         # ── Compte Invité ────────────────────────────────────────────────────
         try:
-            r = subprocess.run(["net", "user", "Guest"],
-                               capture_output=True, text=True, timeout=5)
-            m = re.search(r"Account active\s+(Yes|No)", r.stdout, re.IGNORECASE)
-            if m:
-                data["guest_account_disabled"] = (m.group(1).lower() == "no")
+            guest_disabled = _guest_account_disabled()
+            if guest_disabled is not None:
+                data["guest_account_disabled"] = guest_disabled
         except Exception:
             pass
 
         # ── Politique de verrouillage de compte ─────────────────────────────
-        try:
-            r = subprocess.run(["net", "accounts"],
-                               capture_output=True, text=True, timeout=5)
-            m = re.search(r"Lockout threshold\s+(\d+|Never)", r.stdout, re.IGNORECASE)
-            if m and m.group(1).lower() != "never":
-                data["account_lockout_threshold"] = int(m.group(1))
-            m = re.search(r"Lockout duration \(minutes\)\s+(\d+)", r.stdout, re.IGNORECASE)
-            if m:
-                data["account_lockout_duration"] = int(m.group(1))
-        except Exception:
-            pass
+        # Seuil 0 = « Jamais » ; durée en secondes côté API, en minutes dans le rapport.
+        if policy.get("lockout_threshold"):
+            data["account_lockout_threshold"] = policy["lockout_threshold"]
+        duration = policy.get("lockout_duration_s")
+        if duration is not None and duration != _TIMEQ_FOREVER:
+            data["account_lockout_duration"] = duration // 60
 
     except ImportError:
         logger.warning("winreg non disponible — conformité non collectée")
@@ -744,7 +824,7 @@ def _collect_custom_rules() -> dict:
 # `winget upgrade` liste les applications dont une version plus récente existe.
 # L'agent ne fait que lire : il n'installe rien. Absent (winget non installé,
 # Windows Server ancien…) → la vérification est simplement indiquée « non disponible ».
-_UPDATE_CACHE = {"at": 0.0, "data": None}
+_UPDATE_CACHE = {"at": 0.0, "data": None, "force": False}
 _MAX_UPDATE_ITEMS = 500
 
 def _parse_winget_table(text: str) -> list:
@@ -771,8 +851,10 @@ def _parse_winget_table(text: str) -> list:
     return items
 
 def collect_outdated_software() -> dict:
-    """Résultat : {manager, ok, count, items[], checked_at, error?}. Le résultat est
-    réutilisé pendant `update_check_hours` (défaut 6 h, 0 = désactivé)."""
+    """Résultat : {manager, ok, count, items[], checked_at, error?}. winget n'est lancé
+    qu'au premier rapport après le démarrage, puis uniquement sur demande du dashboard
+    (`_UPDATE_CACHE["force"]`) ; entre-temps le dernier résultat est réutilisé.
+    `update_check_hours = 0` désactive la vérification."""
     hours = 6.0
     if state.config is not None:
         try:
@@ -781,8 +863,9 @@ def collect_outdated_software() -> dict:
             pass
     if hours <= 0:
         return {"manager": None, "ok": False, "error": "désactivé", "count": None, "items": []}
-    if _UPDATE_CACHE["data"] and time.time() - _UPDATE_CACHE["at"] < hours * 3600:
+    if _UPDATE_CACHE["data"] and not _UPDATE_CACHE.get("force"):
         return _UPDATE_CACHE["data"]
+    _UPDATE_CACHE["force"] = False
 
     result = {"manager": "winget", "ok": False, "error": "winget indisponible",
               "count": None, "items": []}
@@ -836,10 +919,10 @@ def send_report(max_attempts: int = 6):
         compliance.setdefault("pending_updates", update_check["count"])
 
     payload = {
-        "hostname":      platform.node(),
-        "os":            platform.system(),
+        "hostname":      _hostname(),
+        "os":            "Windows",
         "release":       _windows_release(),
-        "os_build":      platform.version(),
+        "os_build":      _os_build(),
         "agent_version": AGENT_VERSION,
         "timestamp":     datetime.now().isoformat(),
         "software":      software,
@@ -936,14 +1019,19 @@ def send_heartbeat():
     cfg   = state.config
     token = cfg.get("main_server", "token", fallback="changeme-secret-token")
     try:
-        requests.post(
-            f"{_base_url(cfg)}/api/agents/{platform.node()}/heartbeat",
-            json={"os": platform.system(), "release": _windows_release(),
-                   "os_build": platform.version()},
+        r = requests.post(
+            f"{_base_url(cfg)}/api/agents/{_hostname()}/heartbeat",
+            json={"os": "Windows", "release": _windows_release(),
+                   "os_build": _os_build()},
             headers={"x-agent-token": token},
             timeout=5,
             verify=_tls_verify(cfg),
         )
+        if r.ok and (r.json() or {}).get("refresh_updates"):
+            # Demandé depuis le dashboard : nouvelle vérification winget + rapport immédiat
+            logger.info("Vérification des mises à jour demandée par le serveur.")
+            _UPDATE_CACHE["force"] = True
+            state.scan_event.set()
     except Exception:
         pass
 
@@ -1056,7 +1144,6 @@ def _do_self_update(base: str, token: str, url: str):
         return
     curr_exe     = os.path.abspath(sys.executable)
     new_exe      = curr_exe + ".update"
-    bat_path     = curr_exe + ".upd.bat"
     download_url = url or f"{base}/api/download/agent/windows/exe"
     try:
         _set_status("⬇️  Téléchargement de la mise à jour…")
@@ -1077,21 +1164,23 @@ def _do_self_update(base: str, token: str, url: str):
             magic = f.read(2)
         if magic != b"MZ":
             raise ValueError("Le fichier téléchargé n'est pas un exécutable Windows valide")
-        bat = (
-            "@echo off\r\n"
-            "ping -n 3 127.0.0.1 >nul\r\n"
-            f'move /Y "{new_exe}" "{curr_exe}"\r\n'
-            f'start "" "{curr_exe}"\r\n'
-            "del \"%~f0\"\r\n"
-        )
-        with open(bat_path, "w") as f:
-            f.write(bat)
-        logger.info("Mise à jour téléchargée — remplacement en cours…")
-        subprocess.Popen(
-            ["cmd.exe", "/C", bat_path],
-            creationflags=subprocess.CREATE_NO_WINDOW,
-            close_fds=True,
-        )
+        # Windows autorise le renommage d'un exe en cours d'exécution : on écarte
+        # l'actuel (.old, supprimé au prochain démarrage), on met le nouveau à sa place
+        # et on le lance — sans script cmd intermédiaire.
+        old_exe = curr_exe + ".old"
+        try:
+            os.remove(old_exe)
+        except FileNotFoundError:
+            pass
+        os.replace(curr_exe, old_exe)
+        try:
+            os.replace(new_exe, curr_exe)
+        except Exception:
+            os.replace(old_exe, curr_exe)
+            raise
+        logger.info("Mise à jour installée — redémarrage sur la nouvelle version…")
+        subprocess.Popen([curr_exe], close_fds=True,
+                         creationflags=subprocess.DETACHED_PROCESS)
         _on_quit()
     except Exception as e:
         logger.error(f"Mise à jour échouée: {e}")
@@ -1286,7 +1375,7 @@ def _do_uninstall():
                 "@echo off\r\n"
                 "ping -n 3 127.0.0.1 >nul\r\n"
                 f'del /F /Q "{exe_path}" 2>nul\r\n'
-                f'del /F /Q "{exe_path}.upd.bat" 2>nul\r\n'
+                f'del /F /Q "{exe_path}.old" 2>nul\r\n'
                 "del \"%~f0\"\r\n"
             )
             with open(bat_path, "w") as f:
@@ -1695,6 +1784,12 @@ def main():
             except (FileNotFoundError, KeyboardInterrupt):
                 pass
         sys.exit(0)
+
+    if getattr(sys, "frozen", False):
+        try:
+            os.remove(os.path.abspath(sys.executable) + ".old")  # reste d'une mise à jour
+        except OSError:
+            pass
 
     if args.install:
         install_scheduled_task()

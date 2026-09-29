@@ -8,7 +8,6 @@ import hmac
 import uuid
 import secrets
 import threading
-import queue
 import requests
 import re
 import json
@@ -33,54 +32,6 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
-
-# ─── Logs centralisés (même API que le site CVE : logs.int.heimdall-security.com) ──
-# Optionnel : sans LOGS_API_URL, ce handler reste inactif — seuls les logs stdout
-# (docker logs) existent, comme avant. Non bloquant : file + thread dédié, échec
-# silencieux (jamais planter/ralentir une requête pour un log qui ne part pas).
-LOGS_API_URL     = os.getenv('LOGS_API_URL', '')
-LOGS_API_KEY     = os.getenv('LOGS_API_KEY', '')
-LOGS_SERVER_NAME = os.getenv('LOGS_SERVER_NAME', 'Agents-CVE')
-
-class _LogsApiHandler(logging.Handler):
-    def __init__(self):
-        super().__init__(level=logging.INFO)
-        self._q = queue.Queue(maxsize=5000)
-        if LOGS_API_URL:
-            threading.Thread(target=self._worker, daemon=True, name="LogsApiShipper").start()
-
-    def emit(self, record):
-        if not LOGS_API_URL:
-            return
-        try:
-            self._q.put_nowait({
-                "server_name": LOGS_SERVER_NAME,
-                "level":       record.levelname,
-                "message":     self.format(record),
-                "timestamp":   datetime.utcnow().isoformat(),
-                "source":      "Agents-CVE-Server",
-            })
-        except queue.Full:
-            pass  # file pleine (API de logs down) : on abandonne plutôt que bloquer
-
-    def _worker(self):
-        while True:
-            batch = [self._q.get()]  # bloque jusqu'au 1er log, puis vide le reste
-            while len(batch) < 25:
-                try:
-                    batch.append(self._q.get_nowait())
-                except queue.Empty:
-                    break
-            try:
-                requests.post(LOGS_API_URL, json=batch,
-                              headers={"X-API-Key": LOGS_API_KEY, "Content-Type": "application/json"},
-                              timeout=10)
-            except Exception:
-                pass  # perte d'un batch de logs — pas fatal, jamais remonté à l'appelant
-
-if LOGS_API_URL:
-    logging.getLogger().addHandler(_LogsApiHandler())
-    logger.info(f"Logs centralisés activés → {LOGS_API_URL} (source={LOGS_SERVER_NAME})")
 
 # ─── Parsing de version ───────────────────────────────────────────────────────
 try:
@@ -1105,7 +1056,8 @@ def agent_heartbeat(hostname):
     data = request.get_json(silent=True) or {}
     now  = datetime.utcnow()
     with db_lock:
-        mongo.db.agents.update_one(
+        # La demande de revérification (dashboard) est lue et consommée en une opération.
+        before = mongo.db.agents.find_one_and_update(
             {"hostname": hostname},
             {"$set": {
                 "last_heartbeat": now,
@@ -1113,10 +1065,26 @@ def agent_heartbeat(hostname):
                 "os":             data.get("os",       ""),
                 "release":        data.get("release",  ""),
                 "os_build":       data.get("os_build", ""),
-            }},
+            }, "$unset": {"refresh_updates_requested": ""}},
+            projection={"refresh_updates_requested": 1},
             upsert=True
         )
-    return jsonify({"status": "ok", "ts": now.isoformat()}), 200
+    return jsonify({"status": "ok", "ts": now.isoformat(),
+                    "refresh_updates": bool((before or {}).get("refresh_updates_requested"))}), 200
+
+@app.route('/api/agents/<hostname>/refresh-updates', methods=['POST'])
+@require_role("admin")
+def request_updates_refresh(hostname):
+    """Demande à un agent Windows de relancer sa vérification winget : transmise au
+    prochain heartbeat (≤ 60 s), suivie d'un rapport immédiat."""
+    with db_lock:
+        res = mongo.db.agents.update_one(
+            {"hostname": hostname},
+            {"$set": {"refresh_updates_requested": True,
+                      "refresh_updates_requested_at": datetime.utcnow()}})
+    if not res.matched_count:
+        return {"error": "Agent not found"}, 404
+    return jsonify({"status": "ok"}), 200
 
 @app.route('/api/agents', methods=['GET'])
 def list_agents():

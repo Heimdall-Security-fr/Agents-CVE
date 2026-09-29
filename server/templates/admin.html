@@ -1489,18 +1489,33 @@ async function loadUpdates() {
         ? '<tr id="upd-'+i+'" style="display:none"><td colspan="5" style="padding:0"><table style="width:100%"><thead><tr><th>Logiciel</th><th>Installée</th><th>Disponible</th></tr></thead><tbody>'
           + r.items.map(function(it){ return '<tr><td>'+esc(it.name)+'</td><td class="text-muted">'+esc(it.installed||'—')+'</td><td style="color:var(--green)">'+esc(it.available||'—')+'</td></tr>'; }).join('')
           + '</tbody></table></td></tr>' : '';
+      var checked = r.checked_at ? '<div class="text-muted" style="font-size:10px">vérifié le '+esc(new Date(r.checked_at).toLocaleString('fr-FR'))+'</div>' : '';
+      var refresh = r.os === 'Windows'
+        ? ' <button class="btn btn-sm" title="Relance la vérification winget sur ce poste (transmis sous 60 s si l\'agent est en ligne)" onclick="event.stopPropagation();refreshHostUpdates(\''+esc(r.hostname).replace(/'/g,"\\'")+'\',this)">🔄 Revérifier</button>' : '';
       return '<tr'+((r.items||[]).length?' style="cursor:pointer" onclick="var e=document.getElementById(\'upd-'+i+'\');e.style.display=e.style.display===\'none\'?\'table-row\':\'none\'"':'')+'>'
-        +'<td><strong>'+esc(r.hostname)+'</strong></td><td>'+esc(r.os)+' '+esc(r.release||'')+'</td>'
+        +'<td><strong>'+esc(r.hostname)+'</strong>'+checked+'</td><td>'+esc(r.os)+' '+esc(r.release||'')+'</td>'
         +'<td><span class="badge '+st[0]+'">'+st[1]+'</span>'+note+stale+'</td>'
         +'<td>'+(r.count===null||r.count===undefined?'—':r.count)+'</td>'
-        +'<td class="text-muted">'+esc(r.manager||'—')+'</td></tr>'+detail;
+        +'<td class="text-muted">'+esc(r.manager||'—')+refresh+'</td></tr>'+detail;
     }).join('');
     el.innerHTML = '<div class="cards mb-6">'+cards+'</div>'
       +'<div class="table-wrap"><table><thead><tr><th>Serveur</th><th>OS</th><th>État</th><th>En attente</th><th>Source</th></tr></thead><tbody>'
       +(body || '<tr><td colspan="5" style="padding:24px;text-align:center;color:var(--muted)">Aucun agent n\'a encore envoyé de rapport.</td></tr>')
       +'</tbody></table></div>'
-      +'<p class="text-muted" style="font-size:12px;margin-top:12px">Cliquez sur une ligne pour voir le détail. La liste provient du gestionnaire de paquets de chaque machine (winget, apt, dnf, yum, zypper, brew) et est rafraîchie toutes les 6 h.</p>';
+      +'<p class="text-muted" style="font-size:12px;margin-top:12px">Cliquez sur une ligne pour voir le détail. La liste provient du gestionnaire de paquets de chaque machine (winget, apt, dnf, yum, zypper, brew). Sous Windows, elle est vérifiée au démarrage de l\'agent puis à la demande (bouton « Revérifier ») ; sous Linux/macOS, toutes les 6 h.</p>';
   } catch(err) { el.innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>'; }
+}
+
+async function refreshHostUpdates(hostname, btn) {
+  btn.disabled = true;
+  try {
+    await api('/api/agents/' + encodeURIComponent(hostname) + '/refresh-updates', { method: 'POST' });
+    btn.textContent = '⏳ Demandé';
+    toast('Vérification demandée à ' + hostname + ' — résultat dans ~1 à 2 min', 'ok');
+  } catch (err) {
+    btn.disabled = false;
+    toast(err.message, 'err');
+  }
 }
 
 /* ── Déploiement ── */

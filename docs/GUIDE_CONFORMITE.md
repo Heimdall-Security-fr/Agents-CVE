@@ -192,8 +192,12 @@ version disponible*), ou **Vérification impossible** (gestionnaire absent, erre
 - **Rafraîchissez le cache apt** : l'agent n'exécute pas `apt update`. Si le cache est
   ancien, la liste l'est aussi. Un badge **« cache ancien »** apparaît au-delà de 7 jours ;
   activez `unattended-upgrades` ou un `apt update` planifié.
-- **Fréquence** : la vérification est refaite toutes les **6 heures** (pas à chaque rapport).
-  Réglage dans `agent.conf` : `update_check_hours = 6` (`0` désactive la vérification).
+- **Fréquence** :
+  - **Windows** : au démarrage de l'agent (donc du PC), puis uniquement à la demande via le
+    bouton **« 🔄 Revérifier »** de la page *Mises à jour* (transmis à l'agent sous 60 s,
+    suivi d'un rapport immédiat). Aucune vérification périodique en arrière-plan.
+  - **Linux / macOS** : toutes les **6 heures** (`update_check_hours = 6`).
+  - `update_check_hours = 0` désactive la vérification sur tous les systèmes.
 - **Couverture** : seuls les logiciels connus du gestionnaire de paquets sont couverts.
   Un logiciel installé « à la main » (zip, installeur hors winget…) n'apparaît pas.
 - **Agents anciens** : affichés « Agent à mettre à jour » tant qu'ils n'ont pas reçu

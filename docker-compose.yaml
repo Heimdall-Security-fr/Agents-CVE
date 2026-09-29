@@ -46,10 +46,6 @@ services:
       # sans elle, aucun appel n'est fait à l'API (0 vulnérabilité détectée) plutôt
       # que de la contourner et ne jamais décompter le quota du plan payant.
       CVE_API_KEY: "${CVE_API_KEY:-}"
-      # Logs centralisés (même API que le site CVE) — vide = désactivé
-      LOGS_API_URL: "${LOGS_API_URL:-}"
-      LOGS_API_KEY: "${LOGS_API_KEY:-}"
-      LOGS_SERVER_NAME: "${LOGS_SERVER_NAME:-Agents-CVE}"
     depends_on:
       - mongodb
 

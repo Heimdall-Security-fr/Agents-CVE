@@ -117,11 +117,8 @@ s'auto-mettent à jour sur la version exposée par le serveur.
 | `DEFAULT_ADMIN_PASSWORD` | _(à définir)_              | Mot de passe admin — définissez-le dans votre `.env`/compose |
 | `HEIMDALL_FRONT_URL`     | `http://localhost:3000`    | URL publique du site CVE Heimdall            |
 | `HEIMDALL_CVE_API`       | `http://cve_api:5000`      | API CVE interrogée pour les corrélations (hors réseau Docker Heimdall : `https://cve.heimdall-security.com`) |
-| `CVE_API_KEY`            | _(vide)_                   | Clé API CVE nominative — **obligatoire** pour la corrélation de vulnérabilités (voir encadré ci-dessous) |
+| `CVE_API_KEY`            | _(vide)_                   | Clé API CVE nominative — **obligatoire** pour la corrélation de vulnérabilités (sans elle, aucun appel à l'API, 0 vulnérabilité détectée) ; chaque logiciel analysé consomme 1 crédit |
 | `SERVER_PUBLIC_HOST`     | `127.0.0.1`                | IP/domaine public de ce serveur              |
-| `LOGS_API_URL`           | _(vide)_                   | API de logs centralisée — la même que le site CVE. Vide = désactivé (logs stdout / `docker logs` uniquement) |
-| `LOGS_API_KEY`           | _(vide)_                   | Clé de cette API de logs                     |
-| `LOGS_SERVER_NAME`       | `Agents-CVE`                | Nom affiché dans les logs centralisés        |
 
 ---
 
@@ -263,16 +260,8 @@ recevoir la mise à jour automatique.
 
 ## 📋 Logs
 
-Deux choses distinctes portent le nom « logs » ici :
-
-### Logs du serveur agent (monitoring de l'infra)
-
-Optionnel. En renseignant `LOGS_API_URL` / `LOGS_API_KEY` (voir tableau des variables
-d'environnement ci-dessus) — la même API que celle utilisée par le site CVE — les logs
-du **serveur agent lui-même** (erreurs, connexions, résultats de corrélation…) sont
-expédiés vers votre plateforme de monitoring centralisée, en plus de `docker logs`.
-Envoi non bloquant (file + thread dédié) : un souci réseau sur cette API ne ralentit
-jamais le serveur, et les logs perdus ne sont pas retentés.
+Les logs du serveur agent lui-même sont consultables via `docker logs heimdall_agent_server`.
+Ils ne sont envoyés vers aucune plateforme externe.
 
 ### Logs des agents installés (débogage d'un poste)
 
