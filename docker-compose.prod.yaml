@@ -23,7 +23,9 @@
 #  Variables facultatives :
 #    AGENT_CVE_VERSION       tag de l'image (défaut latest — épinglez un SHA en prod)
 #    HEIMDALL_CVE_API        URL de l'API CVE     (défaut https://cve.heimdall-security.com)
-#    CVE_API_KEY             clé API CVE (recommandée : sans elle, quota du plan gratuit)
+#    CVE_API_KEY             clé API CVE nominative — OBLIGATOIRE pour la corrélation :
+#                            sans elle, aucun appel à l'API n'est fait (aucune vulnérabilité
+#                            détectée) plutôt que de contourner votre quota de plan payant.
 #    HEIMDALL_FRONT_URL      URL publique du site CVE (liens vers les fiches CVE)
 #    DASHBOARD_ALLOWED_ORIGINS  origines autorisées pour le dashboard
 #    BIND_ADDR               interface d'écoute (défaut 0.0.0.0 ; 127.0.0.1 derrière un reverse proxy)

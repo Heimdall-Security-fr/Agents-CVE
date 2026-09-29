@@ -42,7 +42,9 @@ services:
       # API CVE Heimdall (site) interrogée pour les corrélations
       HEIMDALL_CVE_API: "${HEIMDALL_CVE_API:-http://cve_api:5000}"
       HEIMDALL_RSS_URL: "${HEIMDALL_RSS_URL:-http://cve_api:5000/cves/rss}"
-      # Clé API CVE (optionnelle, plan premium)
+      # Clé API CVE nominative — OBLIGATOIRE pour la corrélation de vulnérabilités :
+      # sans elle, aucun appel n'est fait à l'API (0 vulnérabilité détectée) plutôt
+      # que de la contourner et ne jamais décompter le quota du plan payant.
       CVE_API_KEY: "${CVE_API_KEY:-}"
       # Logs centralisés (même API que le site CVE) — vide = désactivé
       LOGS_API_URL: "${LOGS_API_URL:-}"

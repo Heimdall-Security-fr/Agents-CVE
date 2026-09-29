@@ -859,98 +859,58 @@ def refresh_cve_from_rss():
 
 # ─── Corrélation CVE/logiciels ────────────────────────────────────────────────
 def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: str = ""):
-    """Pour chaque logiciel, cherche des CVE dans le cache local puis dans l'API distante.
+    """Pour chaque logiciel, interroge l'API CVE publique (toujours — jamais de lecture
+    directe en base). C'est ce qui fait consommer 1 requête du quota du compte
+    propriétaire de `cve_api_key` (CVE_API_KEY, la clé nominative du client sur ce
+    serveur agent) par logiciel installé : sans appel HTTP réel vers l'API, le plan
+    payant du client (quota journalier lié au nombre de serveurs) n'est jamais décompté.
     Filtre les CVE dont la version installée est en dehors des plages affectées.
     os_build: build NT de l'OS hôte (ex: '10.0.19045 SP0'), utilisé pour les CVE
     dont les versions affectées sont des releases Windows."""
+    if not cve_api_key:
+        logger.warning("[CVE API] Aucune clé configurée (CVE_API_KEY) — corrélation désactivée, "
+                       "aucune requête ne sera comptée sur un plan client.")
+        return []
     vulns = []
-    api_headers = {"x-api-key": cve_api_key} if cve_api_key else {}
+    api_headers = {"x-api-key": cve_api_key}
     for sw in software_list:
-        product      = sw.get("product", "")
-        version      = sw.get("version", "")
-        product_raw  = sw.get("product_raw", product)  # raw registry name (before normalization)
+        product = sw.get("product", "")
+        version = sw.get("version", "")
         if not product:
             continue
 
-        # 1. Cache local (RSS) — matching strict d'abord, desc_terms en dernier recours
-        cpe_norm = _cpe_normalize(product)
-        cpe_norm_raw = _cpe_normalize(product_raw) if product_raw != product else cpe_norm
+        # La limite envoyée à l'API doit couvrir le cap d'affichage ci-dessous (50 par
+        # défaut) sinon on tronque déjà à 10 côté API et le cap devient inopérant —
+        # le dashboard afficherait moins de CVE que ce que l'abonnement autorise.
+        # 100 est le maximum accepté par /cves/search (aucun coût de quota
+        # supplémentaire : 1 requête = 1 crédit, quel que soit `limit`).
+        fetch_limit = min(int(os.getenv("MAX_CVES_PER_SOFTWARE", "50")), 100)
+        cves_raw = []
+        try:
+            resp = requests.get(
+                f"{HEIMDALL_CVE_API}/cves/search",
+                params={"query": product, "type": "product", "limit": fetch_limit},
+                headers=api_headers,
+                timeout=10
+            )
+            if resp.status_code == 200:
+                raw = resp.json()
+                results = raw.get("results", []) if isinstance(raw, dict) else raw
+                # Drop CVEs where product is "n/a" — those are description-matched
+                # false positives with no real product assignment
+                cves_raw = [c for c in results
+                            if _is_valid_cve_doc(c)
+                            and c.get("product", "n/a").lower() not in ("n/a", "", "none")]
+            elif resp.status_code == 429:
+                logger.warning(f"[CVE API] Quota épuisé pour {product} — passez à un plan supérieur ou achetez un pack de crédits.")
+            elif resp.status_code == 401:
+                logger.error(f"[CVE API] Clé API invalide/expirée pour {product} — vérifiez CVE_API_KEY.")
+            else:
+                logger.warning(f"[CVE API] HTTP {resp.status_code} pour {product}")
+        except Exception as e:
+            logger.warning(f"Appel API CVE échoué pour {product}: {e}")
 
-        # Conditions strictes : product exact, CPE search terms, CPE NVD product
-        strict_conditions = [
-            {"product": {"$regex": f"^{re.escape(product)}$", "$options": "i"}},
-            {"cpe_search_terms": cpe_norm},
-            {"cpe_matches.product": cpe_norm},
-        ]
-        if cpe_norm_raw != cpe_norm:
-            strict_conditions.append({"product": {"$regex": f"^{re.escape(product_raw)}$", "$options": "i"}})
-            strict_conditions.append({"cpe_search_terms": cpe_norm_raw})
-            strict_conditions.append({"cpe_matches.product": cpe_norm_raw})
-
-        with db_lock:
-            cves_raw = list(mongo.db.cve_cache.find(
-                {"$or": strict_conditions},
-                sort=[("cvss_score", -1)], limit=10
-            ))
-        cves_raw = [c for c in cves_raw if _is_valid_cve_doc(c)]
-
-        # 2. Recherche directe dans la base CVE principale (matching strict)
-        if not cves_raw:
-            try:
-                with db_lock:
-                    cves_raw = list(mongo.cx["cve_database"]["cves"].find(
-                        {"$or": strict_conditions},
-                        sort=[("cvss_score", -1)], limit=10
-                    ))
-                    for c in cves_raw:
-                        c.pop("_id", None)
-                cves_raw = [c for c in cves_raw if _is_valid_cve_doc(c)]
-            except Exception as e:
-                logger.warning(f"Direct CVE DB lookup échoué pour {product}: {e}")
-
-        # 2b. Dernier recours : desc_terms (matching par texte libre de la description).
-        # Bruyant — on l'utilise uniquement si les CPE et le nom exact n'ont rien donné.
-        if not cves_raw:
-            try:
-                desc_conditions = [{"desc_terms": cpe_norm}]
-                if cpe_norm_raw != cpe_norm:
-                    desc_conditions.append({"desc_terms": cpe_norm_raw})
-                with db_lock:
-                    cves_raw = list(mongo.cx["cve_database"]["cves"].find(
-                        {"$or": desc_conditions},
-                        sort=[("cvss_score", -1)], limit=10
-                    ))
-                    for c in cves_raw:
-                        c.pop("_id", None)
-                cves_raw = [c for c in cves_raw if _is_valid_cve_doc(c)]
-            except Exception as e:
-                logger.warning(f"desc_terms lookup échoué pour {product}: {e}")
-
-        # 3. Fallback → API distante (HTTP)
-        if not cves_raw:
-            try:
-                resp = requests.get(
-                    f"{HEIMDALL_CVE_API}/cves/search",
-                    params={"query": product, "type": "product", "limit": 10},
-                    headers=api_headers,
-                    timeout=10
-                )
-                if resp.status_code == 200:
-                    raw = resp.json()
-                    results = raw.get("results", []) if isinstance(raw, dict) else raw
-                    # Drop CVEs where product is "n/a" — those are description-matched
-                    # false positives with no real product assignment
-                    cves_raw = [c for c in results
-                                if _is_valid_cve_doc(c)
-                                and c.get("product", "n/a").lower() not in ("n/a", "", "none")]
-                elif resp.status_code == 429:
-                    logger.warning(f"[CVE API] Rate limit atteint pour {product} (clé: {'oui' if cve_api_key else 'non'})")
-                else:
-                    logger.warning(f"[CVE API] HTTP {resp.status_code} pour {product}")
-            except Exception as e:
-                logger.warning(f"Fallback API échoué pour {product}: {e}")
-
-        # 4. Filtrage strict par version — pas de fallback si tout est filtré
+        # Filtrage strict par version — pas de fallback si tout est filtré
         if version:
             cves_filtered = [c for c in cves_raw if _cve_affects_version(version, c, product, os_build)]
         else:
