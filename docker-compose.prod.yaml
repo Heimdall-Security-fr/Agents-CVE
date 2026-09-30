@@ -58,6 +58,11 @@ services:
       HEIMDALL_CVE_API: "${HEIMDALL_CVE_API:-https://cve.heimdall-security.com/api}"
       HEIMDALL_RSS_URL: "${HEIMDALL_RSS_URL:-${HEIMDALL_CVE_API:-https://cve.heimdall-security.com}/cves/rss}"
       CVE_API_KEY: "${CVE_API_KEY:-}"
+      # Assistant IA facultatif : clés et contexte restent dans le conteneur.
+      AI_PROVIDER: "${AI_PROVIDER:-}"
+      AI_BASE_URL: "${AI_BASE_URL:-}"
+      AI_API_KEY: "${AI_API_KEY:-}"
+      AI_MODEL: "${AI_MODEL:-}"
     security_opt:
       - no-new-privileges:true
     cap_drop:

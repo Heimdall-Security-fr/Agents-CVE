@@ -224,6 +224,13 @@
     .btn-icon.del:hover { background:rgba(239,68,68,.1); border-color:rgba(239,68,68,.3); color:#f87171; }
     .compliance-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; }
     .compliance-host { background:var(--surface); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); border:1px solid var(--border); border-radius:12px; padding:16px; }
+    .ai-chat { max-width:980px; margin:0 auto; display:flex; flex-direction:column; height:min(680px, calc(100vh - 210px)); min-height:420px; background:var(--surface); border:1px solid var(--border); border-radius:14px; overflow:hidden; }
+    .ai-messages { flex:1; overflow:auto; padding:20px; display:flex; flex-direction:column; gap:12px; }
+    .ai-message { max-width:min(780px,88%); padding:12px 14px; border-radius:12px; white-space:pre-wrap; line-height:1.55; font-size:13px; }
+    .ai-message.user { align-self:flex-end; background:rgba(var(--accent-rgb),.18); border:1px solid rgba(var(--accent-rgb),.35); }
+    .ai-message.assistant { align-self:flex-start; background:rgba(255,255,255,.045); border:1px solid var(--border); }
+    .ai-composer { display:flex; gap:10px; padding:14px; border-top:1px solid var(--border); }
+    .ai-composer textarea { min-height:48px; max-height:130px; resize:vertical; flex:1; margin:0; }
     .check-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:10px; }
     .check-item { display:flex; align-items:flex-start; gap:6px; padding:7px 10px; border-radius:6px; border:1px solid transparent; }
     .check-pass    { background:rgba(74,222,128,.05);   border-color:rgba(74,222,128,.15); }
@@ -368,6 +375,7 @@
     <div class="nav-item" data-page="dashboard"><span class="icon">📊</span> Dashboard</div>
     <div class="nav-item" data-page="servers"><span class="icon">🖥</span> Serveurs</div>
     <div class="nav-item" data-page="vulns"><span class="icon">⚠️</span> Vulnérabilités</div>
+    <div class="nav-item" data-page="ai"><span class="icon">🤖</span> Assistant IA</div>
     <div class="nav-section">Gestion</div>
     <div class="nav-item" data-page="compliance"><span class="icon">✅</span> Conformité</div>
     <div class="nav-item" data-page="updates"><span class="icon">🔄</span> Mises à jour</div>
@@ -387,7 +395,7 @@
     <div class="page" id="page-dashboard">
       <div class="header-row">
         <div><h1>Tableau de bord</h1><p>Vue d'ensemble en temps réel</p></div>
-        <button class="btn btn-ghost btn-sm" onclick="loadDashboard()">↻ Actualiser</button>
+        <div class="flex gap-2"><button class="btn btn-ghost btn-sm" onclick="downloadExport('/api/exports/servers.csv', 'heimdall-inventaire.csv')">⇩ Exporter CSV</button><button class="btn btn-ghost btn-sm" onclick="loadDashboard()">↻ Actualiser</button></div>
       </div>
       <div class="cards" id="stat-cards"><div class="spinner"></div></div>
       <div class="chart-wrap mb-6" id="cve-usage-wrap" style="display:none"><div class="chart-title">Consommation API CVE — 30 jours</div><div id="cve-usage-history"></div></div>
@@ -422,7 +430,7 @@
             <button id="view-table-btn"   class="btn btn-sm btn-active" onclick="setServersView('table')">Tableau</button>
             <button id="view-network-btn" class="btn btn-sm btn-ghost"  onclick="setServersView('network')">🌐 Réseau</button>
           </div>
-          <button class="btn btn-ghost btn-sm" onclick="loadServers()">↻</button>
+          <button class="btn btn-ghost btn-sm" onclick="downloadExport('/api/exports/servers.csv', 'heimdall-inventaire.csv')">⇩ CSV</button><button class="btn btn-ghost btn-sm" onclick="loadServers()">↻</button>
         </div>
       </div>
       <div id="servers-content"><div class="loading-center"><div class="spinner"></div></div></div>
@@ -436,6 +444,7 @@
           <span class="text-muted" id="cve-quota" style="font-size:12px;align-self:center"></span>
           <button class="btn btn-ghost btn-sm" id="btn-cve-check" onclick="checkCveConfiguration()" style="display:none" title="Vérifie l'URL et la clé CVE sans lancer d'analyse">✓ Vérifier</button>
           <button class="btn btn-primary btn-sm" id="btn-cve-rescan" onclick="startCveRescan()" style="display:none" title="Relancer l'analyse CVE depuis les inventaires déjà reçus">🔎 Analyser le parc</button>
+          <button class="btn btn-ghost btn-sm" onclick="downloadExport('/api/exports/vulnerabilities.csv', 'heimdall-vulnerabilites.csv')">⇩ CSV</button>
           <button class="btn btn-ghost btn-sm" id="btn-front-url" onclick="openFrontUrlEditor()" style="display:none" title="Configurer l'URL du site front pour les liens CVE">🔗 URL front</button>
           <button class="btn btn-ghost btn-sm" onclick="loadVulns()">↻</button>
         </div>
@@ -448,11 +457,21 @@
       <div id="vulns-content"><div class="loading-center"><div class="spinner"></div></div></div>
     </div>
 
+    <!-- Assistant IA -->
+    <div class="page" id="page-ai">
+      <div class="header-row"><div><h1>Assistant IA</h1><p id="ai-status">Analyse du parc et aide aux règles de conformité</p></div></div>
+      <div class="ai-chat">
+        <div class="ai-messages" id="ai-messages"></div>
+        <div class="ai-composer"><textarea id="ai-input" placeholder="Ex. Quels hôtes dois-je traiter en priorité et quelles règles CIS appliquer ?" aria-label="Message à l'assistant IA"></textarea><button class="btn btn-primary" id="ai-send" onclick="sendAiMessage()">Envoyer</button></div>
+      </div>
+    </div>
+
     <!-- Conformité -->
     <div class="page" id="page-compliance">
       <div class="header-row">
         <div><h1>Conformité</h1><p id="comp-subtitle">Règles de sécurité personnalisées</p></div>
         <div class="flex gap-2">
+          <button class="btn btn-ghost btn-sm" onclick="downloadExport('/api/exports/compliance.csv', 'heimdall-conformite.csv')">⇩ CSV</button>
           <button class="btn btn-ghost btn-sm" id="btn-add-rule" onclick="openRuleModal(null)" style="display:none">+ Règle</button>
           <button class="btn btn-success btn-sm" id="btn-save-rules" onclick="saveComplianceRules()" style="display:none">💾 Sauvegarder</button>
           <button class="btn btn-ghost btn-sm" id="btn-discard-rules" onclick="discardRuleChanges()" style="display:none">✕ Annuler</button>
@@ -609,6 +628,20 @@ async function api(path, opts) {
   return body;
 }
 
+async function downloadExport(path, filename) {
+  try {
+    const res = await fetch(path, { headers: tok() ? { Authorization: 'Bearer ' + tok() } : {} });
+    if (res.status === 401) { logout(); throw new Error('Session expirée'); }
+    if (!res.ok) {
+      const body = await res.json().catch(function(){ return {}; });
+      throw new Error(body.error || 'Export impossible');
+    }
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement('a'); a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  } catch (err) { toast(err.message, 'err'); }
+}
+
 function showAlert(id, msg, ok) {
   const el = document.getElementById(id);
   el.className = 'alert ' + (ok ? 'alert-ok' : 'alert-err');
@@ -722,7 +755,7 @@ function logout() {
 }
 
 /* ── Router ── */
-var LOADERS = { servers: loadServers, vulns: loadVulns, compliance: loadCompliance, updates: loadUpdates, deploy: loadDeploy, users: loadUsers, dashboard: loadDashboard };
+var LOADERS = { servers: loadServers, vulns: loadVulns, ai: loadAi, compliance: loadCompliance, updates: loadUpdates, deploy: loadDeploy, users: loadUsers, dashboard: loadDashboard };
 
 function navigate(page) {
   document.querySelectorAll('.page').forEach(function(p){ p.classList.remove('active'); });
@@ -734,6 +767,48 @@ function navigate(page) {
 }
 
 document.querySelectorAll('.nav-item[data-page]').forEach(function(el){ el.addEventListener('click', function(){ navigate(el.dataset.page); }); });
+
+/* ── Assistant IA ── */
+var _aiMessages = [], _aiConfigured = false;
+function renderAiMessages() {
+  var box = document.getElementById('ai-messages'); if (!box) return;
+  box.innerHTML = _aiMessages.map(function(m) {
+    return '<div class="ai-message '+(m.role === 'user' ? 'user' : 'assistant')+'">'+esc(m.content)+'</div>';
+  }).join('');
+  box.scrollTop = box.scrollHeight;
+}
+async function loadAi() {
+  var status = document.getElementById('ai-status');
+  if (!_aiMessages.length) {
+    _aiMessages.push({role:'assistant', content:'Je peux analyser le parc visible par Heimdall, aider à prioriser les risques et proposer des règles de conformité. Les actions restent à valider par vous.'});
+    renderAiMessages();
+  }
+  try {
+    var cfg = await api('/api/ai/status');
+    _aiConfigured = !!cfg.configured;
+    status.textContent = cfg.configured
+      ? 'Connecté à '+(cfg.provider || 'IA')+' · modèle '+(cfg.model || '—')+' · le contexte est généré à chaque demande'
+      : 'Non configuré — définissez AI_PROVIDER et AI_MODEL dans l’environnement du serveur.';
+    document.getElementById('ai-send').disabled = !_aiConfigured;
+  } catch (err) { status.textContent = 'Statut IA indisponible : ' + err.message; }
+}
+async function sendAiMessage() {
+  var input = document.getElementById('ai-input');
+  var content = input.value.trim(); if (!content) return;
+  if (!_aiConfigured) { toast('Configurez d’abord le fournisseur IA sur le serveur.', 'err'); return; }
+  var btn = document.getElementById('ai-send');
+  _aiMessages.push({role:'user', content:content}); input.value = ''; renderAiMessages();
+  btn.disabled = true; btn.textContent = 'Analyse…';
+  try {
+    var result = await api('/api/ai/chat', {method:'POST', body:JSON.stringify({messages:_aiMessages})});
+    _aiMessages.push({role:'assistant', content:result.reply}); renderAiMessages();
+  } catch (err) {
+    _aiMessages.push({role:'assistant', content:'Erreur : '+err.message}); renderAiMessages();
+  } finally { btn.disabled = false; btn.textContent = 'Envoyer'; input.focus(); }
+}
+document.getElementById('ai-input').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAiMessage(); }
+});
 
 /* ── Dashboard ── */
 async function loadDashboard() {
@@ -1888,10 +1963,15 @@ var _currentPage = null;
 function startAutoRefresh(page) {
   _currentPage = page;
   if (_refreshTimer) clearInterval(_refreshTimer);
+  // Une conversation ou un formulaire ne doit jamais être remplacé par une
+  // actualisation. Les données IA sont demandées explicitement à l'envoi.
+  if (page === 'ai') return;
   _refreshTimer = setInterval(function(){
     if (document.hidden) return; // pas de refresh si onglet en arrière-plan
     if (document.querySelector('.modal-backdrop.open')) return; // pas pendant l'édition
     if (_isDirty) return; // pas si des règles non sauvegardées
+    var active = document.activeElement;
+    if (active && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)) return;
     var loader = LOADERS[_currentPage];
     if (loader) loader();
   }, 60000);

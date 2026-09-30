@@ -119,6 +119,10 @@ s'auto-mettent à jour sur la version exposée par le serveur.
 | `HEIMDALL_CVE_API`       | `http://cve_api:5000`      | API CVE interrogée pour les corrélations (hors réseau Docker Heimdall : `https://cve.heimdall-security.com/api`) |
 | `CVE_API_KEY`            | _(vide)_                   | Clé API CVE nominative — **obligatoire** pour la corrélation de vulnérabilités (sans elle, aucun appel à l'API, 0 vulnérabilité détectée) ; chaque logiciel analysé consomme 1 crédit |
 | `SERVER_PUBLIC_HOST`     | `127.0.0.1`                | IP/domaine public de ce serveur              |
+| `AI_PROVIDER`            | _(vide)_                   | Assistant : `openai_compatible`, `anthropic` ou `ollama` |
+| `AI_BASE_URL`            | selon le fournisseur       | URL de l'API ou passerelle IA (Ollama : `http://ollama:11434`) |
+| `AI_API_KEY`             | _(vide)_                   | Clé IA, gardée uniquement dans le conteneur serveur |
+| `AI_MODEL`               | _(vide)_                   | Modèle à utiliser (requis pour activer le chat) |
 
 ---
 

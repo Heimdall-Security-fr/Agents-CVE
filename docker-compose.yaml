@@ -46,6 +46,12 @@ services:
       # sans elle, aucun appel n'est fait à l'API (0 vulnérabilité détectée) plutôt
       # que de la contourner et ne jamais décompter le quota du plan payant.
       CVE_API_KEY: "${CVE_API_KEY:-}"
+      # Assistant IA facultatif (la clé ne quitte jamais ce conteneur).
+      # AI_PROVIDER: openai_compatible | anthropic | ollama
+      AI_PROVIDER: "${AI_PROVIDER:-}"
+      AI_BASE_URL: "${AI_BASE_URL:-}"
+      AI_API_KEY: "${AI_API_KEY:-}"
+      AI_MODEL: "${AI_MODEL:-}"
     depends_on:
       - mongodb
 

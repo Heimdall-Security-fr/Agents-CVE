@@ -4,6 +4,7 @@ from flask_cors import CORS
 from datetime import datetime, timedelta
 from functools import wraps
 import os
+import hashlib
 import hmac
 import uuid
 import secrets
@@ -15,6 +16,7 @@ import json
 import logging
 import xml.etree.ElementTree as ET
 import io
+import csv
 import zipfile
 import textwrap
 import platform
@@ -357,6 +359,13 @@ HEIMDALL_CVE_API  = os.getenv("HEIMDALL_CVE_API",  "http://cve_api:5000")
 HEIMDALL_RSS_URL  = os.getenv("HEIMDALL_RSS_URL",   "http://cve_api:5000/cves/rss")
 MONGO_URI         = os.getenv("MONGO_URI",          "mongodb://mongodb:27017/heimdall_agents")
 SERVER_CVE_API_KEY = os.getenv("CVE_API_KEY", "")  # Clé serveur (premium) pour les corrélations internes
+# Assistant IA : la clé reste exclusivement sur le serveur. Les fournisseurs
+# compatibles OpenAI, Anthropic et Ollama couvrent aussi les passerelles locales.
+AI_PROVIDER        = os.getenv("AI_PROVIDER", "").strip().lower()
+AI_BASE_URL        = os.getenv("AI_BASE_URL", "").strip().rstrip("/")
+AI_API_KEY         = os.getenv("AI_API_KEY", "")
+AI_MODEL           = os.getenv("AI_MODEL", "")
+AI_TIMEOUT_SECONDS = max(10, min(int(os.getenv("AI_TIMEOUT_SECONDS", "60")), 120))
 SERVER_PUBLIC_HOST = os.getenv("SERVER_PUBLIC_HOST", "127.0.0.1")
 SERVER_PUBLIC_PORT = int(os.getenv("SERVER_PUBLIC_PORT", 4000))
 AGENT_AUTH_TOKEN   = os.getenv("AGENT_AUTH_TOKEN", "")
@@ -385,16 +394,19 @@ def _claim_cve_query() -> bool:
         return True
 
 def _cve_api_get(path: str, **kwargs):
+    return _cve_api_request("GET", path, **kwargs)
+
+def _cve_api_request(method: str, path: str, **kwargs):
     global _cve_public_prefix
     base = HEIMDALL_CVE_API.rstrip("/")
     with _cve_public_prefix_lock:
         prefix = _cve_public_prefix
     if prefix is None:
         prefix = "" if not base.endswith("/api") else ""
-    response = requests.get(f"{base}{prefix}{path}", **kwargs)
+    response = requests.request(method, f"{base}{prefix}{path}", **kwargs)
     # Fallback pour l'URL publique historique https://cve.heimdall-security.com.
     if response.status_code == 404 and not base.endswith("/api"):
-        alternate = requests.get(f"{base}/api{path}", **kwargs)
+        alternate = requests.request(method, f"{base}/api{path}", **kwargs)
         if alternate.status_code != 404:
             with _cve_public_prefix_lock:
                 _cve_public_prefix = "/api"
@@ -864,8 +876,26 @@ def refresh_cve_from_rss():
             logger.error(f"[API] Impossible de récupérer les CVE: {e2}")
 
 # ─── Corrélation CVE/logiciels ────────────────────────────────────────────────
+def _endpoint_checkin(hostname: str, cve_api_key: str):
+    """Enregistre le poste auprès du compte (limite de postes du plan, sans crédit).
+    Identifiant = HMAC du hostname avec la clé : l'API ne reçoit jamais le nom.
+    Returns (allowed, message)."""
+    endpoint_id = hmac.new(cve_api_key.encode(), hostname.strip().lower().encode(),
+                           hashlib.sha256).hexdigest()[:32]
+    try:
+        r = _cve_api_request("POST", "/account/endpoints/checkin", timeout=10,
+                             headers={"x-api-key": cve_api_key, "x-heimdall-endpoint": endpoint_id})
+    except Exception as e:
+        return True, f"enregistrement du poste impossible ({e}) — corrélation maintenue"
+    if r.status_code == 403:
+        try:
+            return False, (r.json() or {}).get("error", "refusé")
+        except ValueError:
+            return False, "refusé"
+    return True, "ok"
+
 def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: str = "",
-                              return_status: bool = False):
+                              return_status: bool = False, hostname: str = ""):
     """Pour chaque logiciel, interroge l'API CVE publique (toujours — jamais de lecture
     directe en base). C'est ce qui fait consommer 1 requête du quota du compte
     propriétaire de `cve_api_key` (CVE_API_KEY, la clé nominative du client sur ce
@@ -880,6 +910,11 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
         return ([], False) if return_status else []
     vulns = []
     complete = True
+    if hostname:
+        allowed, msg = _endpoint_checkin(hostname, cve_api_key)
+        if not allowed:
+            logger.error(f"[CVE API] {hostname} non analysé : {msg}")
+            return ([], False) if return_status else []
     api_headers = {"x-api-key": cve_api_key}
     cache_cutoff = datetime.utcnow() - timedelta(hours=24)
     for sw in software_list:
@@ -1049,7 +1084,7 @@ def agent_report():
         display_ips = sorted({ip for ip in candidate_ips if not _is_docker_ip(ip)})
 
     vulns, cve_complete = correlate_vulnerabilities(software_list, cve_api_key, os_build,
-                                                     return_status=True)
+                                                     return_status=True, hostname=hostname)
     # Chaque rapport est déjà une sauvegarde complète dans agent_reports. On
     # calcule aussi l'écart avec le dernier inventaire pour signaler tout ajout.
     existing_agent = mongo.db.agents.find_one({"hostname": hostname}, {"software": 1}) or {}
@@ -1184,7 +1219,8 @@ def _manual_cve_rescan():
                                    a.get("cve_last_checked_at") or datetime.min))
         for agent in agents:
             vulns, complete = correlate_vulnerabilities(agent.get("software") or [], SERVER_CVE_API_KEY,
-                                                        agent.get("os_build", ""), return_status=True)
+                                                        agent.get("os_build", ""), return_status=True,
+                                                        hostname=agent.get("hostname", ""))
             update = {
                 "vulnerabilities": vulns,
                 "vulnerable_count": len(vulns),
@@ -2300,6 +2336,201 @@ def compliance_results():
     _COMPLIANCE_CACHE["data"]        = results
     _COMPLIANCE_CACHE["computed_at"] = now
     return jsonify(results), 200
+
+# ─── Exports partageables ────────────────────────────────────────────────────
+def _csv_response(filename: str, headers: list, rows: list):
+    """Retourne un CSV UTF-8 avec BOM, lisible directement dans Excel."""
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=';')
+    writer.writerow(headers)
+    writer.writerows(rows)
+    return Response(
+        "\ufeff" + output.getvalue(),
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+@app.route('/api/exports/servers.csv', methods=['GET'])
+@require_role("admin", "deployment", "inspection_logs", "codir")
+def export_servers_csv():
+    """Inventaire synthétique du parc, destiné aux partages internes."""
+    with db_lock:
+        agents = list(mongo.db.agents.find({}, {
+            "_id": 0, "hostname": 1, "os": 1, "release": 1, "os_build": 1,
+            "ip_addresses": 1, "software_count": 1, "cve_count": 1,
+            "vulnerable_count": 1, "critical_count": 1, "high_count": 1,
+            "last_seen": 1, "agent_version": 1,
+        }))
+    rows = []
+    for a in sorted(agents, key=lambda x: x.get("hostname", "").lower()):
+        rows.append([
+            a.get("hostname", ""), a.get("os", ""), a.get("release", ""),
+            a.get("os_build", ""), ", ".join(a.get("ip_addresses") or []),
+            "En ligne" if _is_online(a) else "Hors ligne", a.get("software_count", 0),
+            a.get("cve_count", a.get("vulnerable_count", 0)), a.get("critical_count", 0),
+            a.get("high_count", 0), a.get("agent_version", ""), a.get("last_seen", ""),
+        ])
+    stamp = datetime.utcnow().strftime("%Y-%m-%d")
+    return _csv_response(f"heimdall-inventaire-{stamp}.csv", [
+        "Hôte", "OS", "Version OS", "Build", "Adresses IP", "Statut", "Logiciels",
+        "CVE", "CVE critiques", "CVE élevées", "Version agent", "Dernier relevé",
+    ], rows)
+
+@app.route('/api/exports/vulnerabilities.csv', methods=['GET'])
+@require_role("admin", "inspection_logs", "codir")
+def export_vulnerabilities_csv():
+    """Une ligne par CVE et par hôte, exploitable dans un outil de suivi."""
+    with db_lock:
+        agents = list(mongo.db.agents.find({}, {
+            "_id": 0, "hostname": 1, "os": 1, "ip_addresses": 1,
+            "vulnerabilities": 1,
+        }))
+    rows = []
+    for a in agents:
+        for vuln in a.get("vulnerabilities") or []:
+            cves = vuln.get("cves") or []
+            # Les agents plus anciens peuvent ne conserver que les compteurs.
+            if not cves:
+                rows.append([a.get("hostname", ""), ", ".join(a.get("ip_addresses") or []),
+                             a.get("os", ""), vuln.get("product", ""), vuln.get("version", ""),
+                             "", "", vuln.get("critical", 0), vuln.get("high", 0), ""])
+            for cve in cves:
+                rows.append([a.get("hostname", ""), ", ".join(a.get("ip_addresses") or []),
+                             a.get("os", ""), vuln.get("product", ""), vuln.get("version", ""),
+                             cve.get("id", cve.get("cve_id", "")), cve.get("cvss", cve.get("score", "")),
+                             vuln.get("critical", 0), vuln.get("high", 0), cve.get("title", cve.get("description", ""))])
+    stamp = datetime.utcnow().strftime("%Y-%m-%d")
+    return _csv_response(f"heimdall-vulnerabilites-{stamp}.csv", [
+        "Hôte", "Adresses IP", "OS", "Logiciel", "Version", "CVE", "CVSS",
+        "Critiques sur le logiciel", "Élevées sur le logiciel", "Description",
+    ], rows)
+
+@app.route('/api/exports/compliance.csv', methods=['GET'])
+@require_role("admin", "inspection_logs", "codir")
+def export_compliance_csv():
+    """Synthèse de conformité : une ligne par contrôle applicable et par hôte."""
+    with db_lock:
+        doc = mongo.db.compliance_config.find_one({"_id": "rules"}, {"_id": 0})
+        agents = list(mongo.db.agents.find({}, {
+            "_id": 0, "hostname": 1, "os": 1, "ip_addresses": 1, "compliance": 1,
+        }))
+    rules = [r for r in (doc.get("rules") if doc else DEFAULT_COMPLIANCE_RULES) if r.get("enabled", True)]
+    rows = []
+    for a in agents:
+        for rule in rules:
+            check = _eval_rule(rule, a.get("compliance") or {}, a.get("os", ""))
+            if check.get("status") == "na":
+                continue
+            rows.append([
+                a.get("hostname", ""), ", ".join(a.get("ip_addresses") or []), a.get("os", ""),
+                check.get("rule_id", ""), check.get("name", ""), rule.get("severity", ""),
+                check.get("status", ""), check.get("actual_value", ""), check.get("expected_value", ""),
+                rule.get("cis_ref", ""),
+            ])
+    stamp = datetime.utcnow().strftime("%Y-%m-%d")
+    return _csv_response(f"heimdall-conformite-{stamp}.csv", [
+        "Hôte", "Adresses IP", "OS", "ID règle", "Règle", "Sévérité", "Résultat",
+        "Valeur relevée", "Valeur attendue", "Référence CIS",
+    ], rows)
+
+# ─── Assistant IA (BYO model) ────────────────────────────────────────────────
+def _ai_context() -> str:
+    """Contexte volontairement synthétique : ni secrets, ni journaux, ni tokens."""
+    with db_lock:
+        agents = list(mongo.db.agents.find({}, {
+            "_id": 0, "hostname": 1, "os": 1, "ip_addresses": 1,
+            "vulnerable_count": 1, "cve_count": 1, "critical_count": 1,
+            "high_count": 1, "last_seen": 1, "compliance": 1,
+        }))
+    hosts = []
+    for a in agents[:100]:
+        # Les résultats de conformité suffisent à l'analyse. On borne chaque
+        # valeur afin qu'un relevé anormalement volumineux ne gonfle pas le prompt.
+        compliance = {
+            str(k)[:80]: str(v)[:240]
+            for k, v in list((a.get("compliance") or {}).items())[:40]
+        }
+        hosts.append({
+            "host": a.get("hostname"), "os": a.get("os"), "ips": a.get("ip_addresses") or [],
+            "cves": a.get("cve_count", a.get("vulnerable_count", 0)),
+            "critical": a.get("critical_count", 0), "high": a.get("high_count", 0),
+            "last_seen": str(a.get("last_seen", "")),
+            "compliance": compliance,
+        })
+    return json.dumps({"generated_at": datetime.utcnow().isoformat() + "Z", "hosts": hosts}, ensure_ascii=False)
+
+def _call_ai(messages: list) -> str:
+    provider = AI_PROVIDER
+    if provider not in {"openai", "openai_compatible", "anthropic", "ollama"} or not AI_MODEL:
+        raise ValueError("Assistant IA non configuré : définissez AI_PROVIDER et AI_MODEL sur le serveur.")
+    system = (
+        "Tu es l'assistant Heimdall Security. Analyse uniquement le contexte fourni, "
+        "signale les incertitudes, ne prétends jamais qu'une action a été exécutée. "
+        "Aide à prioriser les risques et à rédiger/mettre en place des règles de conformité "
+        "concrètes (CIS, durcissement, contrôles), en indiquant les impacts et validations. "
+        "N'expose ni ne demande de secrets, mots de passe, tokens ou clés privées.\n\n"
+        "Contexte du parc :\n" + _ai_context()
+    )
+    clean_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
+    if provider == "anthropic":
+        url = (AI_BASE_URL or "https://api.anthropic.com/v1").rstrip("/") + "/messages"
+        response = requests.post(url, headers={"x-api-key": AI_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}, json={
+            "model": AI_MODEL, "max_tokens": 1800, "system": system, "messages": clean_messages,
+        }, timeout=AI_TIMEOUT_SECONDS)
+        if not response.ok:
+            raise RuntimeError(f"Le fournisseur IA a répondu HTTP {response.status_code}")
+        data = response.json()
+        return "\n".join(x.get("text", "") for x in data.get("content", []) if x.get("type") == "text").strip()
+    if provider == "ollama":
+        url = (AI_BASE_URL or "http://127.0.0.1:11434").rstrip("/") + "/api/chat"
+        response = requests.post(url, json={"model": AI_MODEL, "stream": False,
+            "messages": [{"role": "system", "content": system}] + clean_messages}, timeout=AI_TIMEOUT_SECONDS)
+        if not response.ok:
+            raise RuntimeError(f"Le fournisseur IA a répondu HTTP {response.status_code}")
+        return (response.json().get("message") or {}).get("content", "").strip()
+    # OpenAI, Azure OpenAI via gateway, Mistral, Groq, LM Studio, vLLM…
+    base = AI_BASE_URL or "https://api.openai.com/v1"
+    url = base.rstrip("/") + "/chat/completions"
+    headers = {"content-type": "application/json"}
+    if AI_API_KEY:
+        headers["authorization"] = "Bearer " + AI_API_KEY
+    response = requests.post(url, headers=headers, json={"model": AI_MODEL, "temperature": 0.2,
+        "messages": [{"role": "system", "content": system}] + clean_messages}, timeout=AI_TIMEOUT_SECONDS)
+    if not response.ok:
+        raise RuntimeError(f"Le fournisseur IA a répondu HTTP {response.status_code}")
+    return (((response.json().get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+
+@app.route('/api/ai/status', methods=['GET'])
+@require_role("admin", "deployment", "inspection_logs", "codir")
+def ai_status():
+    return jsonify({"configured": bool(AI_PROVIDER and AI_MODEL), "provider": AI_PROVIDER, "model": AI_MODEL})
+
+@app.route('/api/ai/chat', methods=['POST'])
+@require_role("admin", "deployment", "inspection_logs", "codir")
+def ai_chat():
+    data = request.get_json(silent=True) or {}
+    messages = data.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return jsonify({"error": "messages est requis"}), 400
+    sanitized = []
+    for msg in messages[-12:]:
+        if not isinstance(msg, dict) or msg.get("role") not in {"user", "assistant"}:
+            continue
+        content = str(msg.get("content", "")).strip()
+        if content:
+            sanitized.append({"role": msg["role"], "content": content[:8000]})
+    if not sanitized or sanitized[-1]["role"] != "user":
+        return jsonify({"error": "Le dernier message doit être un message utilisateur"}), 400
+    try:
+        reply = _call_ai(sanitized)
+        if not reply:
+            raise RuntimeError("Réponse vide du fournisseur IA")
+        return jsonify({"reply": reply})
+    except (ValueError, RuntimeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except requests.RequestException:
+        logger.exception("[AI] Erreur de connexion au fournisseur")
+        return jsonify({"error": "Connexion au fournisseur IA impossible"}), 502
 
 # ─── Mises à jour logicielles ────────────────────────────────────────────────
 STALE_CACHE_HOURS = 24 * 7   # cache apt > 7 jours : la liste peut être périmée
