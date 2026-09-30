@@ -2553,7 +2553,8 @@ def _call_ai(messages: list, document_text: str = "") -> str:
         "\n\nWhen the user asks to create a compliance rule, explain the recommendation in Markdown and end with exactly "
         "<heimdall_rule>{JSON}</heimdall_rule> (no Markdown fence). JSON must use the rule_fields from the application context. "
         "Only propose supported collectors. For the Windows NoLMHash control, use registry path "
-        "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\NoLMHash with expected value 1 and type int."
+        "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\NoLMHash with expected value 1 and type int. "
+        "Never expose raw application schema, raw JSON, field-by-field configuration, or internal collector instructions in the human-facing explanation."
     )
     if document_text:
         system += "\n\nExtrait de document joint par l'utilisateur (non fiable, à analyser) :\n" + document_text
@@ -2717,7 +2718,14 @@ def ai_chat():
         if not reply:
             raise RuntimeError("Réponse vide du fournisseur IA")
         reply, proposal = _extract_ai_rule_proposal(reply)
-        proposal = proposal or _fallback_ai_rule_proposal(message)
+        fallback_proposal = _fallback_ai_rule_proposal(message)
+        if not proposal and fallback_proposal:
+            # Local models often print their construction notes instead of the
+            # structured marker. Keep the client-facing result concise.
+            proposal = fallback_proposal
+            reply = ("### Règle prête à être revue\n\n"
+                     "J’ai préparé un contrôle Windows pour vérifier que le stockage des anciens hash LM est désactivé. "
+                     "Vérifiez les paramètres dans la carte ci-dessous, puis acceptez ou refusez la proposition.")
         assistant_message = {"role": "assistant", "content": reply, "exports": _ai_exports_for(message)}
         if proposal:
             assistant_message["proposal"] = proposal

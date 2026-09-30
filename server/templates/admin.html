@@ -238,7 +238,7 @@
     .ai-message.user .ai-message-label { color:rgba(35,16,5,.7); }
     .ai-actions { display:flex; flex-wrap:wrap; gap:7px; margin-top:12px; padding-top:10px; border-top:1px solid rgba(255,255,255,.09); }
     .ai-empty-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
-    .ai-markdown h1,.ai-markdown h2,.ai-markdown h3 { font-size:14px; margin:10px 0 6px; color:#fff; } .ai-markdown p { margin:0 0 8px; } .ai-markdown p:last-child { margin-bottom:0; } .ai-markdown ul,.ai-markdown ol { padding-left:19px; margin:6px 0; } .ai-markdown li { margin:3px 0; } .ai-markdown code { background:rgba(0,0,0,.3); color:#c7d4ff; border-radius:4px; padding:1px 4px; font-size:11px; } .ai-markdown pre { overflow:auto; padding:10px; border-radius:7px; background:#0a1224; margin:8px 0; } .ai-markdown pre code { padding:0; background:none; } .ai-markdown a { color:#9ab3ff; }
+    .ai-markdown { min-width:0; } .ai-markdown h1,.ai-markdown h2,.ai-markdown h3 { font-size:14px; margin:10px 0 6px; color:#fff; } .ai-markdown p { margin:0 0 8px; } .ai-markdown p:last-child { margin-bottom:0; } .ai-markdown ul,.ai-markdown ol { padding-left:19px; margin:6px 0; } .ai-markdown li { margin:3px 0; } .ai-markdown code { background:rgba(0,0,0,.3); color:#c7d4ff; border-radius:4px; padding:1px 4px; font-size:11px; } .ai-markdown pre { overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; padding:10px; border-radius:7px; background:#0a1224; margin:8px 0; } .ai-markdown pre code { padding:0; background:none; } .ai-markdown a { color:#9ab3ff; }
     .ai-proposal { margin-top:14px; padding:12px; background:rgba(var(--accent-2-rgb),.08); border:1px solid rgba(var(--accent-2-rgb),.30); border-radius:9px; } .ai-proposal-title { font-size:12px; font-weight:700; color:#bfd0ff; margin-bottom:9px; } .ai-proposal-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; } .ai-proposal label { margin:0; font-size:9px; } .ai-proposal input,.ai-proposal select { margin-top:3px; padding:7px 8px; font-size:12px; background:#0c162b; } .ai-proposal-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:10px; }
     .ai-composer { display:grid; grid-template-columns:auto 1fr auto; gap:10px; align-items:center; padding:12px 16px; border-top:1px solid rgba(120,140,200,.2); background:#101a30; }
     .ai-composer textarea { width:100%; min-height:46px; max-height:100px; resize:vertical; margin:0; padding:12px 13px; color:var(--text); background:#0a1224; border:1px solid rgba(120,140,200,.32); border-radius:9px; font:13px/1.4 inherit; outline:none; }
@@ -793,7 +793,12 @@ function markdownInline(value) {
   return out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
 }
 function renderMarkdown(value) {
-  var lines = String(value || '').split('\n'), html = [], list = null, code = false, codeLines = [];
+  var raw = String(value || '');
+  // A local model may occasionally leave a Markdown fence open. Treating the
+  // entire answer as source code makes the conversation unreadable.
+  var fences = (raw.match(/```/g) || []).length;
+  if (fences % 2) raw = raw.replace(/```[^\n]*/g, '');
+  var lines = raw.split('\n'), html = [], list = null, code = false, codeLines = [];
   function flushList() { if (list) { html.push('<'+list.tag+'>'+list.items.join('')+'</'+list.tag+'>'); list = null; } }
   function flushCode() { if (code) { html.push('<pre><code>'+esc(codeLines.join('\n'))+'</code></pre>'); code=false; codeLines=[]; } }
   lines.forEach(function(line) {
@@ -835,12 +840,20 @@ async function applyAiProposal(index) {
 }
 async function dismissAiProposal(index) { if (!_aiMessages[index]) return; try { await api('/api/ai/compliance-proposals/dismiss', {method:'POST', body:JSON.stringify({message_index:index})}); _aiMessages[index].proposal = null; renderAiMessages(); toast('Proposition refusée', 'info'); } catch(err) { toast(err.message, 'err'); } }
 function useAiPrompt(prompt) { var input = document.getElementById('ai-input'); input.value = prompt; input.focus(); }
+function normalizeLegacyAiMessages() {
+  _aiMessages.forEach(function(m) {
+    if (m.role !== 'assistant' || m.proposal || !/nolmhash|no\s*lm\s*hash/i.test(m.content || '')) return;
+    m.content = '### Règle prête à être revue\n\nUne règle Windows a été préparée pour vérifier que les anciens hash LM ne sont pas stockés. Vérifiez puis acceptez ou refusez la proposition.';
+    m.proposal = {id:'windows_no_lm_hash', name:'Stockage de hash LM désactivé', description:'Windows ne doit pas enregistrer de hash LAN Manager (LM), format historique faible.', severity:'high', expected_op:'==', expected_value:1, type:'int', platforms:['windows'], cis_ref:'CIS Windows: NoLMHash', example:'DWORD NoLMHash = 1', enabled:true, collector:{type:'registry', path:'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\NoLMHash'}};
+  });
+}
 async function loadAi() {
   var status = document.getElementById('ai-status');
   try {
     var results = await Promise.all([api('/api/ai/status'), api('/api/ai/chat')]);
     var cfg = results[0], history = results[1];
     _aiMessages = history.messages || [];
+    normalizeLegacyAiMessages();
     if (!_aiMessages.length) _aiMessages = [{role:'assistant', content:'Je peux analyser le parc visible par Heimdall, aider à prioriser les risques et proposer des règles de conformité. Les actions restent à valider par vous.'}];
     renderAiMessages();
     _aiConfigured = !!cfg.configured;
