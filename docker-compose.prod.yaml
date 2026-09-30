@@ -55,7 +55,7 @@ services:
       DEFAULT_ADMIN_PASSWORD: "${DEFAULT_ADMIN_PASSWORD:?Set DEFAULT_ADMIN_PASSWORD (12+ characters)}"
       DASHBOARD_ALLOWED_ORIGINS: "${DASHBOARD_ALLOWED_ORIGINS:-}"
       HEIMDALL_FRONT_URL: "${HEIMDALL_FRONT_URL:-https://cve.heimdall-security.com}"
-      HEIMDALL_CVE_API: "${HEIMDALL_CVE_API:-https://cve.heimdall-security.com}"
+      HEIMDALL_CVE_API: "${HEIMDALL_CVE_API:-https://cve.heimdall-security.com/api}"
       HEIMDALL_RSS_URL: "${HEIMDALL_RSS_URL:-${HEIMDALL_CVE_API:-https://cve.heimdall-security.com}/cves/rss}"
       CVE_API_KEY: "${CVE_API_KEY:-}"
     security_opt:

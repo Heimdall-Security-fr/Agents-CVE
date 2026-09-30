@@ -427,6 +427,7 @@
         <div><h1>Vulnérabilités</h1><p id="vulns-subtitle">CVE détectées par agent</p></div>
         <div class="flex gap-2">
           <span class="text-muted" id="cve-quota" style="font-size:12px;align-self:center"></span>
+          <button class="btn btn-ghost btn-sm" id="btn-cve-check" onclick="checkCveConfiguration()" style="display:none" title="Vérifie l'URL et la clé CVE sans lancer d'analyse">✓ Vérifier</button>
           <button class="btn btn-primary btn-sm" id="btn-cve-rescan" onclick="startCveRescan()" style="display:none" title="Relancer l'analyse CVE depuis les inventaires déjà reçus">🔎 Analyser le parc</button>
           <button class="btn btn-ghost btn-sm" id="btn-front-url" onclick="openFrontUrlEditor()" style="display:none" title="Configurer l'URL du site front pour les liens CVE">🔗 URL front</button>
           <button class="btn btn-ghost btn-sm" onclick="loadVulns()">↻</button>
@@ -907,11 +908,27 @@ async function loadVulns() {
   if (fuBtn) fuBtn.style.display = _isAdmin() ? 'inline-flex' : 'none';
   var scanBtn = document.getElementById('btn-cve-rescan');
   if (scanBtn) scanBtn.style.display = _isAdmin() ? 'inline-flex' : 'none';
+  var checkBtn = document.getElementById('btn-cve-check');
+  if (checkBtn) checkBtn.style.display = _isAdmin() ? 'inline-flex' : 'none';
   loadCveQuota();
   try {
     _vulnsData = await api('/api/vulnerabilities');
     renderVulns();
   } catch(err) { el.innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>'; }
+}
+
+async function checkCveConfiguration() {
+  var btn = document.getElementById('btn-cve-check');
+  btn.disabled = true;
+  try {
+    var q = await api('/api/cve-quota');
+    if (!q.configured) throw new Error('CVE_API_KEY non configurée sur le serveur agent.');
+    if (!q.available) throw new Error(q.message || 'API CVE indisponible.');
+    var remaining = q.daily_remaining === null ? 'quota illimité' : q.daily_remaining + ' requête(s) aujourd’hui';
+    toast('Configuration CVE valide — ' + remaining + ', ' + (q.credits || 0) + ' crédit(s).', 'ok');
+    loadCveQuota();
+  } catch (err) { toast('Vérification CVE : ' + err.message, 'err'); }
+  finally { btn.disabled = false; }
 }
 
 async function loadCveQuota() {

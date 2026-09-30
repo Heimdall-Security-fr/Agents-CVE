@@ -355,6 +355,32 @@ SERVER_PUBLIC_HOST = os.getenv("SERVER_PUBLIC_HOST", "127.0.0.1")
 SERVER_PUBLIC_PORT = int(os.getenv("SERVER_PUBLIC_PORT", 4000))
 AGENT_AUTH_TOKEN   = os.getenv("AGENT_AUTH_TOKEN", "")
 HEIMDALL_FRONT_URL = os.getenv("HEIMDALL_FRONT_URL", "http://localhost:3000")
+
+# L'API directe (Docker) expose /cves/..., alors que le site public la publie
+# derrière /api/cves/.... Le premier 404 permet de détecter le bon préfixe sans
+# débiter le quota (seules les routes /cves sont comptabilisées).
+_cve_public_prefix = None
+_cve_public_prefix_lock = threading.Lock()
+
+def _cve_api_get(path: str, **kwargs):
+    global _cve_public_prefix
+    base = HEIMDALL_CVE_API.rstrip("/")
+    with _cve_public_prefix_lock:
+        prefix = _cve_public_prefix
+    if prefix is None:
+        prefix = "" if not base.endswith("/api") else ""
+    response = requests.get(f"{base}{prefix}{path}", **kwargs)
+    # Fallback pour l'URL publique historique https://cve.heimdall-security.com.
+    if response.status_code == 404 and not base.endswith("/api"):
+        alternate = requests.get(f"{base}/api{path}", **kwargs)
+        if alternate.status_code != 404:
+            with _cve_public_prefix_lock:
+                _cve_public_prefix = "/api"
+            return alternate
+    elif response.status_code != 404:
+        with _cve_public_prefix_lock:
+            _cve_public_prefix = ""
+    return response
 def _read_agent_version() -> str:
     """Version des agents publiée par ce serveur : variable d'environnement si définie,
     sinon le fichier .agent_version écrit au build de l'image, sinon la valeur par défaut."""
@@ -804,7 +830,7 @@ def refresh_cve_from_rss():
     except Exception as e:
         logger.warning(f"[RSS] Échec récupération flux RSS: {e}. Tentative via API directe…")
         try:
-            r = requests.get(f"{HEIMDALL_CVE_API}/cves/recent", headers={"x-api-key": SERVER_CVE_API_KEY}, timeout=15)
+            r = _cve_api_get("/cves/recent", headers={"x-api-key": SERVER_CVE_API_KEY}, timeout=15)
             r.raise_for_status()
             cves = r.json() if isinstance(r.json(), list) else r.json().get("results", [])
             for cve in cves:
@@ -845,8 +871,8 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
         fetch_limit = min(int(os.getenv("MAX_CVES_PER_SOFTWARE", "50")), 100)
         cves_raw = []
         try:
-            resp = requests.get(
-                f"{HEIMDALL_CVE_API}/cves/search",
+            resp = _cve_api_get(
+                "/cves/search",
                 params={"query": product, "type": "product", "limit": fetch_limit},
                 headers=api_headers,
                 timeout=10
@@ -1128,10 +1154,12 @@ def cve_quota():
     if not SERVER_CVE_API_KEY:
         return jsonify({"configured": False})
     try:
-        response = requests.get(f"{HEIMDALL_CVE_API}/account/quota",
+        response = _cve_api_get("/account/quota",
                                 headers={"x-api-key": SERVER_CVE_API_KEY}, timeout=10)
         if response.status_code != 200:
-            return jsonify({"configured": True, "available": False})
+            logger.warning("[CVE API] Vérification de configuration: HTTP %s", response.status_code)
+            return jsonify({"configured": True, "available": False,
+                            "message": "API inaccessible, clé invalide ou API CVE non mise à jour."})
         data = response.json()
         return jsonify({"configured": True, "available": True,
                         "daily_limit": data.get("daily_limit"),
@@ -1141,7 +1169,8 @@ def cve_quota():
                         "reset_date": data.get("reset_date")})
     except requests.RequestException as exc:
         logger.warning("[CVE API] Solde indisponible: %s", exc)
-        return jsonify({"configured": True, "available": False})
+        return jsonify({"configured": True, "available": False,
+                        "message": "Impossible de joindre l’API CVE."})
 
 @app.route('/api/cve-rescan', methods=['GET', 'POST'])
 @require_role("admin")

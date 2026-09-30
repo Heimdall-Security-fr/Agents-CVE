@@ -84,7 +84,7 @@ docker run -d --name heimdall_agent_server --network heimdall_agents \
   -e DASHBOARD_JWT_SECRET="<32+ caractères>" \
   -e DEFAULT_ADMIN_EMAIL="admin@votre-domaine.tld" \
   -e DEFAULT_ADMIN_PASSWORD="<12+ caractères>" \
-  -e HEIMDALL_CVE_API="https://cve.heimdall-security.com" \
+  -e HEIMDALL_CVE_API="https://cve.heimdall-security.com/api" \
   -e CVE_API_KEY="<votre clé API CVE>" \
   heimdallsecurity/agent-cve:latest
 ```
@@ -116,7 +116,7 @@ s'auto-mettent à jour sur la version exposée par le serveur.
 | `DEFAULT_ADMIN_EMAIL`    | `admin@heimdall.local`     | Compte admin créé au 1er démarrage           |
 | `DEFAULT_ADMIN_PASSWORD` | _(à définir)_              | Mot de passe admin — définissez-le dans votre `.env`/compose |
 | `HEIMDALL_FRONT_URL`     | `http://localhost:3000`    | URL publique du site CVE Heimdall            |
-| `HEIMDALL_CVE_API`       | `http://cve_api:5000`      | API CVE interrogée pour les corrélations (hors réseau Docker Heimdall : `https://cve.heimdall-security.com`) |
+| `HEIMDALL_CVE_API`       | `http://cve_api:5000`      | API CVE interrogée pour les corrélations (hors réseau Docker Heimdall : `https://cve.heimdall-security.com/api`) |
 | `CVE_API_KEY`            | _(vide)_                   | Clé API CVE nominative — **obligatoire** pour la corrélation de vulnérabilités (sans elle, aucun appel à l'API, 0 vulnérabilité détectée) ; chaque logiciel analysé consomme 1 crédit |
 | `SERVER_PUBLIC_HOST`     | `127.0.0.1`                | IP/domaine public de ce serveur              |
 
