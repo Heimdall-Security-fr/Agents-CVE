@@ -1154,13 +1154,18 @@ def agent_report():
         if log_tail is not None:
             update_fields["log_tail"] = log_tail
             update_fields["log_tail_received_at"] = datetime.utcnow()
+        retained_vuln_count = None
         if not vulns and not cve_complete:
             existing = mongo.db.agents.find_one({"hostname": hostname},
-                                                 {"vulnerabilities": 1, "vulnerable_count": 1})
+                                                 {"vulnerabilities": 1, "vulnerable_count": 1,
+                                                  "cve_count": 1, "critical_count": 1, "high_count": 1})
             if existing and existing.get("vulnerabilities"):
-                update_fields.pop("vulnerabilities", None)
-                update_fields.pop("vulnerable_count", None)
-                logger.info(f"[RAPPORT] {hostname}: corrélation vide, conservation des {existing['vulnerable_count']} vulns précédentes")
+                # Preserve the full previously-known CVE state when the new
+                # correlation is incomplete (quota exhaustion/API failure).
+                for key in ("vulnerabilities", "vulnerable_count", "cve_count", "critical_count", "high_count"):
+                    update_fields.pop(key, None)
+                retained_vuln_count = existing.get("cve_count", existing.get("vulnerable_count", 0))
+                logger.info("[RAPPORT] %s: correlation incomplete; retaining %s previous CVEs", hostname, retained_vuln_count)
 
         mongo.db.agents.update_one(
             {"hostname": hostname},
@@ -1169,7 +1174,9 @@ def agent_report():
         )
 
     report.pop("_id", None)
-    logger.info(f"[RAPPORT] {hostname}: {len(vulns)} vulns, {len(open_ports)} ports ouverts")
+    shown_count = retained_vuln_count if retained_vuln_count is not None else cves_total
+    suffix = " (previous result retained)" if retained_vuln_count is not None else ""
+    logger.info(f"[RAPPORT] {hostname}: {shown_count} CVEs displayed, {len(open_ports)} open ports{suffix}")
     return jsonify(report), 200
 
 @app.route('/api/agents/<hostname>/heartbeat', methods=['POST'])
@@ -2503,7 +2510,8 @@ def _call_ai(messages: list) -> str:
 @app.route('/api/ai/status', methods=['GET'])
 @require_role("admin", "deployment", "inspection_logs", "codir")
 def ai_status():
-    return jsonify({"configured": bool(AI_PROVIDER and AI_MODEL), "provider": AI_PROVIDER, "model": AI_MODEL})
+    return jsonify({"configured": bool(AI_PROVIDER and AI_MODEL), "provider": AI_PROVIDER,
+                    "model": AI_MODEL, "base_url": AI_BASE_URL})
 
 @app.route('/api/ai/chat', methods=['POST'])
 @require_role("admin", "deployment", "inspection_logs", "codir")
@@ -2528,9 +2536,11 @@ def ai_chat():
         return jsonify({"reply": reply})
     except (ValueError, RuntimeError) as exc:
         return jsonify({"error": str(exc)}), 400
-    except requests.RequestException:
-        logger.exception("[AI] Erreur de connexion au fournisseur")
-        return jsonify({"error": "Connexion au fournisseur IA impossible"}), 502
+    except requests.RequestException as exc:
+        # Headers are deliberately omitted: they can contain the provider key.
+        logger.warning("[AI] Provider unreachable (%s): %s", type(exc).__name__, str(exc))
+        target = AI_BASE_URL or ("http://127.0.0.1:11434" if AI_PROVIDER == "ollama" else "https://api.openai.com/v1")
+        return jsonify({"error": f"Fournisseur IA inaccessible ({type(exc).__name__}). Vérifiez AI_BASE_URL et la connectivité du conteneur vers {target}."}), 502
 
 # ─── Mises à jour logicielles ────────────────────────────────────────────────
 STALE_CACHE_HOURS = 24 * 7   # cache apt > 7 jours : la liste peut être périmée

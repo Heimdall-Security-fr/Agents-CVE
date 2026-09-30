@@ -787,7 +787,7 @@ async function loadAi() {
     var cfg = await api('/api/ai/status');
     _aiConfigured = !!cfg.configured;
     status.textContent = cfg.configured
-      ? 'Connecté à '+(cfg.provider || 'IA')+' · modèle '+(cfg.model || '—')+' · le contexte est généré à chaque demande'
+      ? 'Connecté à '+(cfg.provider || 'IA')+' · modèle '+(cfg.model || '—')+' · '+(cfg.base_url || 'URL par défaut')+' · le contexte est généré à chaque demande'
       : 'Non configuré — définissez AI_PROVIDER et AI_MODEL dans l’environnement du serveur.';
     document.getElementById('ai-send').disabled = !_aiConfigured;
   } catch (err) { status.textContent = 'Statut IA indisponible : ' + err.message; }
