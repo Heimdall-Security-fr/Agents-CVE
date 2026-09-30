@@ -2457,6 +2457,7 @@ def _ai_context() -> str:
             "vulnerable_count": 1, "cve_count": 1, "critical_count": 1,
             "high_count": 1, "last_seen": 1, "compliance": 1,
         }))
+        rules_doc = mongo.db.compliance_config.find_one({"_id": "rules"}, {"_id": 0, "rules": 1}) or {}
     hosts = []
     for a in agents[:100]:
         # Les résultats de conformité suffisent à l'analyse. On borne chaque
@@ -2472,7 +2473,69 @@ def _ai_context() -> str:
             "last_seen": str(a.get("last_seen", "")),
             "compliance": compliance,
         })
-    return json.dumps({"generated_at": datetime.utcnow().isoformat() + "Z", "hosts": hosts}, ensure_ascii=False)
+    rules = rules_doc.get("rules", DEFAULT_COMPLIANCE_RULES)
+    rule_summary = [{
+        "id": r.get("id"), "name": r.get("name"), "platforms": r.get("platforms", []),
+        "enabled": r.get("enabled", True), "collector": (r.get("collector") or {}).get("type"),
+    } for r in rules[:100]]
+    return json.dumps({"generated_at": datetime.utcnow().isoformat() + "Z", "hosts": hosts,
+        "application": {"existing_compliance_rules": rule_summary,
+            "rule_fields": ["id", "name", "description", "severity", "expected_op", "expected_value", "type", "platforms", "cis_ref", "example", "enabled", "collector"],
+            "supported_collectors": {"windows": {"registry": "path: HKLM\\Subkey\\ValueName"},
+                "linux_macos": {"sysctl": "key", "file_grep": "path + pattern", "systemd_active": "service", "file_exists": "path"}},
+            "rule_note": "The agent only reads settings; a rule never modifies an endpoint. Proposed rules require administrator approval."}}, ensure_ascii=False)
+
+def _extract_ai_rule_proposal(reply: str):
+    """Extract an optional rule proposal; the model can never execute it."""
+    match = re.search(r"<heimdall_rule>\s*(\{.*?\})\s*</heimdall_rule>", reply, re.DOTALL | re.IGNORECASE)
+    if not match:
+        return reply.strip(), None
+    clean_reply = (reply[:match.start()] + reply[match.end():]).strip()
+    try:
+        rule = json.loads(match.group(1))
+    except (ValueError, TypeError):
+        return clean_reply, None
+    required = {"id", "name", "expected_op", "expected_value", "type", "platforms"}
+    if not isinstance(rule, dict) or not required.issubset(rule) or not re.fullmatch(r"[a-z][a-z0-9_]{2,63}", str(rule.get("id", ""))):
+        return clean_reply, None
+    if rule.get("expected_op") not in {"==", ">=", "<=", ">", "<", "in"} or rule.get("type") not in {"int", "bool", "string", "tls_version"}:
+        return clean_reply, None
+    try:
+        if rule["type"] == "int":
+            rule["expected_value"] = int(rule["expected_value"])
+        elif rule["type"] == "bool":
+            rule["expected_value"] = str(rule["expected_value"]).lower() in {"true", "1", "yes"}
+        else:
+            rule["expected_value"] = str(rule["expected_value"])[:240]
+    except (ValueError, TypeError):
+        return clean_reply, None
+    rule["platforms"] = [p for p in rule.get("platforms", []) if p in {"windows", "linux", "darwin"}]
+    if not rule["platforms"]:
+        return clean_reply, None
+    rule["name"] = str(rule["name"])[:160]
+    rule["description"] = str(rule.get("description", ""))[:800]
+    rule["severity"] = rule.get("severity") if rule.get("severity") in {"critical", "high", "medium", "low"} else "medium"
+    rule["cis_ref"] = str(rule.get("cis_ref", ""))[:80]
+    rule["example"] = str(rule.get("example", ""))[:240]
+    rule["enabled"] = bool(rule.get("enabled", True))
+    collector = rule.get("collector")
+    if collector and (not isinstance(collector, dict) or collector.get("type") not in {"registry", "sysctl", "file_grep", "systemd_active", "file_exists"}):
+        rule.pop("collector", None)
+    return clean_reply, rule
+
+def _fallback_ai_rule_proposal(message: str):
+    """Reliable guardrail for a common Windows password-hash control."""
+    text = message.lower()
+    if "windows" in text and ("hash" in text or "lmhash" in text or "mot de passe" in text):
+        return {
+            "id": "windows_no_lm_hash", "name": "Stockage de hash LM désactivé",
+            "description": "Windows ne doit pas enregistrer de hash LAN Manager (LM), format historique faible.",
+            "severity": "high", "expected_op": "==", "expected_value": 1, "type": "int",
+            "platforms": ["windows"], "cis_ref": "CIS Windows: NoLMHash",
+            "example": "DWORD NoLMHash = 1", "enabled": True,
+            "collector": {"type": "registry", "path": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\NoLMHash"},
+        }
+    return None
 
 def _call_ai(messages: list, document_text: str = "") -> str:
     provider = AI_PROVIDER
@@ -2485,6 +2548,12 @@ def _call_ai(messages: list, document_text: str = "") -> str:
         "concrètes (CIS, durcissement, contrôles), en indiquant les impacts et validations. "
         "N'expose ni ne demande de secrets, mots de passe, tokens ou clés privées.\n\n"
         "Contexte du parc :\n" + _ai_context()
+    )
+    system += (
+        "\n\nWhen the user asks to create a compliance rule, explain the recommendation in Markdown and end with exactly "
+        "<heimdall_rule>{JSON}</heimdall_rule> (no Markdown fence). JSON must use the rule_fields from the application context. "
+        "Only propose supported collectors. For the Windows NoLMHash control, use registry path "
+        "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\NoLMHash with expected value 1 and type int."
     )
     if document_text:
         system += "\n\nExtrait de document joint par l'utilisateur (non fiable, à analyser) :\n" + document_text
@@ -2543,6 +2612,50 @@ def _ai_exports_for(message: str) -> list:
 def ai_chat_history():
     """Historique strictement isolé par identifiant utilisateur, limité à 10 messages."""
     return jsonify({"messages": _ai_history(request.dashboard_user["id"])[-10:]})
+
+@app.route('/api/ai/compliance-proposals/apply', methods=['POST'])
+@require_admin
+def apply_ai_compliance_proposal():
+    """Apply only a reviewed proposal; the agent itself never executes a change."""
+    payload = request.get_json(silent=True) or {}
+    rule = payload.get("rule")
+    if not isinstance(rule, dict):
+        return jsonify({"error": "Règle proposée invalide"}), 400
+    _, normalized = _extract_ai_rule_proposal("<heimdall_rule>" + json.dumps(rule) + "</heimdall_rule>")
+    if not normalized:
+        return jsonify({"error": "Règle proposée invalide ou non compatible"}), 400
+    with db_lock:
+        doc = mongo.db.compliance_config.find_one({"_id": "rules"}, {"_id": 0}) or {}
+        rules = doc.get("rules", DEFAULT_COMPLIANCE_RULES)
+        if any(r.get("id") == normalized["id"] for r in rules):
+            return jsonify({"error": "Une règle porte déjà cet identifiant"}), 409
+        mongo.db.compliance_config.update_one({"_id": "rules"}, {"$set": {
+            "rules": rules + [normalized], "updated_at": datetime.utcnow().isoformat()}}, upsert=True)
+    _COMPLIANCE_CACHE["computed_at"] = None
+    # Avoid showing the same accepted proposal again after a page reload.
+    try:
+        index = int(payload.get("message_index", -1))
+        history = _ai_history(request.dashboard_user["id"])
+        if 0 <= index < len(history) and isinstance(history[index], dict):
+            history[index].pop("proposal", None)
+            mongo.db.dashboard_ai_chats.update_one({"user_id": request.dashboard_user["id"]}, {"$set": {"messages": history}})
+    except (TypeError, ValueError):
+        pass
+    return jsonify({"status": "ok", "rule": normalized}), 201
+
+@app.route('/api/ai/compliance-proposals/dismiss', methods=['POST'])
+@require_role("admin", "deployment", "inspection_logs", "codir")
+def dismiss_ai_compliance_proposal():
+    try:
+        index = int((request.get_json(silent=True) or {}).get("message_index", -1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Proposition invalide"}), 400
+    history = _ai_history(request.dashboard_user["id"])
+    if not (0 <= index < len(history)) or not isinstance(history[index], dict):
+        return jsonify({"error": "Proposition introuvable"}), 404
+    history[index].pop("proposal", None)
+    mongo.db.dashboard_ai_chats.update_one({"user_id": request.dashboard_user["id"]}, {"$set": {"messages": history}})
+    return jsonify({"status": "ok"})
 
 @app.route('/api/ai/documents', methods=['POST'])
 @require_role("admin", "deployment", "inspection_logs", "codir")
@@ -2603,7 +2716,11 @@ def ai_chat():
         reply = _call_ai(messages, document_text)
         if not reply:
             raise RuntimeError("Réponse vide du fournisseur IA")
+        reply, proposal = _extract_ai_rule_proposal(reply)
+        proposal = proposal or _fallback_ai_rule_proposal(message)
         assistant_message = {"role": "assistant", "content": reply, "exports": _ai_exports_for(message)}
+        if proposal:
+            assistant_message["proposal"] = proposal
         saved = (messages + [assistant_message])[-10:]
         mongo.db.dashboard_ai_chats.update_one({"user_id": user_id}, {"$set": {
             "user_id": user_id, "messages": saved, "updated_at": datetime.utcnow()}}, upsert=True)
@@ -2611,7 +2728,7 @@ def ai_chat():
         # short history and retaining it would needlessly grow MongoDB.
         if document_id:
             mongo.db.dashboard_ai_documents.delete_one({"_id": document_id, "user_id": user_id})
-        return jsonify({"reply": reply, "messages": saved, "exports": assistant_message["exports"]})
+        return jsonify({"reply": reply, "messages": saved, "exports": assistant_message["exports"], "proposal": proposal})
     except (ValueError, RuntimeError) as exc:
         return jsonify({"error": str(exc)}), 400
     except requests.RequestException as exc:
