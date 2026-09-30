@@ -224,13 +224,19 @@
     .btn-icon.del:hover { background:rgba(239,68,68,.1); border-color:rgba(239,68,68,.3); color:#f87171; }
     .compliance-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; }
     .compliance-host { background:var(--surface); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); border:1px solid var(--border); border-radius:12px; padding:16px; }
-    .ai-chat { max-width:980px; margin:0 auto; display:flex; flex-direction:column; height:min(680px, calc(100vh - 210px)); min-height:420px; background:var(--surface); border:1px solid var(--border); border-radius:14px; overflow:hidden; }
-    .ai-messages { flex:1; overflow:auto; padding:20px; display:flex; flex-direction:column; gap:12px; }
-    .ai-message { max-width:min(780px,88%); padding:12px 14px; border-radius:12px; white-space:pre-wrap; line-height:1.55; font-size:13px; }
-    .ai-message.user { align-self:flex-end; background:rgba(var(--accent-rgb),.18); border:1px solid rgba(var(--accent-rgb),.35); }
-    .ai-message.assistant { align-self:flex-start; background:rgba(255,255,255,.045); border:1px solid var(--border); }
-    .ai-composer { display:flex; gap:10px; padding:14px; border-top:1px solid var(--border); }
-    .ai-composer textarea { min-height:48px; max-height:130px; resize:vertical; flex:1; margin:0; }
+    .ai-chat { max-width:1040px; margin:0 auto; display:flex; flex-direction:column; height:min(720px,calc(100vh - 180px)); min-height:460px; background:linear-gradient(145deg,rgba(21,30,56,.96),rgba(12,19,38,.96)); border:1px solid var(--border); border-radius:16px; overflow:hidden; box-shadow:0 18px 50px rgba(0,0,0,.22); }
+    .ai-messages { flex:1; overflow:auto; padding:24px clamp(15px,3vw,34px); display:flex; flex-direction:column; gap:14px; }
+    .ai-message { max-width:min(800px,90%); padding:13px 15px; border-radius:14px; white-space:pre-wrap; overflow-wrap:anywhere; line-height:1.6; font-size:13px; }
+    .ai-message.user { align-self:flex-end; background:linear-gradient(135deg,rgba(var(--accent-rgb),.28),rgba(var(--accent-rgb),.12)); border:1px solid rgba(var(--accent-rgb),.42); border-bottom-right-radius:4px; }
+    .ai-message.assistant { align-self:flex-start; background:rgba(255,255,255,.055); border:1px solid var(--border); border-bottom-left-radius:4px; }
+    .ai-message-label { display:block; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-size:9px; font-weight:700; margin-bottom:5px; }
+    .ai-actions { display:flex; flex-wrap:wrap; gap:7px; margin-top:12px; padding-top:10px; border-top:1px solid rgba(255,255,255,.09); }
+    .ai-composer { display:grid; grid-template-columns:auto 1fr auto; gap:10px; align-items:end; padding:14px clamp(14px,2.5vw,24px); border-top:1px solid var(--border); background:rgba(4,9,22,.25); }
+    .ai-composer textarea { min-height:52px; max-height:130px; resize:vertical; margin:0; }
+    .ai-upload { display:flex; flex-direction:column; align-items:center; gap:5px; font-size:10px; color:var(--muted); cursor:pointer; }
+    .ai-upload input { display:none; }
+    .ai-file { grid-column:2/-1; font-size:11px; color:var(--muted); min-height:0; }
+    @media(max-width:640px) { .ai-chat { min-height:500px; height:calc(100vh - 150px); border-radius:10px; } .ai-composer { grid-template-columns:auto 1fr; } .ai-composer > .btn { grid-column:2; } .ai-file { grid-column:1/-1; } .ai-message { max-width:96%; } }
     .check-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:10px; }
     .check-item { display:flex; align-items:flex-start; gap:6px; padding:7px 10px; border-radius:6px; border:1px solid transparent; }
     .check-pass    { background:rgba(74,222,128,.05);   border-color:rgba(74,222,128,.15); }
@@ -462,7 +468,7 @@
       <div class="header-row"><div><h1>Assistant IA</h1><p id="ai-status">Analyse du parc et aide aux règles de conformité</p></div></div>
       <div class="ai-chat">
         <div class="ai-messages" id="ai-messages"></div>
-        <div class="ai-composer"><textarea id="ai-input" placeholder="Ex. Quels hôtes dois-je traiter en priorité et quelles règles CIS appliquer ?" aria-label="Message à l'assistant IA"></textarea><button class="btn btn-primary" id="ai-send" onclick="sendAiMessage()">Envoyer</button></div>
+        <div class="ai-composer"><label class="ai-upload btn btn-ghost btn-sm" title="Joindre un PDF textuel, maximum 3 MiB">📎<input type="file" id="ai-pdf" accept="application/pdf,.pdf" onchange="uploadAiPdf(this)"><span>PDF</span></label><textarea id="ai-input" placeholder="Ex. Quels hôtes dois-je traiter en priorité et quelles règles CIS appliquer ?" aria-label="Message à l'assistant IA"></textarea><button class="btn btn-primary" id="ai-send" onclick="sendAiMessage()">Envoyer</button><div class="ai-file" id="ai-file-status">PDF textuel facultatif · 3 MiB maximum</div></div>
       </div>
     </div>
 
@@ -769,28 +775,44 @@ function navigate(page) {
 document.querySelectorAll('.nav-item[data-page]').forEach(function(el){ el.addEventListener('click', function(){ navigate(el.dataset.page); }); });
 
 /* ── Assistant IA ── */
-var _aiMessages = [], _aiConfigured = false;
+var _aiMessages = [], _aiConfigured = false, _aiDocument = null;
 function renderAiMessages() {
   var box = document.getElementById('ai-messages'); if (!box) return;
   box.innerHTML = _aiMessages.map(function(m) {
-    return '<div class="ai-message '+(m.role === 'user' ? 'user' : 'assistant')+'">'+esc(m.content)+'</div>';
+    var actions = (m.exports || []).map(function(action) {
+      return '<button class="btn btn-ghost btn-sm" onclick="downloadExport(\''+esc(action.path)+ '\',\''+esc(action.filename)+'\')">⇩ '+esc(action.label)+'</button>';
+    }).join('');
+    return '<div class="ai-message '+(m.role === 'user' ? 'user' : 'assistant')+'"><span class="ai-message-label">'+(m.role === 'user' ? 'Vous' : 'Heimdall IA')+'</span>'+esc(m.content)+(actions ? '<div class="ai-actions">'+actions+'</div>' : '')+'</div>';
   }).join('');
   box.scrollTop = box.scrollHeight;
 }
 async function loadAi() {
   var status = document.getElementById('ai-status');
-  if (!_aiMessages.length) {
-    _aiMessages.push({role:'assistant', content:'Je peux analyser le parc visible par Heimdall, aider à prioriser les risques et proposer des règles de conformité. Les actions restent à valider par vous.'});
-    renderAiMessages();
-  }
   try {
-    var cfg = await api('/api/ai/status');
+    var results = await Promise.all([api('/api/ai/status'), api('/api/ai/chat')]);
+    var cfg = results[0], history = results[1];
+    _aiMessages = history.messages || [];
+    if (!_aiMessages.length) _aiMessages = [{role:'assistant', content:'Je peux analyser le parc visible par Heimdall, aider à prioriser les risques et proposer des règles de conformité. Les actions restent à valider par vous.'}];
+    renderAiMessages();
     _aiConfigured = !!cfg.configured;
     status.textContent = cfg.configured
       ? 'Connecté à '+(cfg.provider || 'IA')+' · modèle '+(cfg.model || '—')+' · '+(cfg.base_url || 'URL par défaut')+' · le contexte est généré à chaque demande'
       : 'Non configuré — définissez AI_PROVIDER et AI_MODEL dans l’environnement du serveur.';
     document.getElementById('ai-send').disabled = !_aiConfigured;
   } catch (err) { status.textContent = 'Statut IA indisponible : ' + err.message; }
+}
+async function uploadAiPdf(input) {
+  var file = input.files && input.files[0]; if (!file) return;
+  if (file.size > 3 * 1024 * 1024) { toast('PDF limité à 3 MiB', 'err'); input.value = ''; return; }
+  var status = document.getElementById('ai-file-status'); status.textContent = 'Lecture de '+file.name+'…';
+  try {
+    var form = new FormData(); form.append('file', file);
+    var res = await fetch('/api/ai/documents', {method:'POST', headers:tok() ? {Authorization:'Bearer '+tok()} : {}, body:form});
+    if (res.status === 401) { logout(); throw new Error('Session expirée'); }
+    var data = await res.json().catch(function(){return {};}); if (!res.ok) throw new Error(data.error || 'Import PDF impossible');
+    _aiDocument = data; status.textContent = '📎 '+data.filename+' · '+data.characters.toLocaleString('fr-FR')+' caractères extraits';
+  } catch (err) { _aiDocument = null; status.textContent = 'PDF textuel facultatif · 3 MiB maximum'; toast(err.message, 'err'); }
+  input.value = '';
 }
 async function sendAiMessage() {
   var input = document.getElementById('ai-input');
@@ -800,8 +822,9 @@ async function sendAiMessage() {
   _aiMessages.push({role:'user', content:content}); input.value = ''; renderAiMessages();
   btn.disabled = true; btn.textContent = 'Analyse…';
   try {
-    var result = await api('/api/ai/chat', {method:'POST', body:JSON.stringify({messages:_aiMessages})});
-    _aiMessages.push({role:'assistant', content:result.reply}); renderAiMessages();
+    var result = await api('/api/ai/chat', {method:'POST', body:JSON.stringify({message:content, document_id:_aiDocument ? _aiDocument.id : ''})});
+    _aiMessages = result.messages || _aiMessages.concat([{role:'assistant', content:result.reply, exports:result.exports || []}]);
+    _aiDocument = null; document.getElementById('ai-file-status').textContent = 'PDF textuel facultatif · 3 MiB maximum'; renderAiMessages();
   } catch (err) {
     _aiMessages.push({role:'assistant', content:'Erreur : '+err.message}); renderAiMessages();
   } finally { btn.disabled = false; btn.textContent = 'Envoyer'; input.focus(); }

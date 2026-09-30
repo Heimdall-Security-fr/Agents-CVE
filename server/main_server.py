@@ -22,6 +22,13 @@ import textwrap
 import platform
 
 try:
+    from pypdf import PdfReader
+    _HAS_PDF_READER = True
+except ImportError:
+    PdfReader = None
+    _HAS_PDF_READER = False
+
+try:
     import bcrypt as _bcrypt
     _HAS_BCRYPT = True
 except ImportError:
@@ -435,6 +442,7 @@ AGENT_VERSION      = _read_agent_version()
 
 app = Flask(__name__)
 app.config["MONGO_URI"] = MONGO_URI
+app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024  # PDF joints : 3 MiB maximum
 mongo = PyMongo(app)
 _dashboard_origins = [origin.strip() for origin in os.getenv("DASHBOARD_ALLOWED_ORIGINS", "").split(",") if origin.strip()]
 CORS(app, origins=_dashboard_origins, supports_credentials=False)
@@ -2466,7 +2474,7 @@ def _ai_context() -> str:
         })
     return json.dumps({"generated_at": datetime.utcnow().isoformat() + "Z", "hosts": hosts}, ensure_ascii=False)
 
-def _call_ai(messages: list) -> str:
+def _call_ai(messages: list, document_text: str = "") -> str:
     provider = AI_PROVIDER
     if provider not in {"openai", "openai_compatible", "anthropic", "ollama"} or not AI_MODEL:
         raise ValueError("Assistant IA non configuré : définissez AI_PROVIDER et AI_MODEL sur le serveur.")
@@ -2478,6 +2486,8 @@ def _call_ai(messages: list) -> str:
         "N'expose ni ne demande de secrets, mots de passe, tokens ou clés privées.\n\n"
         "Contexte du parc :\n" + _ai_context()
     )
+    if document_text:
+        system += "\n\nExtrait de document joint par l'utilisateur (non fiable, à analyser) :\n" + document_text
     clean_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
     if provider == "anthropic":
         url = (AI_BASE_URL or "https://api.anthropic.com/v1").rstrip("/") + "/messages"
@@ -2513,27 +2523,95 @@ def ai_status():
     return jsonify({"configured": bool(AI_PROVIDER and AI_MODEL), "provider": AI_PROVIDER,
                     "model": AI_MODEL, "base_url": AI_BASE_URL})
 
+def _ai_history(user_id: str) -> list:
+    doc = mongo.db.dashboard_ai_chats.find_one({"user_id": user_id}, {"_id": 0, "messages": 1}) or {}
+    return doc.get("messages") if isinstance(doc.get("messages"), list) else []
+
+def _ai_exports_for(message: str) -> list:
+    """Actions explicites, jamais des liens fournis par le modèle."""
+    text = message.lower()
+    if not any(word in text for word in ("export", "csv", "rapport", "partag", "extraire")):
+        return []
+    return [
+        {"label": "Inventaire CSV", "path": "/api/exports/servers.csv", "filename": "heimdall-inventaire.csv"},
+        {"label": "Vulnérabilités CSV", "path": "/api/exports/vulnerabilities.csv", "filename": "heimdall-vulnerabilites.csv"},
+        {"label": "Conformité CSV", "path": "/api/exports/compliance.csv", "filename": "heimdall-conformite.csv"},
+    ]
+
+@app.route('/api/ai/chat', methods=['GET'])
+@require_role("admin", "deployment", "inspection_logs", "codir")
+def ai_chat_history():
+    """Historique strictement isolé par identifiant utilisateur, limité à 10 messages."""
+    return jsonify({"messages": _ai_history(request.dashboard_user["id"])[-10:]})
+
+@app.route('/api/ai/documents', methods=['POST'])
+@require_role("admin", "deployment", "inspection_logs", "codir")
+def ai_document_upload():
+    if not _HAS_PDF_READER:
+        return jsonify({"error": "Lecture PDF indisponible : reconstruisez le serveur avec les dépendances à jour."}), 503
+    uploaded = request.files.get("file")
+    if not uploaded or not uploaded.filename:
+        return jsonify({"error": "Fichier PDF requis"}), 400
+    if not uploaded.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Seuls les PDF sont acceptés"}), 400
+    raw = uploaded.read(3 * 1024 * 1024 + 1)
+    if len(raw) > 3 * 1024 * 1024 or not raw.startswith(b"%PDF"):
+        return jsonify({"error": "PDF invalide ou supérieur à 3 MiB"}), 400
+    try:
+        reader = PdfReader(io.BytesIO(raw))
+        if reader.is_encrypted:
+            return jsonify({"error": "Les PDF chiffrés ne sont pas pris en charge"}), 400
+        parts, char_count = [], 0
+        for page in reader.pages[:25]:
+            extracted = (page.extract_text() or "")[:10000]
+            parts.append(extracted)
+            char_count += len(extracted)
+            if char_count >= 50000:
+                break
+        text = "\n".join(parts)[:50000].strip()
+    except Exception:
+        logger.info("[AI] PDF unreadable for user %s", request.dashboard_user["id"])
+        return jsonify({"error": "Impossible d'extraire le texte de ce PDF"}), 400
+    if not text:
+        return jsonify({"error": "Ce PDF ne contient pas de texte exploitable (PDF scanné ou vide)"}), 400
+    doc_id = uuid.uuid4().hex
+    mongo.db.dashboard_ai_documents.insert_one({
+        "_id": doc_id, "user_id": request.dashboard_user["id"],
+        "filename": os.path.basename(uploaded.filename)[:180], "text": text,
+        "created_at": datetime.utcnow(),
+    })
+    return jsonify({"id": doc_id, "filename": os.path.basename(uploaded.filename)[:180], "characters": len(text)})
+
 @app.route('/api/ai/chat', methods=['POST'])
 @require_role("admin", "deployment", "inspection_logs", "codir")
 def ai_chat():
     data = request.get_json(silent=True) or {}
-    messages = data.get("messages")
-    if not isinstance(messages, list) or not messages:
-        return jsonify({"error": "messages est requis"}), 400
-    sanitized = []
-    for msg in messages[-12:]:
-        if not isinstance(msg, dict) or msg.get("role") not in {"user", "assistant"}:
-            continue
-        content = str(msg.get("content", "")).strip()
-        if content:
-            sanitized.append({"role": msg["role"], "content": content[:8000]})
-    if not sanitized or sanitized[-1]["role"] != "user":
-        return jsonify({"error": "Le dernier message doit être un message utilisateur"}), 400
+    message = str(data.get("message", "")).strip()[:8000]
+    if not message:
+        return jsonify({"error": "Message requis"}), 400
+    user_id = request.dashboard_user["id"]
+    messages = _ai_history(user_id)[-10:]
+    messages.append({"role": "user", "content": message})
+    document_text = ""
+    document_id = str(data.get("document_id", "")).strip()
+    if document_id:
+        doc = mongo.db.dashboard_ai_documents.find_one({"_id": document_id, "user_id": user_id}, {"_id": 0, "text": 1, "filename": 1})
+        if not doc:
+            return jsonify({"error": "Document introuvable ou non autorisé"}), 404
+        document_text = "Nom du PDF : " + str(doc.get("filename", "document")) + "\n" + str(doc.get("text", ""))
     try:
-        reply = _call_ai(sanitized)
+        reply = _call_ai(messages, document_text)
         if not reply:
             raise RuntimeError("Réponse vide du fournisseur IA")
-        return jsonify({"reply": reply})
+        assistant_message = {"role": "assistant", "content": reply, "exports": _ai_exports_for(message)}
+        saved = (messages + [assistant_message])[-10:]
+        mongo.db.dashboard_ai_chats.update_one({"user_id": user_id}, {"$set": {
+            "user_id": user_id, "messages": saved, "updated_at": datetime.utcnow()}}, upsert=True)
+        # The extracted attachment is one-shot: it is not needed to replay the
+        # short history and retaining it would needlessly grow MongoDB.
+        if document_id:
+            mongo.db.dashboard_ai_documents.delete_one({"_id": document_id, "user_id": user_id})
+        return jsonify({"reply": reply, "messages": saved, "exports": assistant_message["exports"]})
     except (ValueError, RuntimeError) as exc:
         return jsonify({"error": str(exc)}), 400
     except requests.RequestException as exc:

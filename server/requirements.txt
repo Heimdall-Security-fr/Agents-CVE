@@ -6,3 +6,4 @@ requests
 packaging
 PyJWT>=2.8.0
 bcrypt>=4.0.0
+pypdf>=5.0.0
