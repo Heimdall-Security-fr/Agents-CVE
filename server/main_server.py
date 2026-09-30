@@ -1027,6 +1027,8 @@ def agent_report():
     os_build      = data.get("os_build", "")
     compliance    = data.get("compliance", {})          # NEW: agent-sent compliance data
     ip_addresses  = data.get("ip_addresses", [])        # NEW: agent's own IPs
+    logged_users  = [u for u in (data.get("logged_users") or [])[:100]
+                     if isinstance(u, dict) and str(u.get("username", "")).strip()]
     agent_version = data.get("agent_version", "")        # NEW: version reportée
     update_check  = _sanitize_update_check(data.get("update_check"))
     log_tail      = _sanitize_log_tail(data.get("log_tail"))
@@ -1096,6 +1098,7 @@ def agent_report():
         "software_count":   len(software_list),
         "software":         software_list,
         "ip_addresses":     display_ips,
+        "logged_users":     logged_users,
         "compliance":       compliance,
         "inventory_changes": inventory_changes,
     }
@@ -1224,10 +1227,12 @@ def cve_quota():
         data = response.json()
         return jsonify({"configured": True, "available": True,
                         "daily_limit": data.get("daily_limit"),
+                        "plan": data.get("plan"), "plan_label": data.get("plan_label"),
                         "requests_used": data.get("requests_used", 0),
                         "daily_remaining": data.get("daily_remaining"),
                         "credits": data.get("credits", 0),
-                        "reset_date": data.get("reset_date")})
+                        "reset_date": data.get("reset_date"),
+                        "usage_history": data.get("usage_history", [])})
     except requests.RequestException as exc:
         logger.warning("[CVE API] Solde indisponible: %s", exc)
         return jsonify({"configured": True, "available": False,
@@ -2154,8 +2159,10 @@ def list_servers():
                     if peer != srv["hostname"] and key not in disabled_links:
                         peers.add(peer)
         srv["subnet_peers"] = sorted(peers)
-        # Primary subnet for display
-        srv["subnet"] = next((_subnet_24(ip) for ip in ips if _subnet_24(ip)), None)
+        # Conserver toutes les interfaces : un hôte multi-homé doit apparaître
+        # dans chacun de ses réseaux, pas uniquement dans le premier trouvé.
+        srv["subnets"] = sorted({_subnet_24(ip) for ip in ips if _subnet_24(ip)})
+        srv["subnet"] = srv["subnets"][0] if srv["subnets"] else None
 
     return jsonify({"servers": servers, "subnet_map": subnet_map}), 200
 

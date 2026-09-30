@@ -320,6 +320,25 @@ def get_local_ips() -> list:
             pass
     return sorted(ips)
 
+def collect_logged_users() -> list[dict]:
+    """Comptes observés localement (sans collecter de secrets ni d'historique sensible)."""
+    users = set()
+    system = platform.system()
+    try:
+        if system in ("Linux", "Darwin"):
+            r = subprocess.run(["last", "-w", "-n", "50"], capture_output=True, text=True, timeout=8)
+            for line in r.stdout.splitlines():
+                name = line.split(maxsplit=1)[0] if line.strip() else ""
+                if name and name not in ("reboot", "wtmp"):
+                    users.add(name)
+    except Exception:
+        pass
+    try:
+        users.add(os.getlogin())
+    except Exception:
+        pass
+    return [{"username": u} for u in sorted(users)[:100]]
+
 # ─── Collecte de la conformité (Linux / macOS) ───────────────────────────────
 def collect_compliance() -> dict:
     data = {}
@@ -790,6 +809,7 @@ def _build_payload(config, software_list, open_ports) -> dict:
         "compliance":    compliance,
         "update_check":  update_check,
         "ip_addresses":  get_local_ips(),
+        "logged_users":  collect_logged_users(),
         "log_tail":      read_log_tail(80),
     }
 

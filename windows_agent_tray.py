@@ -531,6 +531,35 @@ def _get_local_ips() -> list:
 
     return sorted(ips)
 
+def _collect_logged_users() -> list:
+    """Profils Windows connus et sessions ouvertes, sans données d'identification."""
+    users = set()
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                             r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList")
+        for i in range(winreg.QueryInfoKey(key)[0]):
+            sid = winreg.EnumKey(key, i)
+            try:
+                with winreg.OpenKey(key, sid) as profile:
+                    path, _ = winreg.QueryValueEx(profile, "ProfileImagePath")
+                    name = os.path.basename(os.path.expandvars(path))
+                    if name and name.lower() not in ("default", "public", "all users"):
+                        users.add(name)
+            except OSError:
+                pass
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["query", "user"], capture_output=True, text=True, timeout=5,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        for line in r.stdout.splitlines()[1:]:
+            name = line.lstrip("> ").split(maxsplit=1)[0] if line.strip() else ""
+            if name: users.add(name)
+    except Exception:
+        pass
+    return [{"username": u} for u in sorted(users)[:100]]
+
 # ─── Politique de comptes via netapi32 (équivalent de `net accounts` / `net user`) ──
 # Appels API directs : aucune console, et indépendant de la langue de Windows.
 _TIMEQ_FOREVER = 0xFFFFFFFF
@@ -914,6 +943,7 @@ def send_report(max_attempts: int = 6):
     open_ports = scan_ports() if do_ports else []
     compliance = _collect_compliance()
     ip_addresses = _get_local_ips()
+    logged_users = _collect_logged_users()
     update_check = collect_outdated_software()
     if update_check.get("ok"):
         compliance.setdefault("pending_updates", update_check["count"])
@@ -930,6 +960,7 @@ def send_report(max_attempts: int = 6):
         "compliance":    compliance,
         "update_check":  update_check,
         "ip_addresses":  ip_addresses,
+        "logged_users":  logged_users,
         "log_tail":      read_log_tail(80),
     }
 

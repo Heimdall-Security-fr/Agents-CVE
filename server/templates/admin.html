@@ -153,6 +153,12 @@
     .modal::before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg, var(--accent), var(--accent-2)); }
     .modal h2 { font-size:1.1rem; margin-bottom:20px; }
     .modal-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:24px; }
+    #inventory-modal .modal { width:min(1180px,96vw); max-width:none; height:min(820px,90vh); display:flex; flex-direction:column; }
+    #inventory-content { flex:1; min-height:0; overflow:auto; }
+    .inventory-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-bottom:18px; }
+    .inventory-section { border:1px solid var(--border); border-radius:10px; padding:14px; background:rgba(16,26,55,.45); }
+    .inventory-section h3 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin-bottom:10px; }
+    @media (max-width:760px) { .inventory-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } #inventory-modal .modal { width:96vw; height:92vh; } }
 
     /* Alerts */
     .alert { padding:10px 14px; border-radius:7px; font-size:13px; margin-bottom:16px; }
@@ -384,6 +390,7 @@
         <button class="btn btn-ghost btn-sm" onclick="loadDashboard()">↻ Actualiser</button>
       </div>
       <div class="cards" id="stat-cards"><div class="spinner"></div></div>
+      <div class="chart-wrap mb-6" id="cve-usage-wrap" style="display:none"><div class="chart-title">Consommation API CVE — 30 jours</div><div id="cve-usage-history"></div></div>
       <div class="grid-2 mb-6" id="dash-charts" style="display:none">
         <div class="chart-wrap">
           <div class="chart-title">Répartition OS</div>
@@ -548,7 +555,7 @@
 
 <!-- FRONT URL MODAL -->
 <div class="modal-backdrop" id="inventory-modal">
-  <div class="modal" style="max-width:920px">
+  <div class="modal">
     <h2>Inventaire — <span id="inventory-hostname"></span></h2>
     <div id="inventory-content" style="max-height:65vh;overflow:auto"></div>
     <div class="modal-actions"><button class="btn btn-primary" onclick="closeInventory()">Fermer</button></div>
@@ -735,8 +742,8 @@ async function loadDashboard() {
   document.getElementById('dash-charts').style.display = 'none';
   document.getElementById('top-vuln-wrap').style.display = 'none';
   try {
-    const results = await Promise.all([api('/api/stats'), api('/api/agents')]);
-    const s = results[0], agents = results[1];
+    const results = await Promise.all([api('/api/stats'), api('/api/agents'), api('/api/cve-quota')]);
+    const s = results[0], agents = results[1], quota = results[2];
 
     const cardDefs = [
       { l:'Agents total',  v:s.agents_total,      c:'',                    sub:'' },
@@ -750,9 +757,20 @@ async function loadDashboard() {
       { l:'Rapports',      v:s.reports_total,     c:'',                    sub:'' },
       { l:'CVE en cache',  v:s.cves_in_cache,     c:'color:var(--accent)', sub:'' }
     ];
+    if (quota.configured && quota.available) {
+      cardDefs.push({l:'Plan CVE', v:quota.plan_label || quota.plan || '—', c:'color:var(--accent)', sub:'abonnement actif'});
+      cardDefs.push({l:'Requêtes restantes', v:quota.daily_remaining === null ? '∞' : quota.daily_remaining, c:'color:var(--green)', sub:'sur '+(quota.daily_limit || '∞')+' aujourd’hui'});
+      cardDefs.push({l:'Crédits restants', v:quota.credits || 0, c:'color:var(--orange)', sub:'hors quota journalier'});
+    }
     cardsEl.innerHTML = cardDefs.map(function(d){
       return '<div class="card"><div class="card-label">'+esc(d.l)+'</div><div class="card-value" style="'+d.c+'">'+(d.v||0)+'</div><div class="card-sub">'+esc(d.sub)+'</div></div>';
     }).join('');
+    var usageWrap = document.getElementById('cve-usage-wrap'), history = quota.usage_history || [];
+    if (quota.configured && quota.available) {
+      usageWrap.style.display = 'block';
+      var max = Math.max.apply(null, history.map(function(x){return x.requests||0;}).concat([1]));
+      document.getElementById('cve-usage-history').innerHTML = history.length ? '<div style="display:flex;align-items:flex-end;gap:4px;height:120px">'+history.map(function(x){var h=Math.max(3,Math.round((x.requests||0)*100/max));return '<div title="'+esc(x.day)+' : '+(x.requests||0)+' requêtes" style="flex:1;min-width:5px;height:'+h+'%;background:linear-gradient(#60a5fa,#2563eb);border-radius:3px 3px 0 0"></div>';}).join('')+'</div><div class="text-muted" style="font-size:11px;margin-top:8px">Survolez une barre pour le détail journalier.</div>' : '<div class="text-muted">Aucune consommation enregistrée.</div>';
+    } else usageWrap.style.display = 'none';
 
     /* OS bars */
     const osDist = s.os_distribution || {};
@@ -870,11 +888,17 @@ function renderServers() {
       +'</div>';
   } else {
     /* Network map */
+    // subnet_map est construit à partir de TOUTES les IP de chaque agent.
+    // Ne pas utiliser seulement s.subnet : une machine multi-homée doit être
+    // visible dans chacun de ses réseaux.
+    const byHostname = Object.fromEntries(servers.map(function(s){ return [s.hostname, s]; }));
     const bySubnet = {};
-    servers.forEach(function(s) {
-      const sn = s.subnet || 'Inconnu';
-      if (!bySubnet[sn]) bySubnet[sn] = [];
-      bySubnet[sn].push(s);
+    Object.keys(subnet_map).forEach(function(sn) {
+      bySubnet[sn] = (subnet_map[sn] || []).map(function(host){ return byHostname[host]; }).filter(Boolean);
+    });
+    servers.filter(function(s){ return !(s.subnets || []).length; }).forEach(function(s) {
+      if (!bySubnet['Inconnu']) bySubnet['Inconnu'] = [];
+      bySubnet['Inconnu'].push(s);
     });
     const keys = Object.keys(bySubnet);
     if (!keys.length) { el.innerHTML = '<div class="loading-center text-muted">Pas encore de données réseau</div>'; return; }
@@ -932,9 +956,13 @@ async function openInventory(hostname) {
     var data = await api('/api/agents/' + encodeURIComponent(hostname) + '/inventory');
     var a = data.agent, sw = a.software || [], last = (data.history || [])[0] || {};
     var changes = last.inventory_changes || {added:[], removed:[]};
+    var users = (a.logged_users || []).map(function(u){ return esc(u.username || ''); }).filter(Boolean);
+    var ips = (a.ip_addresses || []).map(esc).join(' · ') || '—';
+    var ports = (a.open_ports || []).map(String).join(', ') || 'Aucun scan de ports';
     var list = sw.map(function(x){ return '<tr><td>'+esc(x.vendor||'—')+'</td><td>'+esc(x.product||'—')+'</td><td>'+esc(x.version||'—')+'</td></tr>'; }).join('');
-    document.getElementById('inventory-content').innerHTML = '<div class="cards mb-4"><div class="card"><div class="card-label">Logiciels installés</div><div class="card-value">'+sw.length+'</div></div><div class="card"><div class="card-label">Ajoutés au dernier relevé</div><div class="card-value">'+(changes.added||[]).length+'</div></div><div class="card"><div class="card-label">Retirés au dernier relevé</div><div class="card-value">'+(changes.removed||[]).length+'</div></div></div>'
-      +'<p class="text-muted" style="font-size:12px">Chaque rapport conserve une sauvegarde d’inventaire. Dernier relevé : '+esc(a.last_seen ? new Date(a.last_seen).toLocaleString('fr-FR') : '—')+'</p>'
+    document.getElementById('inventory-content').innerHTML = '<div class="inventory-grid"><div class="card"><div class="card-label">Logiciels</div><div class="card-value">'+sw.length+'</div></div><div class="card"><div class="card-label">Ajoutés</div><div class="card-value">'+(changes.added||[]).length+'</div></div><div class="card"><div class="card-label">Retirés</div><div class="card-value">'+(changes.removed||[]).length+'</div></div><div class="card"><div class="card-label">CVE</div><div class="card-value">'+(a.cve_count||0)+'</div></div></div>'
+      +'<div class="inventory-grid" style="grid-template-columns:repeat(2,minmax(0,1fr))"><div class="inventory-section"><h3>Système & réseau</h3><div><strong>'+esc(a.os||'—')+' '+esc(a.release||'')+'</strong></div><div class="text-muted" style="font-size:12px;margin-top:6px">Build : '+esc(a.os_build||'—')+'<br>IP : '+ips+'<br>Ports : '+esc(ports)+'</div></div><div class="inventory-section"><h3>Utilisateurs observés</h3><div class="text-muted" style="font-size:12px">'+(users.length ? users.map(function(u){return '<span class="badge badge-gray" style="margin:2px">'+u+'</span>';}).join(' ') : 'Aucun utilisateur remonté par cet agent')+'</div></div></div>'
+      +'<p class="text-muted" style="font-size:12px">Sauvegarde d’inventaire : '+esc(a.last_seen ? new Date(a.last_seen).toLocaleString('fr-FR') : '—')+'</p>'
       +'<div class="table-wrap"><table><thead><tr><th>Éditeur</th><th>Logiciel</th><th>Version</th></tr></thead><tbody>'+list+'</tbody></table></div>';
   } catch(err) { document.getElementById('inventory-content').innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>'; }
 }
