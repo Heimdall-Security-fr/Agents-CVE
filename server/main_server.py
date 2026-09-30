@@ -385,6 +385,13 @@ CORS(app, origins=_dashboard_origins, supports_credentials=False)
 from contextlib import nullcontext
 db_lock = nullcontext()
 
+# Une relance manuelle peut consommer une requête CVE par logiciel. Elle est
+# exécutée hors requête HTTP et une seule analyse de parc peut tourner à la fois.
+_cve_rescan_lock = threading.Lock()
+_cve_rescan_status = {"running": False, "started_at": None, "finished_at": None,
+                      "total_hosts": 0, "processed_hosts": 0, "estimated_requests": 0,
+                      "error": None}
+
 # ─── Dashboard auth (JWT) ─────────────────────────────────────────────────────
 DASHBOARD_JWT_SECRET    = os.getenv("DASHBOARD_JWT_SECRET", "")
 DASHBOARD_JWT_EXPIRE_D  = int(os.getenv("DASHBOARD_JWT_EXPIRE_DAYS", 7))
@@ -1085,6 +1092,77 @@ def request_updates_refresh(hostname):
     if not res.matched_count:
         return {"error": "Agent not found"}, 404
     return jsonify({"status": "ok"}), 200
+
+def _manual_cve_rescan():
+    """Relance la corrélation depuis les inventaires déjà stockés en Mongo."""
+    global _cve_rescan_status
+    try:
+        agents = list(mongo.db.agents.find(
+            {}, {"hostname": 1, "software": 1, "os_build": 1}))
+        for agent in agents:
+            vulns = correlate_vulnerabilities(agent.get("software") or [], SERVER_CVE_API_KEY,
+                                               agent.get("os_build", ""))
+            mongo.db.agents.update_one({"hostname": agent.get("hostname", "Unknown")}, {"$set": {
+                "vulnerabilities": vulns,
+                "vulnerable_count": len(vulns),
+                "cve_count": sum(v.get("cves_count", 0) for v in vulns),
+                "critical_count": sum(v.get("critical", 0) for v in vulns),
+                "high_count": sum(v.get("high", 0) for v in vulns),
+                "cve_last_manual_scan": datetime.utcnow(),
+            }})
+            with _cve_rescan_lock:
+                _cve_rescan_status["processed_hosts"] += 1
+    except Exception as exc:
+        logger.exception("[CVE RESCAN] Échec de l'analyse manuelle")
+        with _cve_rescan_lock:
+            _cve_rescan_status["error"] = str(exc)[:300]
+    finally:
+        with _cve_rescan_lock:
+            _cve_rescan_status["running"] = False
+            _cve_rescan_status["finished_at"] = datetime.utcnow()
+
+@app.route('/api/cve-quota', methods=['GET'])
+@require_role("admin", "inspection_logs")
+def cve_quota():
+    """Proxy du solde : la clé CVE ne quitte jamais le serveur agent."""
+    if not SERVER_CVE_API_KEY:
+        return jsonify({"configured": False})
+    try:
+        response = requests.get(f"{HEIMDALL_CVE_API}/account/quota",
+                                headers={"x-api-key": SERVER_CVE_API_KEY}, timeout=10)
+        if response.status_code != 200:
+            return jsonify({"configured": True, "available": False})
+        data = response.json()
+        return jsonify({"configured": True, "available": True,
+                        "daily_limit": data.get("daily_limit"),
+                        "requests_used": data.get("requests_used", 0),
+                        "daily_remaining": data.get("daily_remaining"),
+                        "credits": data.get("credits", 0),
+                        "reset_date": data.get("reset_date")})
+    except requests.RequestException as exc:
+        logger.warning("[CVE API] Solde indisponible: %s", exc)
+        return jsonify({"configured": True, "available": False})
+
+@app.route('/api/cve-rescan', methods=['GET', 'POST'])
+@require_role("admin")
+def cve_rescan():
+    global _cve_rescan_status
+    if request.method == 'GET':
+        with _cve_rescan_lock:
+            return jsonify(_clean(dict(_cve_rescan_status)))
+    if not SERVER_CVE_API_KEY:
+        return {"error": "CVE_API_KEY non configurée : analyse manuelle impossible."}, 400
+    with _cve_rescan_lock:
+        if _cve_rescan_status["running"]:
+            return jsonify(_clean(dict(_cve_rescan_status))), 409
+        agents = list(mongo.db.agents.find({}, {"software.product": 1}))
+        estimate = sum(len([sw for sw in (a.get("software") or []) if sw.get("product")])
+                       for a in agents)
+        _cve_rescan_status = {"running": True, "started_at": datetime.utcnow(), "finished_at": None,
+                              "total_hosts": len(agents), "processed_hosts": 0,
+                              "estimated_requests": estimate, "error": None}
+        threading.Thread(target=_manual_cve_rescan, name="ManualCveRescan", daemon=True).start()
+        return jsonify(_clean(dict(_cve_rescan_status))), 202
 
 @app.route('/api/agents', methods=['GET'])
 def list_agents():

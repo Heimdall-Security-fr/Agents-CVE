@@ -72,6 +72,7 @@ jobs:
           context: .
           file: ./server/Dockerfile
           push: true
+          pull: true
           build-args: |
             AGENT_VERSION=${{ env.AGENT_VERSION_BASE }}.${{ gitea.run_number }}
           tags: |

@@ -426,6 +426,8 @@
       <div class="header-row">
         <div><h1>Vulnérabilités</h1><p id="vulns-subtitle">CVE détectées par agent</p></div>
         <div class="flex gap-2">
+          <span class="text-muted" id="cve-quota" style="font-size:12px;align-self:center"></span>
+          <button class="btn btn-primary btn-sm" id="btn-cve-rescan" onclick="startCveRescan()" style="display:none" title="Relancer l'analyse CVE depuis les inventaires déjà reçus">🔎 Analyser le parc</button>
           <button class="btn btn-ghost btn-sm" id="btn-front-url" onclick="openFrontUrlEditor()" style="display:none" title="Configurer l'URL du site front pour les liens CVE">🔗 URL front</button>
           <button class="btn btn-ghost btn-sm" onclick="loadVulns()">↻</button>
         </div>
@@ -903,10 +905,60 @@ async function loadVulns() {
   // Bouton de configuration de l'URL front : admin uniquement
   var fuBtn = document.getElementById('btn-front-url');
   if (fuBtn) fuBtn.style.display = _isAdmin() ? 'inline-flex' : 'none';
+  var scanBtn = document.getElementById('btn-cve-rescan');
+  if (scanBtn) scanBtn.style.display = _isAdmin() ? 'inline-flex' : 'none';
+  loadCveQuota();
   try {
     _vulnsData = await api('/api/vulnerabilities');
     renderVulns();
   } catch(err) { el.innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>'; }
+}
+
+async function loadCveQuota() {
+  var el = document.getElementById('cve-quota');
+  if (!el || !_isAdmin()) return;
+  try {
+    var q = await api('/api/cve-quota');
+    if (!q.configured) { el.textContent = 'Clé CVE non configurée'; return; }
+    if (!q.available) { el.textContent = 'Solde CVE indisponible'; return; }
+    var daily = q.daily_remaining === null ? 'illimité' : q.daily_remaining + ' / ' + q.daily_limit + ' aujourd’hui';
+    el.textContent = 'Quota : ' + daily + ' · Crédits : ' + (q.credits || 0);
+  } catch (err) { el.textContent = 'Solde CVE indisponible'; }
+}
+
+async function startCveRescan() {
+  if (!confirm('Relancer l’analyse CVE de tous les inventaires ? Une requête CVE est effectuée par logiciel et consomme le quota/crédits applicables.')) return;
+  var btn = document.getElementById('btn-cve-rescan');
+  btn.disabled = true;
+  try {
+    var state = await api('/api/cve-rescan', { method: 'POST' });
+    toast('Analyse démarrée : jusqu’à ' + state.estimated_requests + ' requêtes CVE sur ' + state.total_hosts + ' serveur(s).', 'ok');
+    watchCveRescan();
+  } catch (err) {
+    toast(err.message, 'err');
+    btn.disabled = false;
+  }
+}
+
+async function watchCveRescan() {
+  var btn = document.getElementById('btn-cve-rescan');
+  try {
+    var state = await api('/api/cve-rescan');
+    if (state.running) {
+      btn.textContent = '⏳ Analyse ' + state.processed_hosts + '/' + state.total_hosts;
+      setTimeout(watchCveRescan, 3000);
+      return;
+    }
+    btn.disabled = false;
+    btn.textContent = '🔎 Analyser le parc';
+    if (state.error) toast('Analyse terminée avec erreur : ' + state.error, 'err');
+    else toast('Analyse CVE terminée : ' + state.processed_hosts + ' serveur(s) analysé(s).', 'ok');
+    loadCveQuota();
+    loadVulns();
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = '🔎 Analyser le parc';
+  }
 }
 
 /* ── Logs agent (modale) — debug centralisé ── */

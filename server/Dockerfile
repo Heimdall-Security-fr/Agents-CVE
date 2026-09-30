@@ -40,12 +40,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+# upgrade : correctifs de sécurité Debian (openssl, zlib…) publiés depuis l'image de base
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Dépendances Python du serveur
+# pip/setuptools/wheel de l'image de base sont souvent en retard (CVE signalées par Docker Scout)
 COPY server/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir -r requirements.txt
 
 # Code du serveur
 COPY server/ .
