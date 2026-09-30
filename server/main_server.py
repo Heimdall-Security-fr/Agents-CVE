@@ -8,6 +8,7 @@ import hmac
 import uuid
 import secrets
 import threading
+import time
 import requests
 import re
 import json
@@ -284,9 +285,14 @@ def _cve_affects_version(installed_ver: str, cve_doc: dict, product: str,
 
     ac = cve_doc.get("affected_components", [])
     if not ac:
-        # No structured version ranges — try the root-level version hint
-        # (common in RSS-ingested CVEs). If installed is strictly newer than
-        # the CVE's referenced version, the patch has likely been applied.
+        # La recherche de l'API peut retomber sur desc_terms. Sans CPE ni
+        # composant affecté, n'accepter que l'association explicite du produit
+        # racine : autrement un paquet court (apt, bash, ssl...) récupère des
+        # CVE qui ne parlent de lui que dans leur description.
+        doc_product = _cpe_normalize(str(cve_doc.get("product", "")))
+        if not doc_product or doc_product != _cpe_normalize(product):
+            return False
+        # No structured version ranges — try the root-level version hint.
         root_ver = str(cve_doc.get("version", "")).strip()
         if root_ver and root_ver.lower() not in ("n/a", "", "none", "0"):
             inst = _parse_ver(installed_ver)
@@ -307,11 +313,11 @@ def _cve_affects_version(installed_ver: str, cve_doc: dict, product: str,
             continue
         comp_low  = comp_prod.lower()
         comp_norm = _cpe_normalize(comp_prod)
-        # Exact, normalized, or substring match in either direction
+        # Une correspondance par sous-chaîne est trop permissive pour les
+        # paquets Linux ("apt" pouvait matcher "apache_tomcat", par exemple).
+        # On ne conserve que l'identité explicite du produit/CPE.
         if (comp_low == product_low
-                or comp_norm == product_norm
-                or (product_norm and product_norm in comp_norm)
-                or (comp_norm and comp_norm in product_norm)):
+                or comp_norm == product_norm):
             matching_comps.append(comp)
 
     if not matching_comps:
@@ -361,6 +367,22 @@ HEIMDALL_FRONT_URL = os.getenv("HEIMDALL_FRONT_URL", "http://localhost:3000")
 # débiter le quota (seules les routes /cves sont comptabilisées).
 _cve_public_prefix = None
 _cve_public_prefix_lock = threading.Lock()
+_cve_budget_lock = threading.Lock()
+_cve_budget_day = None
+_cve_budget_used = 0
+CVE_DAILY_QUERY_BUDGET = max(1, int(os.getenv("CVE_DAILY_QUERY_BUDGET", "50")))
+
+def _claim_cve_query() -> bool:
+    """Borne les appels facturables : 50/jour par défaut, configurable."""
+    global _cve_budget_day, _cve_budget_used
+    today = datetime.utcnow().date()
+    with _cve_budget_lock:
+        if _cve_budget_day != today:
+            _cve_budget_day, _cve_budget_used = today, 0
+        if _cve_budget_used >= CVE_DAILY_QUERY_BUDGET:
+            return False
+        _cve_budget_used += 1
+        return True
 
 def _cve_api_get(path: str, **kwargs):
     global _cve_public_prefix
@@ -842,7 +864,8 @@ def refresh_cve_from_rss():
             logger.error(f"[API] Impossible de récupérer les CVE: {e2}")
 
 # ─── Corrélation CVE/logiciels ────────────────────────────────────────────────
-def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: str = ""):
+def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: str = "",
+                              return_status: bool = False):
     """Pour chaque logiciel, interroge l'API CVE publique (toujours — jamais de lecture
     directe en base). C'est ce qui fait consommer 1 requête du quota du compte
     propriétaire de `cve_api_key` (CVE_API_KEY, la clé nominative du client sur ce
@@ -854,9 +877,11 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
     if not cve_api_key:
         logger.warning("[CVE API] Aucune clé configurée (CVE_API_KEY) — corrélation désactivée, "
                        "aucune requête ne sera comptée sur un plan client.")
-        return []
+        return ([], False) if return_status else []
     vulns = []
+    complete = True
     api_headers = {"x-api-key": cve_api_key}
+    cache_cutoff = datetime.utcnow() - timedelta(hours=24)
     for sw in software_list:
         product = sw.get("product", "")
         version = sw.get("version", "")
@@ -870,29 +895,42 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
         # supplémentaire : 1 requête = 1 crédit, quel que soit `limit`).
         fetch_limit = min(int(os.getenv("MAX_CVES_PER_SOFTWARE", "50")), 100)
         cves_raw = []
-        try:
-            resp = _cve_api_get(
-                "/cves/search",
-                params={"query": product, "type": "product", "limit": fetch_limit},
-                headers=api_headers,
-                timeout=10
-            )
-            if resp.status_code == 200:
-                raw = resp.json()
-                results = raw.get("results", []) if isinstance(raw, dict) else raw
-                # Drop CVEs where product is "n/a" — those are description-matched
-                # false positives with no real product assignment
-                cves_raw = [c for c in results
-                            if _is_valid_cve_doc(c)
-                            and c.get("product", "n/a").lower() not in ("n/a", "", "none")]
-            elif resp.status_code == 429:
-                logger.warning(f"[CVE API] Quota épuisé pour {product} — passez à un plan supérieur ou achetez un pack de crédits.")
-            elif resp.status_code == 401:
-                logger.error(f"[CVE API] Clé API invalide/expirée pour {product} — vérifiez CVE_API_KEY.")
-            else:
-                logger.warning(f"[CVE API] HTTP {resp.status_code} pour {product}")
-        except Exception as e:
-            logger.warning(f"Appel API CVE échoué pour {product}: {e}")
+        cache_key = product.strip().lower()
+        cached = mongo.db.cve_search_cache.find_one(
+            {"product": cache_key, "fetched_at": {"$gte": cache_cutoff}}, {"cves": 1})
+        if cached is not None:
+            cves_raw = cached.get("cves") or []
+        else:
+            if not _claim_cve_query():
+                complete = False
+                logger.info("[CVE API] Budget journalier local atteint (%s requêtes) — produit reporté: %s",
+                            CVE_DAILY_QUERY_BUDGET, product)
+                continue
+            try:
+                resp = _cve_api_get(
+                    "/cves/search",
+                    params={"query": product, "type": "product", "limit": fetch_limit},
+                    headers=api_headers,
+                    timeout=10
+                )
+                if resp.status_code == 200:
+                    raw = resp.json()
+                    results = raw.get("results", []) if isinstance(raw, dict) else raw
+                    cves_raw = [c for c in results
+                                if _is_valid_cve_doc(c)
+                                and c.get("product", "n/a").lower() not in ("n/a", "", "none")]
+                    # Même produit sur plusieurs hôtes : une seule requête CVE/jour.
+                    mongo.db.cve_search_cache.update_one(
+                        {"product": cache_key}, {"$set": {"cves": cves_raw,
+                         "fetched_at": datetime.utcnow()}}, upsert=True)
+                elif resp.status_code == 429:
+                    logger.warning(f"[CVE API] Quota épuisé pour {product} — analyse mise en attente.")
+                elif resp.status_code == 401:
+                    logger.error(f"[CVE API] Clé API invalide/expirée pour {product} — vérifiez CVE_API_KEY.")
+                else:
+                    logger.warning(f"[CVE API] HTTP {resp.status_code} pour {product}")
+            except Exception as e:
+                logger.warning(f"Appel API CVE échoué pour {product}: {e}")
 
         # Filtrage strict par version — pas de fallback si tout est filtré
         if version:
@@ -927,7 +965,7 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
                           "affected_components": c.get("affected_components", []),
                           "cpe_matches": c.get("cpe_matches", [])} for c in cves]
             })
-    return vulns
+    return (vulns, complete) if return_status else vulns
 
 # ─── Logs locaux des agents (debug centralisé) ────────────────────────────────
 _LOG_TAIL_MAX_LINES = 200
@@ -1008,7 +1046,20 @@ def agent_report():
         # pour que l'utilisateur ait au moins quelque chose à voir.
         display_ips = sorted({ip for ip in candidate_ips if not _is_docker_ip(ip)})
 
-    vulns = correlate_vulnerabilities(software_list, cve_api_key, os_build)
+    vulns, cve_complete = correlate_vulnerabilities(software_list, cve_api_key, os_build,
+                                                     return_status=True)
+    # Chaque rapport est déjà une sauvegarde complète dans agent_reports. On
+    # calcule aussi l'écart avec le dernier inventaire pour signaler tout ajout.
+    existing_agent = mongo.db.agents.find_one({"hostname": hostname}, {"software": 1}) or {}
+    def _software_keys(items):
+        return {f"{s.get('vendor', '')}|{s.get('product', '')}|{s.get('version', '')}"
+                for s in items if s.get("product")}
+    previous_keys = _software_keys(existing_agent.get("software") or [])
+    current_keys = _software_keys(software_list)
+    inventory_changes = {
+        "added": sorted(current_keys - previous_keys)[:200],
+        "removed": sorted(previous_keys - current_keys)[:200],
+    }
     # Vrais totaux CVE (somme à travers tous les logiciels), pas juste le nombre
     # de logiciels vulnérables.
     cves_total     = sum(v.get("cves_count", 0) for v in vulns)
@@ -1046,6 +1097,7 @@ def agent_report():
         "software":         software_list,
         "ip_addresses":     display_ips,
         "compliance":       compliance,
+        "inventory_changes": inventory_changes,
     }
     # Absent (ancien agent) → on ne l'écrit pas, pour ne pas effacer le dernier résultat connu.
     if update_check is not None:
@@ -1064,7 +1116,7 @@ def agent_report():
         if log_tail is not None:
             update_fields["log_tail"] = log_tail
             update_fields["log_tail_received_at"] = datetime.utcnow()
-        if not vulns:
+        if not vulns and not cve_complete:
             existing = mongo.db.agents.find_one({"hostname": hostname},
                                                  {"vulnerabilities": 1, "vulnerable_count": 1})
             if existing and existing.get("vulnerabilities"):
@@ -1124,18 +1176,27 @@ def _manual_cve_rescan():
     global _cve_rescan_status
     try:
         agents = list(mongo.db.agents.find(
-            {}, {"hostname": 1, "software": 1, "os_build": 1}))
+            {}, {"hostname": 1, "software": 1, "os_build": 1, "cve_last_checked_at": 1}))
+        agents.sort(key=lambda a: (a.get("cve_last_checked_at") is not None,
+                                   a.get("cve_last_checked_at") or datetime.min))
         for agent in agents:
-            vulns = correlate_vulnerabilities(agent.get("software") or [], SERVER_CVE_API_KEY,
-                                               agent.get("os_build", ""))
-            mongo.db.agents.update_one({"hostname": agent.get("hostname", "Unknown")}, {"$set": {
+            vulns, complete = correlate_vulnerabilities(agent.get("software") or [], SERVER_CVE_API_KEY,
+                                                        agent.get("os_build", ""), return_status=True)
+            update = {
                 "vulnerabilities": vulns,
                 "vulnerable_count": len(vulns),
                 "cve_count": sum(v.get("cves_count", 0) for v in vulns),
                 "critical_count": sum(v.get("critical", 0) for v in vulns),
                 "high_count": sum(v.get("high", 0) for v in vulns),
                 "cve_last_manual_scan": datetime.utcnow(),
-            }})
+                "cve_last_checked_at": datetime.utcnow(),
+            }
+            # Si le budget s'est arrêté au milieu de l'hôte, conserver le
+            # dernier résultat plutôt que de le remplacer par un faux « sain ».
+            if not complete:
+                update = {"cve_last_manual_scan": datetime.utcnow(),
+                          "cve_scan_deferred": True}
+            mongo.db.agents.update_one({"hostname": agent.get("hostname", "Unknown")}, {"$set": update})
             with _cve_rescan_lock:
                 _cve_rescan_status["processed_hosts"] += 1
     except Exception as exc:
@@ -1184,7 +1245,11 @@ def cve_rescan():
     with _cve_rescan_lock:
         if _cve_rescan_status["running"]:
             return jsonify(_clean(dict(_cve_rescan_status))), 409
-        agents = list(mongo.db.agents.find({}, {"software.product": 1}))
+        agents = list(mongo.db.agents.find({}, {"software.product": 1,
+                                                "cve_last_checked_at": 1}))
+        # File prioritaire : jamais vérifié d'abord, puis contrôle le plus ancien.
+        agents.sort(key=lambda a: (a.get("cve_last_checked_at") is not None,
+                                   a.get("cve_last_checked_at") or datetime.min))
         estimate = sum(len([sw for sw in (a.get("software") or []) if sw.get("product")])
                        for a in agents)
         _cve_rescan_status = {"running": True, "started_at": datetime.utcnow(), "finished_at": None,
@@ -1192,6 +1257,30 @@ def cve_rescan():
                               "estimated_requests": estimate, "error": None}
         threading.Thread(target=_manual_cve_rescan, name="ManualCveRescan", daemon=True).start()
         return jsonify(_clean(dict(_cve_rescan_status))), 202
+
+def _daily_cve_scheduler():
+    """Lance la file une fois par jour, après le renouvellement des quotas."""
+    while True:
+        now = datetime.utcnow()
+        next_run = (now.replace(hour=0, minute=10, second=0, microsecond=0) + timedelta(days=1))
+        time.sleep(max(60, (next_run - now).total_seconds()))
+        if not SERVER_CVE_API_KEY or not _cve_rescan_lock.acquire(blocking=False):
+            continue
+        try:
+            if _cve_rescan_status.get("running"):
+                continue
+            agents = list(mongo.db.agents.find({}, {"software.product": 1,
+                                                    "cve_last_checked_at": 1}))
+            agents.sort(key=lambda a: (a.get("cve_last_checked_at") is not None,
+                                       a.get("cve_last_checked_at") or datetime.min))
+            _cve_rescan_status.update({"running": True, "started_at": datetime.utcnow(),
+                                       "finished_at": None, "total_hosts": len(agents),
+                                       "processed_hosts": 0,
+                                       "estimated_requests": sum(len(a.get("software") or []) for a in agents),
+                                       "error": None})
+            threading.Thread(target=_manual_cve_rescan, name="DailyCveRescan", daemon=True).start()
+        finally:
+            _cve_rescan_lock.release()
 
 @app.route('/api/agents', methods=['GET'])
 def list_agents():
@@ -1236,6 +1325,19 @@ def agent_history(hostname):
             {"hostname": hostname}, {"_id": 0}
         ).sort("received_at", -1).limit(20))
     return jsonify([_clean(r) for r in reports])
+
+@app.route('/api/agents/<hostname>/inventory', methods=['GET'])
+@require_role("admin", "deployment", "inspection_logs", "codir")
+def agent_inventory(hostname):
+    """Fiche complète : inventaire courant et sauvegardes/écarts récents."""
+    agent = mongo.db.agents.find_one({"hostname": hostname}, {"_id": 0, "log_tail": 0})
+    if not agent:
+        return {"error": "Agent not found"}, 404
+    history = list(mongo.db.agent_reports.find(
+        {"hostname": hostname}, {"_id": 0, "received_at": 1, "software_count": 1,
+                               "inventory_changes": 1, "cve_count": 1})
+        .sort("received_at", -1).limit(30))
+    return jsonify(_clean({"agent": agent, "history": history}))
 
 # ─── Suppressions CVE ─────────────────────────────────────────────────────────
 @app.route('/api/agents/<hostname>/suppress', methods=['GET'])
@@ -2019,6 +2121,8 @@ def list_servers():
     Docker IPs (172.16-31.x.x) are already filtered when agents report in."""
     with db_lock:
         agents = list(mongo.db.agents.find({}, {"_id": 0, "software": 0, "log_tail": 0}))
+        disabled_links = {d.get("key") for d in mongo.db.network_link_overrides.find(
+            {"disabled": True}, {"_id": 0, "key": 1})}
 
     servers = []
     subnet_map: dict = {}  # subnet -> [hostname, ...]
@@ -2046,13 +2150,26 @@ def list_servers():
             sn = _subnet_24(ip)
             if sn:
                 for peer in subnet_map.get(sn, []):
-                    if peer != srv["hostname"]:
+                    key = "|".join(sorted((srv["hostname"], peer)))
+                    if peer != srv["hostname"] and key not in disabled_links:
                         peers.add(peer)
         srv["subnet_peers"] = sorted(peers)
         # Primary subnet for display
         srv["subnet"] = next((_subnet_24(ip) for ip in ips if _subnet_24(ip)), None)
 
     return jsonify({"servers": servers, "subnet_map": subnet_map}), 200
+
+@app.route('/api/network-links/<source>/<target>', methods=['DELETE'])
+@require_role("admin")
+def disable_network_link(source, target):
+    """Masque manuellement un lien supposé issu d'un sous-réseau partagé."""
+    if source == target:
+        return {"error": "Lien invalide"}, 400
+    key = "|".join(sorted((source, target)))
+    mongo.db.network_link_overrides.update_one({"key": key}, {"$set": {
+        "key": key, "disabled": True, "disabled_at": datetime.utcnow(),
+        "disabled_by": request.dashboard_user.get("email", "")}}, upsert=True)
+    return jsonify({"status": "ok"})
 
 # ─── All vulnerabilities across all agents ───────────────────────────────────
 @app.route('/api/vulnerabilities', methods=['GET'])
@@ -2274,5 +2391,6 @@ if __name__ == "__main__":
             time.sleep(6 * 3600)
             refresh_cve_from_rss()
     threading.Thread(target=rss_scheduler, daemon=True).start()
+    threading.Thread(target=_daily_cve_scheduler, daemon=True).start()
 
     app.run(host="0.0.0.0", port=SERVER_PUBLIC_PORT, debug=False)

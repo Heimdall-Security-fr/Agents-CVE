@@ -547,6 +547,13 @@
 </div>
 
 <!-- FRONT URL MODAL -->
+<div class="modal-backdrop" id="inventory-modal">
+  <div class="modal" style="max-width:920px">
+    <h2>Inventaire — <span id="inventory-hostname"></span></h2>
+    <div id="inventory-content" style="max-height:65vh;overflow:auto"></div>
+    <div class="modal-actions"><button class="btn btn-primary" onclick="closeInventory()">Fermer</button></div>
+  </div>
+</div>
 <div class="modal-backdrop" id="logs-modal">
   <div class="modal" style="max-width:820px">
     <h2>Logs — <span id="logs-hostname"></span></h2>
@@ -817,7 +824,7 @@ function renderServers() {
     const rows = paged.slice.map(function(s) {
       const ips   = (s.ip_addresses||[]).map(function(ip){ return '<span class="code">'+esc(ip)+'</span>'; }).join(' ') || '<span class="text-muted">—</span>';
       const peers = (s.subnet_peers||[]).length
-        ? s.subnet_peers.slice(0,3).map(function(p){ return '<span class="badge badge-gray" style="font-size:10px">'+esc(p)+'</span>'; }).join(' ')
+        ? s.subnet_peers.slice(0,3).map(function(p){ return '<button class="badge badge-gray" style="font-size:10px;cursor:pointer" title="Supprimer ce lien supposé" onclick="event.stopPropagation();removeNetworkLink(\''+esc(s.hostname).replace(/'/g,"\\'")+'\',\''+esc(p).replace(/'/g,"\\'")+'\')">'+esc(p)+' ×</button>'; }).join(' ')
           + (s.subnet_peers.length>3 ? ' <span class="text-muted" style="font-size:11px">+'+s.subnet_peers.length+'</span>':'')
         : '<span class="text-muted">—</span>';
       // cve_count = vrai total de CVE (fallback sur vulnerable_count pour les vieux docs)
@@ -846,7 +853,7 @@ function renderServers() {
         + (s.agent_version
             ? '<div style="font-size:10px;color:var(--muted);margin-top:2px">agent v'+esc(s.agent_version)+(swCount?' · '+swCount+' logiciels':'')+verBadge+logsBtn+'</div>'
             : (swCount?'<div style="font-size:10px;color:var(--muted);margin-top:2px">'+swCount+' logiciels'+logsBtn+'</div>':'<div style="font-size:10px;margin-top:2px">'+logsBtn+'</div>'));
-      return '<tr>'
+      return '<tr style="cursor:pointer" onclick="openInventory(\''+esc(s.hostname).replace(/'/g,"\\'")+ '\')">'
         +'<td>'+hostLine+'</td>'
         +'<td><span class="badge '+(s.online?'badge-green':'badge-gray')+'">'+(s.online?'En ligne':'Hors ligne')+'</span></td>'
         +'<td>'+osLine+'</td>'
@@ -915,6 +922,30 @@ async function loadVulns() {
     _vulnsData = await api('/api/vulnerabilities');
     renderVulns();
   } catch(err) { el.innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>'; }
+}
+
+async function openInventory(hostname) {
+  document.getElementById('inventory-hostname').textContent = hostname;
+  document.getElementById('inventory-content').innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+  document.getElementById('inventory-modal').classList.add('open');
+  try {
+    var data = await api('/api/agents/' + encodeURIComponent(hostname) + '/inventory');
+    var a = data.agent, sw = a.software || [], last = (data.history || [])[0] || {};
+    var changes = last.inventory_changes || {added:[], removed:[]};
+    var list = sw.map(function(x){ return '<tr><td>'+esc(x.vendor||'—')+'</td><td>'+esc(x.product||'—')+'</td><td>'+esc(x.version||'—')+'</td></tr>'; }).join('');
+    document.getElementById('inventory-content').innerHTML = '<div class="cards mb-4"><div class="card"><div class="card-label">Logiciels installés</div><div class="card-value">'+sw.length+'</div></div><div class="card"><div class="card-label">Ajoutés au dernier relevé</div><div class="card-value">'+(changes.added||[]).length+'</div></div><div class="card"><div class="card-label">Retirés au dernier relevé</div><div class="card-value">'+(changes.removed||[]).length+'</div></div></div>'
+      +'<p class="text-muted" style="font-size:12px">Chaque rapport conserve une sauvegarde d’inventaire. Dernier relevé : '+esc(a.last_seen ? new Date(a.last_seen).toLocaleString('fr-FR') : '—')+'</p>'
+      +'<div class="table-wrap"><table><thead><tr><th>Éditeur</th><th>Logiciel</th><th>Version</th></tr></thead><tbody>'+list+'</tbody></table></div>';
+  } catch(err) { document.getElementById('inventory-content').innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>'; }
+}
+function closeInventory() { document.getElementById('inventory-modal').classList.remove('open'); }
+
+async function removeNetworkLink(source, target) {
+  if (!confirm('Masquer le lien supposé entre '+source+' et '+target+' ?')) return;
+  try {
+    await api('/api/network-links/'+encodeURIComponent(source)+'/'+encodeURIComponent(target), {method:'DELETE'});
+    loadServers();
+  } catch (err) { toast(err.message, 'err'); }
 }
 
 async function checkCveConfiguration() {
