@@ -943,13 +943,13 @@ def send_report(max_attempts: int = 6):
                                  timeout=(10, 300), verify=verify)
             resp.raise_for_status()
             data  = resp.json()
-            vulns = data.get("vulnerable_count", 0)
             with state.lock:
                 state.connected  = True
-                state.vuln_count = vulns
-            msg = f"⚠️ {vulns} vulnérabilité(s)" if vulns else "✅ Aucune vulnérabilité"
-            _set_status(msg, connected=True, vulns=vulns > 0)
-            logger.info(f"Rapport envoyé — {msg}")
+                # L'agent collecte et transmet uniquement. La qualification des
+                # CVE et leur affichage sont du ressort du serveur/dashboard.
+                state.vuln_count = 0
+            _set_status("Rapport envoyé au serveur", connected=True)
+            logger.info("Rapport envoyé au serveur pour analyse.")
             return data
         except requests.exceptions.Timeout as e:
             _set_status(f"⏳ Analyse serveur trop longue — retry {delay}s (essai {attempt}/{max_attempts})", connected=False)

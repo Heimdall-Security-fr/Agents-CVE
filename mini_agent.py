@@ -813,11 +813,9 @@ def send_report(config, software_list, open_ports, max_attempts: int = 6) -> dic
                                  verify=_tls_verify(config))
             resp.raise_for_status()
             data = resp.json()
-            vuln_count = data.get("vulnerable_count", 0)
-            logger.info(f"✅ Rapport envoyé. {vuln_count} vulnérabilité(s) détectée(s).")
-            for v in data.get("vulnerabilities", [])[:5]:
-                logger.warning(f"  ⚠️  {v['software']} → {v['cves_count']} CVE "
-                               f"(CRITIQUE: {v.get('critical',0)}, HAUTE: {v.get('high',0)})")
+            # L'agent se limite à transmettre l'inventaire. La corrélation CVE
+            # et les éventuelles alertes sont centralisées sur le serveur.
+            logger.info("✅ Rapport envoyé au serveur pour analyse.")
             return data
         except requests.exceptions.Timeout as e:
             logger.warning(f"Analyse serveur trop longue ({type(e).__name__}). Retry dans {delay}s…")

@@ -1342,7 +1342,8 @@ def download_agent(target_os):
     # install.sh détecte l'OS à l'exécution (systemd pour Linux, launchd pour macOS)
     # et installe le service de manière idempotente. uninstall.sh est livré dans
     # le même bundle ET aussi disponible via `python3 mini_agent.py --uninstall`.
-    server_base = f"http://{server_host}:{server_port}"
+    # The packaged agent.conf is the source of truth for the installer.
+    server_base = f"{_public_scheme()}://{server_host}:{server_port}"
 
     bash_install = textwrap.dedent(f"""\
         #!/usr/bin/env bash
@@ -1350,6 +1351,8 @@ def download_agent(target_os):
         set -e
         SERVER_BASE="{server_base}"
         INSTALL_DIR="/opt/heimdall-agent"
+        SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+        CONFIG_SOURCE="$SCRIPT_DIR/agent.conf"
 
         OS_KIND="$(uname -s)"
         echo "🛡  Installation de l'agent Heimdall sur $OS_KIND…"
@@ -1372,10 +1375,22 @@ def download_agent(target_os):
         mkdir -p "$INSTALL_DIR"
 
         # ── Fichier de configuration ────────────────────────────────────────
-        cat > "$INSTALL_DIR/agent.conf" << 'CONFIG'
-{config_content}
-CONFIG
-        chmod 600 "$INSTALL_DIR/agent.conf"
+        # Do not start an unusable service: agent.conf must come from the
+        # downloaded bundle and must contain the pre-configured shared token.
+        if [ ! -r "$CONFIG_SOURCE" ]; then
+          echo "Configuration missing: $CONFIG_SOURCE"
+          echo "Extract the complete ZIP, then run: sudo bash install.sh"
+          exit 1
+        fi
+        token="$(awk -F= '/^[[:space:]]*token[[:space:]]*=/ {{sub(/^[^=]*=/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit}}' "$CONFIG_SOURCE")"
+        if [ ${{#token}} -lt 32 ]; then
+          echo "The token in agent.conf is invalid (32 characters minimum)."
+          exit 1
+        fi
+        config_tmp="$INSTALL_DIR/.agent.conf.$$"
+        install -m 600 "$CONFIG_SOURCE" "$config_tmp"
+        mv -f "$config_tmp" "$INSTALL_DIR/agent.conf"
+        echo "Configuration installed: $INSTALL_DIR/agent.conf"
 
         # ── Téléchargement du script agent ──────────────────────────────────
         echo "⬇  Téléchargement de mini_agent.py…"
