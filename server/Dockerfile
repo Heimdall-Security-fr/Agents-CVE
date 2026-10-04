@@ -4,6 +4,7 @@ FROM cdrx/pyinstaller-windows:python3 AS win-builder
 WORKDIR /src
 COPY windows_agent_tray.py .
 COPY server/static/heimdall-logo.png .
+COPY make_icon.py .
 COPY VERSION .
 
 # Version de l'agent : AGENT_VERSION (build-arg de la CI, ex. 1.0.57) si valide, sinon
@@ -20,10 +21,14 @@ RUN pip install --quiet "requests" "pillow" "pystray>=0.19.5" "pyinstaller>=5.13
 # Vérifie que les dépendances clés sont bien importables sous Wine/Python Windows
 RUN wine python -c "import pystray, PIL, PIL.Image, PIL.ImageDraw, requests; print('deps OK')"
 
+# Icône de l'exe (Explorateur, barre des tâches) : sans --icon, PyInstaller met la sienne
+RUN wine python make_icon.py heimdall-logo.png heimdall.ico && test -s heimdall.ico
+
 RUN pyinstaller \
     --onefile \
     --windowed \
     --name HeimdallAgent \
+    --icon heimdall.ico \
     --hidden-import pystray._win32 \
     --hidden-import PIL \
     --hidden-import PIL.Image \

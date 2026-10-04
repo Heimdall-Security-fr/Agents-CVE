@@ -28,6 +28,8 @@
 #                            détectée) plutôt que de contourner votre quota de plan payant.
 #    HEIMDALL_FRONT_URL      URL publique du site CVE (liens vers les fiches CVE)
 #    DASHBOARD_ALLOWED_ORIGINS  origines autorisées pour le dashboard
+#    SERVER_PUBLIC_PORT      port publié sur l'hôte (défaut 4000)
+#    CVE_DAILY_QUERY_BUDGET  requêtes CVE max/jour (défaut 50 — à ajuster à votre plan)
 #    BIND_ADDR               interface d'écoute (défaut 0.0.0.0 ; 127.0.0.1 derrière un reverse proxy)
 #
 #  ⚠️  MONGO_USER / MONGO_PASSWORD ne sont pris en compte qu'à la CRÉATION de la
@@ -44,11 +46,12 @@ services:
       mongodb:
         condition: service_healthy
     ports:
-      - "${BIND_ADDR:-0.0.0.0}:4000:4000"
+      - "${BIND_ADDR:-0.0.0.0}:${SERVER_PUBLIC_PORT:-4000}:4000"
     environment:
       MONGO_URI: "mongodb://${MONGO_USER:?Set MONGO_USER}:${MONGO_PASSWORD:?Set MONGO_PASSWORD}@mongodb:27017/heimdall_agents?authSource=admin"
       SERVER_PUBLIC_HOST: "${SERVER_PUBLIC_HOST:?Set SERVER_PUBLIC_HOST (domaine ou IP publique de ce serveur)}"
-      SERVER_PUBLIC_PORT: "4000"
+      # Port publié côté hôte (mapping ci-dessus) — utilisé dans les commandes d'installation
+      SERVER_PUBLIC_PORT: "${SERVER_PUBLIC_PORT:-4000}"
       AGENT_AUTH_TOKEN: "${AGENT_AUTH_TOKEN:?Set AGENT_AUTH_TOKEN (32+ characters)}"
       DASHBOARD_JWT_SECRET: "${DASHBOARD_JWT_SECRET:?Set DASHBOARD_JWT_SECRET (32+ characters)}"
       DEFAULT_ADMIN_EMAIL: "${DEFAULT_ADMIN_EMAIL:?Set DEFAULT_ADMIN_EMAIL}"
@@ -58,6 +61,9 @@ services:
       HEIMDALL_CVE_API: "${HEIMDALL_CVE_API:-https://cve.heimdall-security.com/api}"
       HEIMDALL_RSS_URL: "${HEIMDALL_RSS_URL:-${HEIMDALL_CVE_API:-https://cve.heimdall-security.com}/cves/rss}"
       CVE_API_KEY: "${CVE_API_KEY:-}"
+      # Requêtes CVE max/jour (1 requête = 1 crédit du plan) et CVE conservées par logiciel
+      CVE_DAILY_QUERY_BUDGET: "${CVE_DAILY_QUERY_BUDGET:-50}"
+      MAX_CVES_PER_SOFTWARE: "${MAX_CVES_PER_SOFTWARE:-50}"
       # Assistant IA facultatif : clés et contexte restent dans le conteneur.
       AI_PROVIDER: "${AI_PROVIDER:-}"
       AI_BASE_URL: "${AI_BASE_URL:-}"

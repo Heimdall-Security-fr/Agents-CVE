@@ -76,11 +76,66 @@ def _win_version() -> tuple:
 def _os_build() -> str:
     return "%d.%d.%d" % _win_version()[:3]
 
+def _win_nt_value(name: str, default=""):
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as k:
+            return winreg.QueryValueEx(k, name)[0]
+    except OSError:
+        return default
+
+def _is_windows_server() -> bool:
+    # InstallationType : « Client », « Server » ou « Server Core ». ProductName en repli
+    # (ancien Windows Server sans InstallationType).
+    itype = str(_win_nt_value("InstallationType", ""))
+    if itype:
+        return itype.lower().startswith("server")
+    return "server" in str(_win_nt_value("ProductName", "")).lower()
+
+# Build NT → millésime Windows Server (ProductName en repli pour les builds inconnus)
+_SERVER_BUILDS = {9200: "2012", 9600: "2012 R2", 14393: "2016", 17763: "2019",
+                  20348: "2022", 25398: "2022, 23H2 Edition", 26100: "2025"}
+
+def _server_year() -> str:
+    build = _win_version()[2]
+    if build in _SERVER_BUILDS:
+        return _SERVER_BUILDS[build]
+    m = re.search(r"Server\s+(\d{4}(?:\s+R2)?)", str(_win_nt_value("ProductName", "")), re.I)
+    return m.group(1) if m else ""
+
 def _windows_release() -> str:
     major, minor, build = _win_version()[:3]
+    if _is_windows_server():
+        year = _server_year()
+        return f"Server {year}" if year else "Server"
     if major == 10 and build >= 22000:
         return "11"
     return {(6, 3): "8.1", (6, 2): "8", (6, 1): "7"}.get((major, minor), str(major))
+
+def _os_software_entry():
+    """Le système lui-même, inventorié comme un logiciel pour que ses CVE soient
+    corrélées. Nom et version suivent le format des CVE Microsoft :
+    produit « Windows Server 2022 » / « Windows 11 Version 24H2 »,
+    version « 10.0.<build>.<UBR> » (UBR = niveau de mise à jour cumulative)."""
+    major, minor, build = _win_version()[:3]
+    try:
+        ubr = int(_win_nt_value("UBR", 0))
+    except (TypeError, ValueError):
+        ubr = 0
+    if _is_windows_server():
+        year = _server_year()
+        if not year:
+            return None
+        product = f"Windows Server {year}"
+        if build == 25398:  # 23H2 n'existe qu'en Server Core
+            product += " (Server Core installation)"
+    else:
+        name = "Windows 11" if major == 10 and build >= 22000 else f"Windows {_windows_release()}"
+        dv = str(_win_nt_value("DisplayVersion", "") or _win_nt_value("ReleaseId", "")).strip()
+        product = f"{name} Version {dv}" if dv else name
+    return {"vendor": "Microsoft", "product": product, "product_raw": str(_win_nt_value("ProductName", product)),
+            "version": f"{major}.{minor}.{build}.{ubr}", "kind": "os"}
 
 def _hostname() -> str:
     return socket.gethostname()
@@ -471,7 +526,8 @@ def _pip_packages():
     return packages
 
 def collect_software():
-    return _registry_software() + _pip_packages()
+    os_entry = _os_software_entry()
+    return ([os_entry] if os_entry else []) + _registry_software() + _pip_packages()
 
 # ─── Scan de ports ────────────────────────────────────────────────────────────
 COMMON_PORTS = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 1433, 1521,
@@ -896,11 +952,77 @@ def collect_outdated_software() -> dict:
         return _UPDATE_CACHE["data"]
     _UPDATE_CACHE["force"] = False
 
+    winget = _find_winget()
+    result = _winget_upgrades(winget) if winget else None
+    if result is None or not result.get("ok"):
+        # winget absent (Windows Server) ou en échec : Windows Update reste interrogeable
+        wu = _windows_update_pending()
+        if wu.get("ok") or result is None:
+            result = wu
+    _UPDATE_CACHE.update(at=time.time(), data=result)
+    return result
+
+def _find_winget():
+    """winget.exe : PATH, sinon les emplacements d'App Installer (absents du PATH sous
+    certains comptes / sur Windows Server où il a été installé à la main)."""
+    import shutil, glob
+    found = shutil.which("winget")
+    if found:
+        return found
+    local = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps", "winget.exe")
+    if os.path.isfile(local):
+        return local
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    cands = glob.glob(os.path.join(pf, "WindowsApps", "Microsoft.DesktopAppInstaller_*__8wekyb3d8bbwe", "winget.exe"))
+    return sorted(cands)[-1] if cands else None
+
+# Mises à jour Windows en attente via l'API COM Windows Update Agent (présente sur toutes
+# les éditions, Server compris ; respecte un WSUS configuré). Lecture seule.
+_WU_PS = (
+    "$s=New-Object -ComObject Microsoft.Update.Session;"
+    "$r=$s.CreateUpdateSearcher().Search(\"IsInstalled=0 and IsHidden=0 and Type='Software'\");"
+    "$o=@(foreach($u in $r.Updates){[pscustomobject]@{t=$u.Title;"
+    "kb=(@($u.KBArticleIDs)|%{'KB'+$_}) -join ','}});"
+    "$j=ConvertTo-Json -InputObject $o -Compress;"
+    # base64 : indépendant de l'encodage de la console (accents des titres en français)
+    "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($j))"
+)
+
+def _windows_update_pending() -> dict:
+    import json
+    result = {"manager": "windows_update", "ok": False, "error": "Windows Update indisponible",
+              "count": None, "items": []}
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", _WU_PS],
+            capture_output=True, text=True, errors="replace",
+            timeout=300, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = (r.stdout or "").strip()
+        if r.returncode == 0 and out:
+            import base64
+            data = json.loads(base64.b64decode(out).decode("utf-8"))
+            if isinstance(data, dict):
+                data = [data]
+            items = [{"name": str(u.get("t") or "")[:200], "id": u.get("kb") or None,
+                      "installed": None, "available": u.get("kb") or "disponible"}
+                     for u in data if isinstance(u, dict) and u.get("t")]
+            result = {"manager": "windows_update", "ok": True, "count": len(items),
+                      "items": items[:_MAX_UPDATE_ITEMS],
+                      "checked_at": datetime.now().isoformat()}
+        else:
+            result["error"] = ((r.stderr or out).strip().splitlines() or ["sortie vide"])[0][:200]
+    except subprocess.TimeoutExpired:
+        result["error"] = "délai dépassé (Windows Update)"
+    except Exception as e:
+        result["error"] = str(e)[:200]
+    return result
+
+def _winget_upgrades(winget: str) -> dict:
     result = {"manager": "winget", "ok": False, "error": "winget indisponible",
               "count": None, "items": []}
     try:
         r = subprocess.run(
-            ["winget", "upgrade", "--include-unknown", "--accept-source-agreements"],
+            [winget, "upgrade", "--include-unknown", "--accept-source-agreements"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=120, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         items = _parse_winget_table(r.stdout or "")
@@ -919,7 +1041,6 @@ def collect_outdated_software() -> dict:
         result["error"] = "délai dépassé"
     except Exception as e:
         result["error"] = str(e)[:200]
-    _UPDATE_CACHE.update(at=time.time(), data=result)
     return result
 
 # ─── Envoi du rapport ────────────────────────────────────────────────────────

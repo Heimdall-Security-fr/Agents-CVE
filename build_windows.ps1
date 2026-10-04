@@ -31,23 +31,7 @@ if (-not (Test-Path $LogoSrc)) {
 }
 if ($LogoSrc -ne "heimdall-logo.png") { Copy-Item $LogoSrc "heimdall-logo.png" -Force }
 
-@'
-from PIL import Image
-
-def make_ico():
-    logo = Image.open("heimdall-logo.png").convert("RGBA")
-    eye = logo.crop((0, 0, logo.width, int(logo.height * 0.70)))  # l'œil, sans le texte
-    sizes = [16, 32, 48, 64, 256]
-    canvas = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
-    scale = 256 / eye.width
-    eye = eye.resize((256, max(1, round(eye.height * scale))), Image.LANCZOS)
-    canvas.paste(eye, (0, (256 - eye.height) // 2), eye)
-    canvas.save("heimdall.ico", format="ICO", sizes=[(s, s) for s in sizes])
-    print("heimdall.ico créé depuis le logo.")
-
-make_ico()
-'@ | Out-File -FilePath "heimdall_icon.py" -Encoding utf8
-python heimdall_icon.py
+python make_icon.py heimdall-logo.png heimdall.ico
 
 # ── 4. Build PyInstaller ─────────────────────────────────────
 Write-Host "`n🔨  Compilation de l'agent..." -ForegroundColor Cyan

@@ -1781,7 +1781,7 @@ async function loadUpdates() {
           + '</tbody></table></td></tr>' : '';
       var checked = r.checked_at ? '<div class="text-muted" style="font-size:10px">vérifié le '+esc(new Date(r.checked_at).toLocaleString('fr-FR'))+'</div>' : '';
       var refresh = r.os === 'Windows'
-        ? ' <button class="btn btn-sm" title="Relance la vérification winget sur ce poste (transmis sous 60 s si l\'agent est en ligne)" onclick="event.stopPropagation();refreshHostUpdates(\''+esc(r.hostname).replace(/'/g,"\\'")+'\',this)">🔄 Revérifier</button>' : '';
+        ? ' <button class="btn btn-sm" title="Relance la vérification winget / Windows Update sur ce poste (transmis sous 60 s si l\'agent est en ligne)" onclick="event.stopPropagation();refreshHostUpdates(\''+esc(r.hostname).replace(/'/g,"\\'")+'\',this)">🔄 Revérifier</button>' : '';
       return '<tr'+((r.items||[]).length?' style="cursor:pointer" onclick="var e=document.getElementById(\'upd-'+i+'\');e.style.display=e.style.display===\'none\'?\'table-row\':\'none\'"':'')+'>'
         +'<td><strong>'+esc(r.hostname)+'</strong>'+checked+'</td><td>'+esc(r.os)+' '+esc(r.release||'')+'</td>'
         +'<td><span class="badge '+st[0]+'">'+st[1]+'</span>'+note+stale+'</td>'
@@ -1792,7 +1792,7 @@ async function loadUpdates() {
       +'<div class="table-wrap"><table><thead><tr><th>Serveur</th><th>OS</th><th>État</th><th>En attente</th><th>Source</th></tr></thead><tbody>'
       +(body || '<tr><td colspan="5" style="padding:24px;text-align:center;color:var(--muted)">Aucun agent n\'a encore envoyé de rapport.</td></tr>')
       +'</tbody></table></div>'
-      +'<p class="text-muted" style="font-size:12px;margin-top:12px">Cliquez sur une ligne pour voir le détail. La liste provient du gestionnaire de paquets de chaque machine (winget, apt, dnf, yum, zypper, brew). Sous Windows, elle est vérifiée au démarrage de l\'agent puis à la demande (bouton « Revérifier ») ; sous Linux/macOS, toutes les 6 h.</p>';
+      +'<p class="text-muted" style="font-size:12px;margin-top:12px">Cliquez sur une ligne pour voir le détail. La liste provient du gestionnaire de paquets de chaque machine (winget, apt, dnf, yum, zypper, brew) ; sans winget (Windows Server), ce sont les mises à jour Windows Update en attente. Sous Windows, elle est vérifiée au démarrage de l\'agent puis à la demande (bouton « Revérifier ») ; sous Linux/macOS, toutes les 6 h.</p>';
   } catch(err) { el.innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>'; }
 }
 
@@ -1850,11 +1850,49 @@ async function downloadWindowsInstaller() {
   } catch (e) { alert('Erreur réseau : ' + e.message); }
 }
 
+// Clé de déploiement (= AGENT_AUTH_TOKEN) : visible des rôles admin et deployment
+// uniquement. Masquée par défaut ; « Afficher » la place aussi dans les commandes.
+var _deployToken = null, _deployTokenShown = false;
+var TOKEN_PLACEHOLDER = '<AGENT_AUTH_TOKEN>';
+function _canDeploy() { var u = usr(); return !!u && (u.role === 'admin' || u.role === 'deployment'); }
+function _renderDeployToken() {
+  var shown = _deployTokenShown && _deployToken;
+  var keyEl = document.getElementById('deploy-token-value');
+  if (keyEl) keyEl.textContent = shown ? _deployToken : '•'.repeat(32);
+  var btn = document.getElementById('deploy-token-toggle');
+  if (btn) btn.textContent = shown ? '🙈 Masquer' : '👁 Afficher';
+  document.querySelectorAll('.deploy-tok').forEach(function(s){ s.textContent = shown ? _deployToken : TOKEN_PLACEHOLDER; });
+}
+function toggleDeployToken() { _deployTokenShown = !_deployTokenShown; _renderDeployToken(); }
+async function copyText(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {               // contexte non sécurisé (HTTP) : repli execCommand
+    var ta = document.createElement('textarea'); ta.value = text;
+    document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
+  }
+  if (btn) { var t = btn.textContent; btn.textContent = '✅ Copié'; setTimeout(function(){ btn.textContent = t; }, 1500); }
+}
+function copyDeployToken(btn) { if (_deployToken) copyText(_deployToken, btn); }
+// Copie une commande avec la vraie clé (même si elle est masquée à l'écran)
+function copyDeployCmd(id, btn) {
+  var el = document.getElementById(id); if (!el) return;
+  var txt = el.textContent;
+  if (_deployToken) txt = txt.split(TOKEN_PLACEHOLDER).join(_deployToken);
+  copyText(txt, btn);
+}
+
 async function loadDeploy() {
   const el = document.getElementById('deploy-content');
   el.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
   try {
     const info = await api('/api/server-info');
+    _deployToken = null; _deployTokenShown = false;
+    if (_canDeploy()) {
+      try { _deployToken = (await api('/api/deploy/token')).token || null; } catch (e) { _deployToken = null; }
+    }
+    const tokSpan = '<span class="deploy-tok">&lt;AGENT_AUTH_TOKEN&gt;</span>';
+    const copyBtn = function(id){ return _deployToken ? '<button class="btn btn-sm" style="margin-top:6px" onclick="copyDeployCmd(\''+id+'\',this)">📋 Copier la commande</button>' : ''; };
     const host = info.host || window.location.hostname;
     const port = info.port || '4000';
     // Schéma vu par le navigateur (derrière un reverse proxy HTTPS → https)
@@ -1863,7 +1901,15 @@ async function loadDeploy() {
     el.innerHTML =
       '<div class="deploy-step"><h3>⚙️ Informations du serveur</h3>'
       +'<div class="grid-2"><div><label style="margin-top:0">Hôte public</label><div class="code-block">'+esc(host)+'</div></div>'
-      +'<div><label style="margin-top:0">Port</label><div class="code-block">'+esc(port)+'</div></div></div></div>'
+      +'<div><label style="margin-top:0">Port</label><div class="code-block">'+esc(port)+'</div></div></div>'
+      +(_deployToken
+        ? '<label>Clé de déploiement <span class="text-muted" style="font-weight:400">(token agent, <code>AGENT_AUTH_TOKEN</code>)</span></label>'
+          +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><div class="code-block" id="deploy-token-value" style="flex:1;min-width:220px;word-break:break-all;margin:0"></div>'
+          +'<button class="btn btn-sm" id="deploy-token-toggle" onclick="toggleDeployToken()"></button>'
+          +'<button class="btn btn-sm" onclick="copyDeployToken(this)">📋 Copier</button></div>'
+          +'<p class="text-muted" style="font-size:12px;margin-top:6px">⚠️ Secret : il permet d\'enregistrer des agents et de télécharger l\'installateur. Ne le partagez qu\'avec les personnes chargées du déploiement. Chaque consultation est journalisée côté serveur.</p>'
+        : '<p class="text-muted" style="font-size:12px;margin-top:10px">La clé de déploiement n\'est visible que des rôles <strong>admin</strong> et <strong>deployment</strong>.</p>')
+      +'</div>'
 
       +'<div class="deploy-step"><h3>📥 Télécharger un agent</h3>'
       +'<div class="dl-grid">'
@@ -1873,15 +1919,22 @@ async function loadDeploy() {
       +'</div></div>'
 
       +'<div class="deploy-step"><h3>🚀 Installation Linux / macOS</h3>'
-      +'<p class="text-muted" style="font-size:12px;margin-bottom:8px">Une seule commande, aucune dépendance à installer à la main (seul <code>requests</code> est nécessaire, installé automatiquement). Le script configure le service (systemd sur Linux, launchd sur macOS), le démarre, et pose une commande <code>heimdall</code> pour le piloter ensuite. Remplacez <code>&lt;AGENT_AUTH_TOKEN&gt;</code> par le token de votre serveur.</p>'
-      +'<div class="code-block">curl -fsSL -H "x-agent-token: &lt;AGENT_AUTH_TOKEN&gt;" '+scheme+'://'+esc(host)+':'+esc(port)+'/api/download/agent/linux -o heimdall.zip &amp;&amp; unzip -o heimdall.zip -d heimdall &amp;&amp; sudo bash heimdall/install.sh</div>'
+      +'<p class="text-muted" style="font-size:12px;margin-bottom:8px">Une seule commande, aucune dépendance à installer à la main (seul <code>requests</code> est nécessaire, installé automatiquement). Le script configure le service (systemd sur Linux, launchd sur macOS), le démarre, et pose une commande <code>heimdall</code> pour le piloter ensuite. '+(_deployToken ? 'Le bouton « Copier la commande » y insère la clé de déploiement.' : 'Remplacez <code>&lt;AGENT_AUTH_TOKEN&gt;</code> par le token de votre serveur.')+'</p>'
+      +'<div class="code-block" id="deploy-cmd-linux">curl -fsSL -H "x-agent-token: '+tokSpan+'" '+scheme+'://'+esc(host)+':'+esc(port)+'/api/download/agent/linux -o heimdall.zip &amp;&amp; unzip -o heimdall.zip -d heimdall &amp;&amp; sudo bash heimdall/install.sh</div>'
+      +copyBtn('deploy-cmd-linux')
       +'<p class="text-muted" style="font-size:12px;margin-top:12px">Une fois installé, pilotez l\'agent avec :</p>'
       +'<div class="code-block">heimdall --scan            # scanner maintenant\nheimdall --status          # état de l\'agent et du service\nheimdall --configuration   # voir / modifier la configuration\nheimdall --uninstall       # désinstaller\nheimdall --help             # toutes les options</div>'
       +'<p class="text-muted" style="font-size:12px;margin-top:8px">Pour un certificat HTTPS auto-signé, ajoutez <code>verify_ssl = false</code> dans <code>[main_server]</code> de <code>/opt/heimdall-agent/agent.conf</code> (ou <code>heimdall --configuration</code>) puis <code>sudo systemctl restart heimdall-agent</code>.</p></div>'
 
       +'<div class="deploy-step"><h3>🪟 Installation Windows</h3>'
-      +'<p class="text-muted" style="font-size:12px;margin-bottom:8px">Téléchargez puis exécutez <code>Install-HeimdallAgent.ps1</code>. Il configure automatiquement le serveur, le port et le token, sans saisie manuelle.</p>'
-      +'<p class="text-muted" style="font-size:12px;margin-top:8px">L\'option « EXE seul » reste disponible pour un déploiement manuel ; dans ce cas, il faut renseigner le token dans l\'assistant.</p></div>';
+      +'<p class="text-muted" style="font-size:12px;margin-bottom:8px">Une seule commande PowerShell, sans droits administrateur : installe l\'agent dans <code>%LOCALAPPDATA%\\HeimdallAgent</code>, l\'active au démarrage de Windows et le lance.</p>'
+      +'<div class="code-block" id="deploy-cmd-win">irm -Headers @{ \'x-agent-token\' = \''+tokSpan+'\' } '+scheme+'://'+esc(host)+':'+esc(port)+'/api/install/windows.ps1 | iex</div>'
+      +copyBtn('deploy-cmd-win')
+      +'<p class="text-muted" style="font-size:12px;margin-top:12px">Ou téléchargez puis exécutez <code>Install-HeimdallAgent.ps1</code> (bouton « Télécharger l\'installateur » ci-dessus) : il configure automatiquement le serveur, le port et le token.</p>'
+      +'<p class="text-muted" style="font-size:12px;margin-top:8px">L\'option « EXE seul » reste disponible pour un déploiement manuel ; dans ce cas, il faut renseigner le token dans l\'assistant, ou en ligne de commande :</p>'
+      +'<div class="code-block" id="deploy-cmd-exe">HeimdallAgent.exe --silent --autostart --server '+esc(host)+' --port '+esc(port)+' --token '+tokSpan+httpsFlag+'</div>'
+      +copyBtn('deploy-cmd-exe')+'</div>';
+    _renderDeployToken();
   } catch(err) { el.innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>'; }
 }
 

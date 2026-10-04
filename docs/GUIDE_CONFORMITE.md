@@ -178,7 +178,8 @@ L'agent interroge le **gestionnaire de paquets local** (lecture seule, rien n'es
 
 | Système                    | Source        | Remarque                                                            |
 | -------------------------- | ------------- | ------------------------------------------------------------------- |
-| Windows                    | `winget upgrade` | Nécessite winget (App Installer, présent sur Windows 10/11 récents) |
+| Windows                    | `winget upgrade` | winget (App Installer, présent sur Windows 10/11 récents), recherché aussi hors du PATH |
+| Windows sans winget (Windows Server) | Windows Update | Mises à jour Windows en attente, via l'API Windows Update intégrée (respecte un WSUS) |
 | Debian / Ubuntu            | `apt list --upgradable` | Lit le cache local : voir ci-dessous                       |
 | RHEL / Fedora / Rocky      | `dnf` / `yum check-update` | Interroge les dépôts                                   |
 | SUSE                       | `zypper list-updates`      |                                                        |
@@ -219,7 +220,7 @@ petit retard. Elle n'est évaluée que lorsque la vérification a abouti (sinon 
 | Score très bas, beaucoup de « unknown »      | Droits insuffisants de l'agent (section 5)                          |
 | Une règle reste « unknown » alors que tout est configuré | Vérifiez collecteur, chemin/clé et plateformes cochées  |
 | Modification de règle sans effet             | Sauvegardée ? Attendre le prochain rapport de l'agent               |
-| « Vérification impossible » sur Windows      | winget absent ou bloqué (proxy, source non validée) : `winget upgrade` à la main |
+| « Vérification impossible » sur Windows      | winget et Windows Update injoignables (proxy, WSUS, service `wuauserv` arrêté) : tester `winget upgrade` ou Windows Update à la main |
 | « Vérification impossible » sur Linux        | Gestionnaire non géré (pacman, apk…) ou erreur : voir le détail dans la page |
 
 Logs de l'agent : Windows `%APPDATA%\HeimdallAgent\agent.log` — Linux : `journalctl -u heimdall-agent`.

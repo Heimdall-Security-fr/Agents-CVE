@@ -155,6 +155,9 @@ def _check_cpe_match(installed_ver: str, cpe_matches: list, product: str):
 
     product_low  = product.lower()
     product_norm = _cpe_normalize(product)
+    # Nom complet sans retrait du suffixe numérique : « Windows Server 2022 » →
+    # windows_server_2022 (le CPE NVD), là où _cpe_normalize donnerait windows_server.
+    product_full = re.sub(r'[^a-z0-9]+', '_', product_low).strip('_')
     saw_product_entry = False
 
     for cm in cpe_matches:
@@ -163,7 +166,7 @@ def _check_cpe_match(installed_ver: str, cpe_matches: list, product: str):
             continue
         # Le CPE product est déjà au format canonique (ex: "microsoft_edge").
         # On compare au nom brut ET au nom normalisé pour couvrir les deux.
-        if m_product != product_low and m_product != product_norm:
+        if m_product not in (product_low, product_norm, product_full):
             continue
         saw_product_entry = True
 
@@ -801,8 +804,10 @@ def require_agent_token(f):
         return f(*args, **kwargs)
     return decorated
 
+DEPLOY_ROLES = ("admin", "deployment")
+
 def require_admin_or_agent_token(f):
-    """Session admin (dashboard) OU token agent (curl / PowerShell d'installation)."""
+    """Session admin/deployment (dashboard) OU token agent (curl / PowerShell d'installation)."""
     @wraps(f)
     def decorated(*args, **kwargs):
         token = request.headers.get("x-agent-token")
@@ -811,8 +816,8 @@ def require_admin_or_agent_token(f):
         user, err = _get_dashboard_user()
         if not user:
             return jsonify({"error": err or "Unauthorized"}), 401
-        if user["role"] != "admin":
-            return jsonify({"error": "Accès réservé aux administrateurs"}), 403
+        if user["role"] not in DEPLOY_ROLES:
+            return jsonify({"error": "Accès réservé aux rôles admin et deployment"}), 403
         request.dashboard_user = user
         return f(*args, **kwargs)
     return decorated
@@ -1458,10 +1463,11 @@ def agent_software(hostname):
     # Construire un index: nom_produit_lower → entrée_vulnérabilité
     vuln_lookup = {}
     for v in stored_vulns:
-        raw         = v.get("software", "")        # ex. "vendor/product v1.0"
-        name_part   = raw.split("/")[-1]            # "product v1.0"
-        product_key = re.sub(r'\s+v[\d\.].*$', '', name_part, flags=re.IGNORECASE).strip().lower()
-        vuln_lookup[product_key] = v
+        product_key = v.get("product")
+        if not product_key:  # anciens documents : "vendor/product v1.0"
+            name_part   = v.get("software", "").split("/")[-1]
+            product_key = re.sub(r'\s+v[\d\.].*$', '', name_part, flags=re.IGNORECASE)
+        vuln_lookup[product_key.strip().lower()] = v
 
     enriched = []
     for sw in software_list:
@@ -1493,15 +1499,16 @@ def agent_software(hostname):
         cves_visible = []
         cves_suppressed = []
         for c in cves_raw:
-            key = (product.lower(), c.get("id", ""))
+            key = (product.lower(), c.get("cve_id") or c.get("id", ""))
             if key in suppressed_set:
                 cves_suppressed.append({**c, "suppressed": True})
             else:
                 cves_visible.append({**c, "suppressed": False})
 
         total_visible  = len(cves_visible)
-        crit_visible   = sum(1 for c in cves_visible if float(c.get("cvss",  0)) >= 9.0)
-        high_visible   = sum(1 for c in cves_visible if 7.0 <= float(c.get("cvss", 0)) < 9.0)
+        def _score(c): return float(c.get("cvss_score", c.get("cvss")) or 0)
+        crit_visible   = sum(1 for c in cves_visible if _score(c) >= 9.0)
+        high_visible   = sum(1 for c in cves_visible if 7.0 <= _score(c) < 9.0)
 
         enriched.append({
             "product":    product,
@@ -1901,6 +1908,17 @@ def server_info():
     """Retourne les infos publiques du serveur (sans le token)."""
     return jsonify({"host": SERVER_PUBLIC_HOST, "port": SERVER_PUBLIC_PORT,
                     "agent_version": AGENT_VERSION})
+
+@app.route('/api/deploy/token', methods=['GET'])
+@require_role(*DEPLOY_ROLES)
+def deploy_token():
+    """Clé de déploiement (AGENT_AUTH_TOKEN) pour la page Déploiement du dashboard.
+    Réservée aux rôles admin et deployment ; chaque consultation est journalisée."""
+    logger.info("[DEPLOY] Clé de déploiement consultée par %s (%s)",
+                request.dashboard_user["email"], request.dashboard_user["role"])
+    resp = jsonify({"token": AGENT_AUTH_TOKEN})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 def _agent_is_up_to_date(agent_version: str):
     """True/False, ou None si la version de l'agent est inconnue/illisible (agent
