@@ -1026,6 +1026,9 @@ function renderServers() {
         : (scanStatus === 'complete'
             ? '<span class="badge badge-green">Sain</span>'
             : '<span class="badge badge-gray" title="Aucune analyse CVE complète enregistrée">Non analysé</span>');
+      const hostScanBtn = _isAdmin()
+        ? '<div style="margin-top:5px"><button class="btn btn-ghost btn-sm host-cve-rescan" style="font-size:10px;padding:3px 7px" onclick="event.stopPropagation();startHostCveRescan(\''+esc(s.hostname).replace(/'/g,"\\'")+'\')" title="Relancer uniquement l’analyse CVE de cet hôte">↻ Analyser</button></div>'
+        : '';
       const osLine = '<div class="text-muted">'+esc(osIcon(s.os))+' '+esc(s.os||'?')
         + (s.release ? ' <span style="font-size:10px;opacity:.7">'+esc(s.release)+'</span>' : '')
         + '</div>'
@@ -1043,7 +1046,7 @@ function renderServers() {
         +'<td>'+hostLine+'</td>'
         +'<td><span class="badge '+(s.online?'badge-green':'badge-gray')+'">'+(s.online?'En ligne':'Hors ligne')+'</span></td>'
         +'<td>'+osLine+'</td>'
-        +'<td>'+ips+'</td><td>'+vuln+'</td>'
+        +'<td>'+ips+'</td><td>'+vuln+hostScanBtn+'</td>'
         +'<td class="text-muted" style="font-size:11px">'+esc(s.subnet||'—')+'</td>'
         +'<td>'+peers+'</td>'
         +'<td style="font-size:11px;color:var(--muted)">'+(s.last_seen ? new Date(s.last_seen).toLocaleString('fr-FR') : '—')+'</td>'
@@ -1185,23 +1188,42 @@ async function startCveRescan() {
   }
 }
 
+async function startHostCveRescan(hostname) {
+  if (!confirm('Relancer uniquement l’analyse CVE de « '+hostname+' » ? Les requêtes consommées dépendent du nombre de logiciels de cet hôte.')) return;
+  var buttons = document.querySelectorAll('.host-cve-rescan');
+  buttons.forEach(function(b){ b.disabled = true; });
+  var parkBtn = document.getElementById('btn-cve-rescan');
+  if (parkBtn) parkBtn.disabled = true;
+  try {
+    var state = await api('/api/agents/' + encodeURIComponent(hostname) + '/cve-rescan', { method: 'POST' });
+    toast('Analyse de '+hostname+' démarrée : jusqu’à '+state.estimated_requests+' requêtes CVE.', 'ok');
+    watchCveRescan();
+  } catch (err) {
+    toast(err.message, 'err');
+    buttons.forEach(function(b){ b.disabled = false; });
+    if (parkBtn) parkBtn.disabled = false;
+  }
+}
+
 async function watchCveRescan() {
   var btn = document.getElementById('btn-cve-rescan');
   try {
     var state = await api('/api/cve-rescan');
     if (state.running) {
-      btn.textContent = '⏳ Analyse ' + state.processed_hosts + '/' + state.total_hosts;
+      btn.textContent = state.target_hostname
+        ? '⏳ ' + state.target_hostname
+        : '⏳ Analyse ' + state.processed_hosts + '/' + state.total_hosts;
       setTimeout(watchCveRescan, 3000);
       return;
     }
     btn.disabled = false;
     btn.textContent = '🔎 Analyser le parc';
     if (state.error) toast('Analyse terminée avec erreur : ' + state.error, 'err');
-    else if (state.deferred_hosts) toast('Analyse CVE : ' + (state.completed_hosts || 0) + ' hôte(s) terminé(s), ' + state.deferred_hosts + ' en attente. Vérifiez la limite de postes et le quota.', 'err');
-    else toast('Analyse CVE terminée : ' + state.processed_hosts + ' serveur(s) analysé(s).', 'ok');
+    else if (state.deferred_hosts) toast((state.target_hostname ? 'Analyse de '+state.target_hostname : 'Analyse CVE') + ' en attente. Vérifiez la limite de postes et le quota.', 'err');
+    else toast(state.target_hostname ? 'Analyse CVE de '+state.target_hostname+' terminée.' : 'Analyse CVE terminée : ' + state.processed_hosts + ' serveur(s) analysé(s).', 'ok');
     loadCveQuota();
     loadVulns();
-    if (document.getElementById('page-servers').classList.contains('active')) loadServers();
+    loadServers();
   } catch (err) {
     btn.disabled = false;
     btn.textContent = '🔎 Analyser le parc';
@@ -1390,7 +1412,10 @@ function renderVulns() {
           +'<h3>'+esc(selectedAgent.hostname)+'</h3>'
           +'<div class="sub">'+esc(osIcon(selectedAgent.os))+' '+esc(selectedAgent.os||'')+' — '+sbs+' <span class="badge badge-gray">'+cves.length+' CVE</span></div>'
         +'</div>'
-        +'<button class="vuln-detail-close" onclick="selectVulnHost(null)" title="Fermer">×</button>'
+        +'<div class="flex gap-2">'
+          +(_isAdmin() ? '<button class="btn btn-primary btn-sm host-cve-rescan" onclick="startHostCveRescan(\''+esc(selectedAgent.hostname).replace(/'/g,"\\'")+'\')" title="Relancer uniquement cet hôte">↻ Analyser cet hôte</button>' : '')
+          +'<button class="vuln-detail-close" onclick="selectVulnHost(null)" title="Fermer">×</button>'
+        +'</div>'
       +'</div>'
       +'<div class="vuln-detail-body">'
         +(cveRows

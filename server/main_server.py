@@ -520,7 +520,8 @@ db_lock = nullcontext()
 _cve_rescan_lock = threading.Lock()
 _cve_rescan_status = {"running": False, "started_at": None, "finished_at": None,
                       "total_hosts": 0, "processed_hosts": 0, "completed_hosts": 0,
-                      "deferred_hosts": 0, "estimated_requests": 0, "error": None}
+                      "deferred_hosts": 0, "estimated_requests": 0,
+                      "target_hostname": None, "current_host": None, "error": None}
 
 # ─── Dashboard auth (JWT) ─────────────────────────────────────────────────────
 DASHBOARD_JWT_SECRET    = os.getenv("DASHBOARD_JWT_SECRET", "")
@@ -1296,15 +1297,18 @@ def request_updates_refresh(hostname):
         return {"error": "Agent not found"}, 404
     return jsonify({"status": "ok"}), 200
 
-def _manual_cve_rescan():
-    """Relance la corrélation depuis les inventaires déjà stockés en Mongo."""
+def _manual_cve_rescan(hostname: str | None = None):
+    """Relance la corrélation depuis les inventaires stockés, pour un hôte ou le parc."""
     global _cve_rescan_status
     try:
+        query = {"hostname": hostname} if hostname else {}
         agents = list(mongo.db.agents.find(
-            {}, {"hostname": 1, "software": 1, "os_build": 1, "cve_last_checked_at": 1}))
+            query, {"hostname": 1, "software": 1, "os_build": 1, "cve_last_checked_at": 1}))
         agents.sort(key=lambda a: (a.get("cve_last_checked_at") is not None,
                                    a.get("cve_last_checked_at") or datetime.min))
         for agent in agents:
+            with _cve_rescan_lock:
+                _cve_rescan_status["current_host"] = agent.get("hostname", "")
             vulns, complete = correlate_vulnerabilities(agent.get("software") or [], SERVER_CVE_API_KEY,
                                                         agent.get("os_build", ""), return_status=True,
                                                         hostname=agent.get("hostname", ""))
@@ -1334,6 +1338,7 @@ def _manual_cve_rescan():
         with _cve_rescan_lock:
             _cve_rescan_status["running"] = False
             _cve_rescan_status["finished_at"] = datetime.utcnow()
+            _cve_rescan_status["current_host"] = None
 
 @app.route('/api/cve-quota', methods=['GET'])
 @require_role("admin", "inspection_logs")
@@ -1386,8 +1391,37 @@ def cve_rescan():
         _cve_rescan_status = {"running": True, "started_at": datetime.utcnow(), "finished_at": None,
                               "total_hosts": len(agents), "processed_hosts": 0,
                               "completed_hosts": 0, "deferred_hosts": 0,
-                              "estimated_requests": estimate, "error": None}
+                              "estimated_requests": estimate, "target_hostname": None,
+                              "current_host": None, "error": None}
         threading.Thread(target=_manual_cve_rescan, name="ManualCveRescan", daemon=True).start()
+        return jsonify(_clean(dict(_cve_rescan_status))), 202
+
+
+@app.route('/api/agents/<hostname>/cve-rescan', methods=['POST'])
+@require_role("admin")
+def agent_cve_rescan(hostname):
+    """Lance une corrélation CVE asynchrone pour un seul inventaire."""
+    global _cve_rescan_status
+    if not SERVER_CVE_API_KEY:
+        return {"error": "CVE_API_KEY non configurée : analyse manuelle impossible."}, 400
+    with _cve_rescan_lock:
+        if _cve_rescan_status.get("running"):
+            current = _cve_rescan_status.get("current_host") or _cve_rescan_status.get("target_hostname")
+            return jsonify({**_clean(dict(_cve_rescan_status)),
+                            "error": f"Une analyse CVE est déjà en cours{f' sur {current}' if current else ''}."}), 409
+        agent = mongo.db.agents.find_one(
+            {"hostname": hostname}, {"hostname": 1, "software.product": 1})
+        if not agent:
+            return {"error": "Agent introuvable"}, 404
+        estimate = len([sw for sw in (agent.get("software") or []) if sw.get("product")])
+        _cve_rescan_status = {
+            "running": True, "started_at": datetime.utcnow(), "finished_at": None,
+            "total_hosts": 1, "processed_hosts": 0, "completed_hosts": 0,
+            "deferred_hosts": 0, "estimated_requests": estimate,
+            "target_hostname": hostname, "current_host": hostname, "error": None,
+        }
+        threading.Thread(target=_manual_cve_rescan, args=(hostname,),
+                         name=f"CveRescan-{hostname}"[:60], daemon=True).start()
         return jsonify(_clean(dict(_cve_rescan_status))), 202
 
 def _daily_cve_scheduler():
@@ -1410,6 +1444,7 @@ def _daily_cve_scheduler():
                                        "processed_hosts": 0, "completed_hosts": 0,
                                        "deferred_hosts": 0,
                                        "estimated_requests": sum(len(a.get("software") or []) for a in agents),
+                                       "target_hostname": None, "current_host": None,
                                        "error": None})
             threading.Thread(target=_manual_cve_rescan, name="DailyCveRescan", daemon=True).start()
         finally:
