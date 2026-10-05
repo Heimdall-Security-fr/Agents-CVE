@@ -1013,13 +1013,17 @@ function renderServers() {
       const crit     = s.critical_count || 0;
       const high     = s.high_count     || 0;
       const swCount  = s.software_count || 0;
+      const scanStatus = s.cve_scan_status || (cveTotal ? 'complete' : 'unknown');
       var secBadges = [];
       if (crit)     secBadges.push('<span class="badge badge-red" title="Critiques">'+crit+' crit.</span>');
       if (high)     secBadges.push('<span class="badge badge-orange" title="Élevés">'+high+' élevés</span>');
       if (cveTotal) secBadges.push('<span class="badge badge-gray" title="Total CVE">'+cveTotal+' CVE</span>');
+      if (scanStatus === 'deferred') secBadges.push('<span class="badge badge-orange" title="Analyse incomplète ou refusée ; le dernier résultat complet est conservé">Analyse en attente</span>');
       const vuln = secBadges.length
         ? secBadges.join(' ')
-        : '<span class="badge badge-green">Sain</span>';
+        : (scanStatus === 'complete'
+            ? '<span class="badge badge-green">Sain</span>'
+            : '<span class="badge badge-gray" title="Aucune analyse CVE complète enregistrée">Non analysé</span>');
       const osLine = '<div class="text-muted">'+esc(osIcon(s.os))+' '+esc(s.os||'?')
         + (s.release ? ' <span style="font-size:10px;opacity:.7">'+esc(s.release)+'</span>' : '')
         + '</div>'
@@ -1160,7 +1164,8 @@ async function loadCveQuota() {
     if (!q.configured) { el.textContent = 'Clé CVE non configurée'; return; }
     if (!q.available) { el.textContent = 'Solde CVE indisponible'; return; }
     var daily = q.daily_remaining === null ? 'illimité' : q.daily_remaining + ' / ' + q.daily_limit + ' aujourd’hui';
-    el.textContent = 'Quota : ' + daily + ' · Crédits : ' + (q.credits || 0);
+    var endpoints = q.max_endpoints == null ? '' : ' · Postes : ' + (q.endpoints_active || 0) + ' / ' + q.max_endpoints;
+    el.textContent = 'Quota : ' + daily + ' · Crédits : ' + (q.credits || 0) + endpoints;
   } catch (err) { el.textContent = 'Solde CVE indisponible'; }
 }
 
@@ -1190,9 +1195,11 @@ async function watchCveRescan() {
     btn.disabled = false;
     btn.textContent = '🔎 Analyser le parc';
     if (state.error) toast('Analyse terminée avec erreur : ' + state.error, 'err');
+    else if (state.deferred_hosts) toast('Analyse CVE : ' + (state.completed_hosts || 0) + ' hôte(s) terminé(s), ' + state.deferred_hosts + ' en attente. Vérifiez la limite de postes et le quota.', 'err');
     else toast('Analyse CVE terminée : ' + state.processed_hosts + ' serveur(s) analysé(s).', 'ok');
     loadCveQuota();
     loadVulns();
+    if (document.getElementById('page-servers').classList.contains('active')) loadServers();
   } catch (err) {
     btn.disabled = false;
     btn.textContent = '🔎 Analyser le parc';
@@ -1328,11 +1335,13 @@ function renderVulns() {
     var crit = cves.filter(function(c){ return (c.cvss_score||0)>=9; }).length;
     var high = cves.filter(function(c){ return (c.cvss_score||0)>=7 && (c.cvss_score||0)<9; }).length;
     var med  = cves.filter(function(c){ return (c.cvss_score||0)>=4 && (c.cvss_score||0)<7; }).length;
+    var pending = agent.cve_scan_status !== 'complete';
     var badges = [
       crit ? '<span class="badge badge-red">'+crit+'</span>' : '',
       high ? '<span class="badge badge-orange">'+high+'</span>' : '',
       med  ? '<span class="badge badge-yellow">'+med+'</span>' : '',
-      '<span class="badge badge-gray">'+cves.length+' CVE</span>'
+      pending ? '<span class="badge badge-orange">'+(agent.cve_scan_status === 'deferred' ? 'en attente' : 'non analysé')+'</span>' : '',
+      cves.length ? '<span class="badge badge-gray">'+cves.length+' CVE</span>' : ''
     ].filter(Boolean).join('');
     var sel = (agent.hostname === _vulnSelectedHost) ? ' selected' : '';
     return '<div class="vuln-item'+sel+'" onclick="selectVulnHost(\''+esc(agent.hostname).replace(/'/g,"\\'")+'\')">'
@@ -1355,10 +1364,12 @@ function renderVulns() {
     var crit = cves.filter(function(c){ return (c.cvss_score||0)>=9; }).length;
     var high = cves.filter(function(c){ return (c.cvss_score||0)>=7 && (c.cvss_score||0)<9; }).length;
     var med  = cves.filter(function(c){ return (c.cvss_score||0)>=4 && (c.cvss_score||0)<7; }).length;
+    var pending = selectedAgent.cve_scan_status !== 'complete';
     var sbs = [
       crit ? '<span class="badge badge-red">'+crit+' crit.</span>' : '',
       high ? '<span class="badge badge-orange">'+high+' élevé'+(high>1?'s':'')+'</span>' : '',
-      med  ? '<span class="badge badge-yellow">'+med+' moy.</span>' : ''
+      med  ? '<span class="badge badge-yellow">'+med+' moy.</span>' : '',
+      pending ? '<span class="badge badge-orange">'+(selectedAgent.cve_scan_status === 'deferred' ? 'analyse en attente' : 'non analysé')+'</span>' : ''
     ].filter(Boolean).join(' ');
     var cveRows = cves.slice().sort(function(a,b){ return (b.cvss_score||0)-(a.cvss_score||0); }).map(function(c) {
       var score = c.cvss_score;
@@ -1382,7 +1393,7 @@ function renderVulns() {
       +'<div class="vuln-detail-body">'
         +(cveRows
           ? '<table><thead><tr><th>CVE ID</th><th>Sévérité</th><th>Produit</th><th>Description</th></tr></thead><tbody>'+cveRows+'</tbody></table>'
-          : '<div style="padding:16px;color:var(--muted);font-size:13px">Aucun détail CVE disponible</div>')
+          : '<div style="padding:16px;color:var(--muted);font-size:13px">'+(pending ? 'Aucune analyse CVE complète enregistrée pour cet hôte.' : 'Aucune CVE détectée.')+'</div>')
       +'</div>';
   }
 

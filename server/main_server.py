@@ -205,6 +205,49 @@ def _is_valid_cve_doc(c: dict) -> bool:
     """Return True only if the document has a proper CVE-YYYY-NNNNN identifier."""
     return bool(_CVE_ID_RE.match(str(c.get("id", ""))))
 
+
+def _vulnerability_totals(vulnerabilities) -> dict:
+    """Rebuild denormalized counters from the stored vulnerability payload.
+
+    Older documents can contain a populated ``vulnerabilities`` array alongside
+    stale zero-valued counters. The array is the source of truth, so deriving
+    the summary at read/write boundaries keeps every dashboard page consistent.
+    """
+    totals = {"vulnerable_count": 0, "cve_count": 0,
+              "critical_count": 0, "high_count": 0}
+    if not isinstance(vulnerabilities, list):
+        return totals
+
+    for vuln in vulnerabilities:
+        if not isinstance(vuln, dict):
+            continue
+        cves = vuln.get("cves")
+        if isinstance(cves, list):
+            count = len(cves)
+            critical = high = 0
+            for cve in cves:
+                if not isinstance(cve, dict):
+                    continue
+                try:
+                    score = float(cve.get("cvss_score", cve.get("cvss", 0)) or 0)
+                except (TypeError, ValueError):
+                    score = 0
+                if score >= 9.0:
+                    critical += 1
+                elif score >= 7.0:
+                    high += 1
+        else:
+            # Compatibility with early documents which only stored aggregates.
+            count = int(vuln.get("cves_count", 0) or 0)
+            critical = int(vuln.get("critical", 0) or 0)
+            high = int(vuln.get("high", 0) or 0)
+        if count > 0:
+            totals["vulnerable_count"] += 1
+            totals["cve_count"] += count
+            totals["critical_count"] += critical
+            totals["high_count"] += high
+    return totals
+
 def _in_version_range(inst_str: str, versions: list, os_build: str = "") -> bool:
     """
     Return True if inst_str is covered by at least one 'affected' version entry.
@@ -460,8 +503,8 @@ db_lock = nullcontext()
 # exécutée hors requête HTTP et une seule analyse de parc peut tourner à la fois.
 _cve_rescan_lock = threading.Lock()
 _cve_rescan_status = {"running": False, "started_at": None, "finished_at": None,
-                      "total_hosts": 0, "processed_hosts": 0, "estimated_requests": 0,
-                      "error": None}
+                      "total_hosts": 0, "processed_hosts": 0, "completed_hosts": 0,
+                      "deferred_hosts": 0, "estimated_requests": 0, "error": None}
 
 # ─── Dashboard auth (JWT) ─────────────────────────────────────────────────────
 DASHBOARD_JWT_SECRET    = os.getenv("DASHBOARD_JWT_SECRET", "")
@@ -972,12 +1015,16 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
                         {"product": cache_key}, {"$set": {"cves": cves_raw,
                          "fetched_at": datetime.utcnow()}}, upsert=True)
                 elif resp.status_code == 429:
+                    complete = False
                     logger.warning(f"[CVE API] Quota épuisé pour {product} — analyse mise en attente.")
                 elif resp.status_code == 401:
+                    complete = False
                     logger.error(f"[CVE API] Clé API invalide/expirée pour {product} — vérifiez CVE_API_KEY.")
                 else:
+                    complete = False
                     logger.warning(f"[CVE API] HTTP {resp.status_code} pour {product}")
             except Exception as e:
+                complete = False
                 logger.warning(f"Appel API CVE échoué pour {product}: {e}")
 
         # Filtrage strict par version — pas de fallback si tout est filtré
@@ -1112,9 +1159,10 @@ def agent_report():
     }
     # Vrais totaux CVE (somme à travers tous les logiciels), pas juste le nombre
     # de logiciels vulnérables.
-    cves_total     = sum(v.get("cves_count", 0) for v in vulns)
-    critical_total = sum(v.get("critical",   0) for v in vulns)
-    high_total     = sum(v.get("high",       0) for v in vulns)
+    vuln_totals = _vulnerability_totals(vulns)
+    cves_total     = vuln_totals["cve_count"]
+    critical_total = vuln_totals["critical_count"]
+    high_total     = vuln_totals["high_count"]
 
     # Calcul de priorité : port ouvert + CVE critique = CRITIQUE
     priority_alerts = []
@@ -1149,7 +1197,11 @@ def agent_report():
         "logged_users":     logged_users,
         "compliance":       compliance,
         "inventory_changes": inventory_changes,
+        "cve_scan_status":  "complete" if cve_complete else "deferred",
+        "cve_scan_deferred": not cve_complete,
     }
+    if cve_complete:
+        report["cve_last_checked_at"] = datetime.utcnow()
     # Absent (ancien agent) → on ne l'écrit pas, pour ne pas effacer le dernier résultat connu.
     if update_check is not None:
         report["update_check"] = update_check
@@ -1168,7 +1220,7 @@ def agent_report():
             update_fields["log_tail"] = log_tail
             update_fields["log_tail_received_at"] = datetime.utcnow()
         retained_vuln_count = None
-        if not vulns and not cve_complete:
+        if not cve_complete:
             existing = mongo.db.agents.find_one({"hostname": hostname},
                                                  {"vulnerabilities": 1, "vulnerable_count": 1,
                                                   "cve_count": 1, "critical_count": 1, "high_count": 1})
@@ -1180,11 +1232,10 @@ def agent_report():
                 retained_vuln_count = existing.get("cve_count", existing.get("vulnerable_count", 0))
                 logger.info("[RAPPORT] %s: correlation incomplete; retaining %s previous CVEs", hostname, retained_vuln_count)
 
-        mongo.db.agents.update_one(
-            {"hostname": hostname},
-            {"$set": update_fields},
-            upsert=True
-        )
+        update_ops = {"$set": update_fields}
+        if cve_complete:
+            update_ops["$unset"] = {"cve_scan_error": ""}
+        mongo.db.agents.update_one({"hostname": hostname}, update_ops, upsert=True)
 
     report.pop("_id", None)
     shown_count = retained_vuln_count if retained_vuln_count is not None else cves_total
@@ -1243,21 +1294,22 @@ def _manual_cve_rescan():
                                                         hostname=agent.get("hostname", ""))
             update = {
                 "vulnerabilities": vulns,
-                "vulnerable_count": len(vulns),
-                "cve_count": sum(v.get("cves_count", 0) for v in vulns),
-                "critical_count": sum(v.get("critical", 0) for v in vulns),
-                "high_count": sum(v.get("high", 0) for v in vulns),
+                **_vulnerability_totals(vulns),
                 "cve_last_manual_scan": datetime.utcnow(),
                 "cve_last_checked_at": datetime.utcnow(),
+                "cve_scan_status": "complete",
+                "cve_scan_deferred": False,
             }
             # Si le budget s'est arrêté au milieu de l'hôte, conserver le
             # dernier résultat plutôt que de le remplacer par un faux « sain ».
             if not complete:
                 update = {"cve_last_manual_scan": datetime.utcnow(),
+                          "cve_scan_status": "deferred",
                           "cve_scan_deferred": True}
             mongo.db.agents.update_one({"hostname": agent.get("hostname", "Unknown")}, {"$set": update})
             with _cve_rescan_lock:
                 _cve_rescan_status["processed_hosts"] += 1
+                _cve_rescan_status["completed_hosts" if complete else "deferred_hosts"] += 1
     except Exception as exc:
         logger.exception("[CVE RESCAN] Échec de l'analyse manuelle")
         with _cve_rescan_lock:
@@ -1287,6 +1339,8 @@ def cve_quota():
                         "requests_used": data.get("requests_used", 0),
                         "daily_remaining": data.get("daily_remaining"),
                         "credits": data.get("credits", 0),
+                        "max_endpoints": data.get("max_endpoints"),
+                        "endpoints_active": data.get("endpoints_active"),
                         "reset_date": data.get("reset_date"),
                         "usage_history": data.get("usage_history", [])})
     except requests.RequestException as exc:
@@ -1315,6 +1369,7 @@ def cve_rescan():
                        for a in agents)
         _cve_rescan_status = {"running": True, "started_at": datetime.utcnow(), "finished_at": None,
                               "total_hosts": len(agents), "processed_hosts": 0,
+                              "completed_hosts": 0, "deferred_hosts": 0,
                               "estimated_requests": estimate, "error": None}
         threading.Thread(target=_manual_cve_rescan, name="ManualCveRescan", daemon=True).start()
         return jsonify(_clean(dict(_cve_rescan_status))), 202
@@ -1336,7 +1391,8 @@ def _daily_cve_scheduler():
                                        a.get("cve_last_checked_at") or datetime.min))
             _cve_rescan_status.update({"running": True, "started_at": datetime.utcnow(),
                                        "finished_at": None, "total_hosts": len(agents),
-                                       "processed_hosts": 0,
+                                       "processed_hosts": 0, "completed_hosts": 0,
+                                       "deferred_hosts": 0,
                                        "estimated_requests": sum(len(a.get("software") or []) for a in agents),
                                        "error": None})
             threading.Thread(target=_manual_cve_rescan, name="DailyCveRescan", daemon=True).start()
@@ -1350,6 +1406,11 @@ def list_agents():
     with db_lock:
         agents = list(mongo.db.agents.find({}, {"_id": 0, "log_tail": 0}))
     for a in agents:
+        totals = _vulnerability_totals(a.get("vulnerabilities"))
+        a.update(totals)
+        if a.get("cve_scan_status") not in ("complete", "deferred"):
+            a["cve_scan_status"] = ("deferred" if a.get("cve_scan_deferred")
+                                    else "complete" if totals["cve_count"] else "unknown")
         a["online"] = _is_online(a)
         a["agent_up_to_date"] = _agent_is_up_to_date(a.get("agent_version", ""))
     return jsonify([_clean(a) for a in agents])
@@ -1360,6 +1421,11 @@ def get_agent(hostname):
         agent = mongo.db.agents.find_one({"hostname": hostname}, {"_id": 0, "log_tail": 0})
     if not agent:
         return {"error": "Agent not found"}, 404
+    totals = _vulnerability_totals(agent.get("vulnerabilities"))
+    agent.update(totals)
+    if agent.get("cve_scan_status") not in ("complete", "deferred"):
+        agent["cve_scan_status"] = ("deferred" if agent.get("cve_scan_deferred")
+                                    else "complete" if totals["cve_count"] else "unknown")
     agent["online"] = _is_online(agent)
     return jsonify(_clean(agent))
 
@@ -2202,6 +2268,14 @@ def list_servers():
     subnet_map: dict = {}  # subnet -> [hostname, ...]
 
     for a in agents:
+        totals = _vulnerability_totals(a.get("vulnerabilities"))
+        a.update(totals)
+        if a.get("cve_scan_status") not in ("complete", "deferred"):
+            # A legacy vulnerable document was necessarily analysed. A legacy
+            # empty document has no proof of a completed scan, so do not label
+            # it healthy until a current server version checks it.
+            a["cve_scan_status"] = ("deferred" if a.get("cve_scan_deferred")
+                                    else "complete" if totals["cve_count"] else "unknown")
         a["online"] = _is_online(a)
         a["agent_up_to_date"] = _agent_is_up_to_date(a.get("agent_version", ""))
         ips = a.get("ip_addresses", [])
@@ -2254,13 +2328,22 @@ def all_vulnerabilities():
     with db_lock:
         agents = list(mongo.db.agents.find(
             {}, {"_id": 0, "hostname": 1, "os": 1, "vulnerabilities": 1,
-                 "vulnerable_count": 1, "ip_addresses": 1}
+                 "vulnerable_count": 1, "cve_count": 1, "critical_count": 1,
+                 "high_count": 1, "ip_addresses": 1, "cve_scan_status": 1,
+                 "cve_scan_deferred": 1, "cve_last_checked_at": 1}
         ))
     result = []
     for a in agents:
-        if a.get("vulnerable_count", 0) > 0:
+        totals = _vulnerability_totals(a.get("vulnerabilities"))
+        a.update(totals)
+        if a.get("cve_scan_status") not in ("complete", "deferred"):
+            a["cve_scan_status"] = ("deferred" if a.get("cve_scan_deferred")
+                                    else "complete" if totals["cve_count"] else "unknown")
+        # Keep vulnerable hosts and hosts whose scan has not completed. Healthy
+        # hosts with a confirmed scan remain omitted from this focused page.
+        if a.get("cve_count", 0) > 0 or a["cve_scan_status"] != "complete":
             result.append(_clean(a))
-    result.sort(key=lambda x: -(x.get("vulnerable_count") or 0))
+    result.sort(key=lambda x: -(x.get("cve_count") or 0))
     return jsonify(result), 200
 
 # ─── Compliance rules ─────────────────────────────────────────────────────────
