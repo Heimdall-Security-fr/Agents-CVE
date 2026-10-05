@@ -20,6 +20,22 @@ import csv
 import zipfile
 import textwrap
 import platform
+import html
+
+try:
+    from reportlab.lib import colors as pdf_colors
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+    )
+    _HAS_REPORTLAB = True
+except ImportError:
+    _HAS_REPORTLAB = False
 
 try:
     from pypdf import PdfReader
@@ -2466,6 +2482,175 @@ def _csv_response(filename: str, headers: list, rows: list):
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
+
+def _pdf_fonts():
+    """Return Unicode-capable font names when DejaVu Sans is available."""
+    regular = bold = "Helvetica"
+    if not _HAS_REPORTLAB:
+        return regular, "Helvetica-Bold"
+    candidates = [
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        (r"C:\Windows\Fonts\DejaVuSans.ttf", r"C:\Windows\Fonts\DejaVuSans-Bold.ttf"),
+    ]
+    for regular_path, bold_path in candidates:
+        if os.path.exists(regular_path) and os.path.exists(bold_path):
+            try:
+                if "HeimdallSans" not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(TTFont("HeimdallSans", regular_path))
+                    pdfmetrics.registerFont(TTFont("HeimdallSans-Bold", bold_path))
+                return "HeimdallSans", "HeimdallSans-Bold"
+            except Exception:
+                pass
+    return regular, "Helvetica-Bold"
+
+
+def _pdf_response(filename: str, title: str, subtitle: str, summary: list,
+                  headers: list, rows: list, widths: list, intro: str = ""):
+    """Build a branded, paginated PDF report from tabular export data."""
+    if not _HAS_REPORTLAB:
+        return jsonify({"error": "Export PDF indisponible : installez reportlab puis reconstruisez le serveur."}), 503
+
+    regular_font, bold_font = _pdf_fonts()
+    accent = pdf_colors.HexColor("#ff7a2f")
+    navy = pdf_colors.HexColor("#0b1328")
+    navy_light = pdf_colors.HexColor("#17223d")
+    text = pdf_colors.HexColor("#172033")
+    muted = pdf_colors.HexColor("#64748b")
+    border = pdf_colors.HexColor("#d9e1ec")
+    pale = pdf_colors.HexColor("#f4f7fb")
+
+    output = io.BytesIO()
+    page_size = landscape(A4)
+    doc = SimpleDocTemplate(
+        output, pagesize=page_size, leftMargin=13 * mm, rightMargin=13 * mm,
+        topMargin=24 * mm, bottomMargin=17 * mm,
+        title=title, author="Heimdall Security",
+        subject=subtitle,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "HeimdallTitle", parent=styles["Title"], fontName=bold_font,
+        fontSize=22, leading=26, textColor=navy, alignment=TA_LEFT,
+        spaceAfter=3 * mm,
+    )
+    subtitle_style = ParagraphStyle(
+        "HeimdallSubtitle", parent=styles["Normal"], fontName=regular_font,
+        fontSize=9, leading=13, textColor=muted, spaceAfter=5 * mm,
+    )
+    body_style = ParagraphStyle(
+        "HeimdallBody", parent=styles["BodyText"], fontName=regular_font,
+        fontSize=7.2, leading=9.2, textColor=text,
+    )
+    head_style = ParagraphStyle(
+        "HeimdallHead", parent=body_style, fontName=bold_font,
+        fontSize=7.2, leading=9, textColor=pdf_colors.white,
+    )
+    card_label_style = ParagraphStyle(
+        "HeimdallCardLabel", parent=body_style, fontSize=7, textColor=muted,
+    )
+    card_value_style = ParagraphStyle(
+        "HeimdallCardValue", parent=body_style, fontName=bold_font,
+        fontSize=14, leading=17, textColor=navy,
+    )
+
+    def para(value, style=body_style):
+        if isinstance(value, datetime):
+            value = value.strftime("%d/%m/%Y %H:%M UTC")
+        value = "—" if value is None or value == "" else str(value)
+        if len(value) > 2000:
+            value = value[:1999] + "…"
+        return Paragraph(html.escape(value).replace("\n", "<br/>"), style)
+
+    story = [
+        Paragraph(html.escape(title), title_style),
+        Paragraph(html.escape(subtitle), subtitle_style),
+    ]
+    if intro:
+        story.extend([para(intro), Spacer(1, 4 * mm)])
+
+    if summary:
+        card_width = (page_size[0] - doc.leftMargin - doc.rightMargin) / len(summary)
+        cards = [[Table([[para(label, card_label_style)], [para(value, card_value_style)]],
+                        colWidths=[card_width - 3 * mm], rowHeights=[6 * mm, 10 * mm],
+                        style=TableStyle([
+                            ("BACKGROUND", (0, 0), (-1, -1), pale),
+                            ("BOX", (0, 0), (-1, -1), 0.6, border),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 4 * mm),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 4 * mm),
+                            ("TOPPADDING", (0, 0), (-1, -1), 2 * mm),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 2 * mm),
+                        ])) for label, value in summary]]
+        summary_table = Table(cards, colWidths=[card_width] * len(summary), hAlign="LEFT")
+        summary_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3 * mm),
+        ]))
+        story.extend([summary_table, Spacer(1, 6 * mm)])
+
+    table_data = [[para(h, head_style) for h in headers]]
+    table_data.extend([[para(cell) for cell in row] for row in rows])
+    report_table = Table(table_data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+    table_commands = [
+        ("BACKGROUND", (0, 0), (-1, 0), navy_light),
+        ("TEXTCOLOR", (0, 0), (-1, 0), pdf_colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.35, border),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2 * mm),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2 * mm),
+        ("TOPPADDING", (0, 1), (-1, -1), 1.6 * mm),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 1.6 * mm),
+    ]
+    for idx, row in enumerate(rows, start=1):
+        joined = " ".join(str(v).upper() for v in row)
+        background = pdf_colors.white if idx % 2 else pale
+        if "CRITIQUE" in joined or "ÉCHEC" in joined or "ECHEC" in joined:
+            background = pdf_colors.HexColor("#fff0f0")
+        elif "ÉLEVÉ" in joined or "EN ATTENTE" in joined or "NON ANALYSÉ" in joined:
+            background = pdf_colors.HexColor("#fff7ed")
+        table_commands.append(("BACKGROUND", (0, idx), (-1, idx), background))
+    report_table.setStyle(TableStyle(table_commands))
+    story.append(report_table if rows else para("Aucune donnée disponible pour ce rapport."))
+
+    generated = datetime.utcnow().strftime("%d/%m/%Y à %H:%M UTC")
+    def decorate_page(canvas, _doc):
+        canvas.saveState()
+        width, height = page_size
+        canvas.setFillColor(navy)
+        canvas.rect(0, height - 13 * mm, width, 13 * mm, stroke=0, fill=1)
+        canvas.setFillColor(accent)
+        canvas.rect(13 * mm, height - 8.5 * mm, 2.2 * mm, 4 * mm, stroke=0, fill=1)
+        canvas.setFont(bold_font, 9)
+        canvas.setFillColor(pdf_colors.white)
+        canvas.drawString(18 * mm, height - 7.5 * mm, "HEIMDALL SECURITY")
+        canvas.setFont(regular_font, 7)
+        canvas.setFillColor(muted)
+        canvas.drawString(13 * mm, 8 * mm, f"Généré le {generated}")
+        canvas.drawRightString(width - 13 * mm, 8 * mm, f"Page {canvas.getPageNumber()}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=decorate_page, onLaterPages=decorate_page)
+    return Response(
+        output.getvalue(), mimetype="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"',
+                 "Cache-Control": "no-store"},
+    )
+
+
+def _cvss_label(score) -> str:
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return "Inconnue"
+    if value >= 9:
+        return "Critique"
+    if value >= 7:
+        return "Élevée"
+    if value >= 4:
+        return "Moyenne"
+    return "Faible"
+
 @app.route('/api/exports/servers.csv', methods=['GET'])
 @require_role("admin", "deployment", "inspection_logs", "codir")
 def export_servers_csv():
@@ -2475,22 +2660,72 @@ def export_servers_csv():
             "_id": 0, "hostname": 1, "os": 1, "release": 1, "os_build": 1,
             "ip_addresses": 1, "software_count": 1, "cve_count": 1,
             "vulnerable_count": 1, "critical_count": 1, "high_count": 1,
-            "last_seen": 1, "agent_version": 1,
+            "last_seen": 1, "agent_version": 1, "vulnerabilities": 1,
+            "cve_scan_status": 1, "cve_scan_deferred": 1,
         }))
     rows = []
     for a in sorted(agents, key=lambda x: x.get("hostname", "").lower()):
+        totals = _vulnerability_totals(a.get("vulnerabilities"))
+        status = a.get("cve_scan_status")
+        if status not in ("complete", "deferred"):
+            status = "deferred" if a.get("cve_scan_deferred") else "complete" if totals["cve_count"] else "unknown"
         rows.append([
             a.get("hostname", ""), a.get("os", ""), a.get("release", ""),
             a.get("os_build", ""), ", ".join(a.get("ip_addresses") or []),
             "En ligne" if _is_online(a) else "Hors ligne", a.get("software_count", 0),
-            a.get("cve_count", a.get("vulnerable_count", 0)), a.get("critical_count", 0),
-            a.get("high_count", 0), a.get("agent_version", ""), a.get("last_seen", ""),
+            totals["cve_count"], totals["critical_count"], totals["high_count"],
+            {"complete": "Terminée", "deferred": "En attente", "unknown": "Non analysé"}.get(status, status),
+            a.get("agent_version", ""), a.get("last_seen", ""),
         ])
     stamp = datetime.utcnow().strftime("%Y-%m-%d")
     return _csv_response(f"heimdall-inventaire-{stamp}.csv", [
         "Hôte", "OS", "Version OS", "Build", "Adresses IP", "Statut", "Logiciels",
-        "CVE", "CVE critiques", "CVE élevées", "Version agent", "Dernier relevé",
+        "CVE", "CVE critiques", "CVE élevées", "État analyse CVE", "Version agent", "Dernier relevé",
     ], rows)
+
+
+@app.route('/api/exports/servers.pdf', methods=['GET'])
+@require_role("admin", "deployment", "inspection_logs", "codir")
+def export_servers_pdf():
+    """Rapport PDF lisible de l'inventaire et de son niveau d'exposition."""
+    agents = list(mongo.db.agents.find({}, {
+        "_id": 0, "hostname": 1, "os": 1, "release": 1, "ip_addresses": 1,
+        "software_count": 1, "vulnerabilities": 1, "last_seen": 1,
+        "cve_scan_status": 1, "cve_scan_deferred": 1,
+    }))
+    rows, total_cves, total_critical, vulnerable, pending, online = [], 0, 0, 0, 0, 0
+    for a in sorted(agents, key=lambda x: x.get("hostname", "").lower()):
+        totals = _vulnerability_totals(a.get("vulnerabilities"))
+        status = a.get("cve_scan_status")
+        if status not in ("complete", "deferred"):
+            status = "deferred" if a.get("cve_scan_deferred") else "complete" if totals["cve_count"] else "unknown"
+        scan_label = {"complete": "Terminée", "deferred": "En attente", "unknown": "Non analysé"}.get(status, status)
+        is_online = _is_online(a)
+        online += int(is_online)
+        pending += int(status != "complete")
+        vulnerable += int(totals["cve_count"] > 0)
+        total_cves += totals["cve_count"]
+        total_critical += totals["critical_count"]
+        last_seen = a.get("last_seen")
+        if isinstance(last_seen, datetime):
+            last_seen = last_seen.strftime("%d/%m/%Y %H:%M")
+        rows.append([
+            a.get("hostname", ""), f"{a.get('os', '')} {a.get('release', '')}".strip(),
+            ", ".join(a.get("ip_addresses") or []), "En ligne" if is_online else "Hors ligne",
+            scan_label, a.get("software_count", 0), totals["cve_count"],
+            f"{totals['critical_count']} / {totals['high_count']}", last_seen or "—",
+        ])
+    stamp = datetime.utcnow().strftime("%Y-%m-%d")
+    return _pdf_response(
+        f"heimdall-inventaire-{stamp}.pdf", "Rapport d'inventaire du parc",
+        "État des agents, systèmes, inventaires logiciels et exposition CVE.",
+        [("Hôtes", len(agents)), ("En ligne", online), ("Hôtes vulnérables", vulnerable),
+         ("CVE / critiques", f"{total_cves} / {total_critical}"), ("Analyses en attente", pending)],
+        ["Hôte", "Système", "Adresses IP", "Statut", "Analyse CVE", "Logiciels", "CVE",
+         "Crit. / élevées", "Dernier relevé"],
+        rows, [27*mm, 34*mm, 40*mm, 20*mm, 24*mm, 17*mm, 14*mm, 22*mm, 35*mm],
+        "Ce document donne une vue synthétique du parc supervisé. Une analyse en attente ou non réalisée ne doit pas être interprétée comme une absence de vulnérabilité.",
+    )
 
 @app.route('/api/exports/vulnerabilities.csv', methods=['GET'])
 @require_role("admin", "inspection_logs", "codir")
@@ -2513,13 +2748,63 @@ def export_vulnerabilities_csv():
             for cve in cves:
                 rows.append([a.get("hostname", ""), ", ".join(a.get("ip_addresses") or []),
                              a.get("os", ""), vuln.get("product", ""), vuln.get("version", ""),
-                             cve.get("id", cve.get("cve_id", "")), cve.get("cvss", cve.get("score", "")),
+                             cve.get("id", cve.get("cve_id", "")), cve.get("cvss_score", cve.get("cvss", cve.get("score", ""))),
                              vuln.get("critical", 0), vuln.get("high", 0), cve.get("title", cve.get("description", ""))])
     stamp = datetime.utcnow().strftime("%Y-%m-%d")
     return _csv_response(f"heimdall-vulnerabilites-{stamp}.csv", [
         "Hôte", "Adresses IP", "OS", "Logiciel", "Version", "CVE", "CVSS",
         "Critiques sur le logiciel", "Élevées sur le logiciel", "Description",
     ], rows)
+
+
+@app.route('/api/exports/vulnerabilities.pdf', methods=['GET'])
+@require_role("admin", "inspection_logs", "codir")
+def export_vulnerabilities_pdf():
+    """Rapport PDF priorisé, une ligne par CVE détectée et hôte concerné."""
+    agents = list(mongo.db.agents.find({}, {
+        "_id": 0, "hostname": 1, "os": 1, "vulnerabilities": 1,
+        "cve_scan_status": 1, "cve_scan_deferred": 1,
+    }))
+    rows, critical, high, affected_hosts, pending = [], 0, 0, set(), 0
+    for a in agents:
+        totals = _vulnerability_totals(a.get("vulnerabilities"))
+        status = a.get("cve_scan_status")
+        if status not in ("complete", "deferred"):
+            status = "deferred" if a.get("cve_scan_deferred") else "complete" if totals["cve_count"] else "unknown"
+        if status != "complete":
+            pending += 1
+            if not totals["cve_count"]:
+                rows.append([a.get("hostname", ""), a.get("os", ""), "—", "—", "—",
+                             "Non analysé" if status == "unknown" else "En attente",
+                             "Aucun résultat CVE complet n'est disponible pour cet hôte."])
+        for vuln in a.get("vulnerabilities") or []:
+            product = vuln.get("product") or vuln.get("name") or "—"
+            version = vuln.get("version") or "—"
+            for cve in vuln.get("cves") or []:
+                score = cve.get("cvss_score", cve.get("cvss", cve.get("score")))
+                severity = _cvss_label(score)
+                critical += int(severity == "Critique")
+                high += int(severity == "Élevée")
+                affected_hosts.add(a.get("hostname", ""))
+                rows.append([
+                    a.get("hostname", ""), a.get("os", ""), f"{product} {version}".strip(),
+                    cve.get("cve_id", cve.get("id", "")), score if score is not None else "—",
+                    severity, (cve.get("description") or cve.get("title") or "")[:500],
+                ])
+    severity_rank = {"Critique": 0, "Élevée": 1, "Moyenne": 2, "Faible": 3,
+                     "En attente": 4, "Non analysé": 5, "Inconnue": 6}
+    rows.sort(key=lambda row: (severity_rank.get(row[5], 9), str(row[0]).lower(), str(row[3])))
+    stamp = datetime.utcnow().strftime("%Y-%m-%d")
+    cve_rows = sum(1 for row in rows if str(row[3]).startswith("CVE-"))
+    return _pdf_response(
+        f"heimdall-vulnerabilites-{stamp}.pdf", "Rapport de vulnérabilités",
+        "Vulnérabilités détectées, classées par criticité et rattachées aux hôtes concernés.",
+        [("CVE détectées", cve_rows), ("Critiques", critical), ("Élevées", high),
+         ("Hôtes affectés", len(affected_hosts)), ("Analyses en attente", pending)],
+        ["Hôte", "OS", "Produit / version", "CVE", "CVSS", "Sévérité", "Description"],
+        rows, [25*mm, 24*mm, 43*mm, 25*mm, 14*mm, 20*mm, 90*mm],
+        "Priorisez les vulnérabilités critiques et élevées, puis confirmez l'exposition réelle avant remédiation. Les résultats dépendent de la fraîcheur des inventaires et des analyses CVE.",
+    )
 
 @app.route('/api/exports/compliance.csv', methods=['GET'])
 @require_role("admin", "inspection_logs", "codir")
@@ -2548,6 +2833,52 @@ def export_compliance_csv():
         "Hôte", "Adresses IP", "OS", "ID règle", "Règle", "Sévérité", "Résultat",
         "Valeur relevée", "Valeur attendue", "Référence CIS",
     ], rows)
+
+
+@app.route('/api/exports/compliance.pdf', methods=['GET'])
+@require_role("admin", "inspection_logs", "codir")
+def export_compliance_pdf():
+    """Rapport PDF des contrôles de conformité applicables au parc."""
+    doc = mongo.db.compliance_config.find_one({"_id": "rules"}, {"_id": 0})
+    agents = list(mongo.db.agents.find({}, {
+        "_id": 0, "hostname": 1, "os": 1, "ip_addresses": 1, "compliance": 1,
+    }))
+    rules = [r for r in (doc.get("rules") if doc else DEFAULT_COMPLIANCE_RULES) if r.get("enabled", True)]
+    rows, passed, failed, unknown = [], 0, 0, 0
+    labels = {"pass": "Conforme", "fail": "Échec", "unknown": "Inconnu"}
+    severity_labels = {"critical": "Critique", "high": "Élevée",
+                       "medium": "Moyenne", "low": "Faible"}
+    for a in agents:
+        for rule in rules:
+            check = _eval_rule(rule, a.get("compliance") or {}, a.get("os", ""))
+            status = check.get("status")
+            if status == "na":
+                continue
+            passed += int(status == "pass")
+            failed += int(status == "fail")
+            unknown += int(status == "unknown")
+            rows.append([
+                a.get("hostname", ""), a.get("os", ""), check.get("name", ""),
+                severity_labels.get(str(rule.get("severity", "")).lower(), str(rule.get("severity", "")).capitalize()),
+                labels.get(status, status),
+                check.get("actual_value", "—"), check.get("expected_value", "—"),
+                rule.get("cis_ref", "—"),
+            ])
+    status_rank = {"Échec": 0, "Inconnu": 1, "Conforme": 2}
+    rows.sort(key=lambda row: (status_rank.get(row[4], 9), str(row[0]).lower(), str(row[2]).lower()))
+    applicable = passed + failed + unknown
+    score = round(passed / applicable * 100) if applicable else 0
+    stamp = datetime.utcnow().strftime("%Y-%m-%d")
+    return _pdf_response(
+        f"heimdall-conformite-{stamp}.pdf", "Rapport de conformité",
+        "Évaluation des règles de sécurité applicables aux systèmes supervisés.",
+        [("Hôtes", len(agents)), ("Contrôles", applicable), ("Conformes", passed),
+         ("Échecs", failed), ("Score global", f"{score} %")],
+        ["Hôte", "OS", "Contrôle", "Sévérité", "Résultat", "Valeur relevée",
+         "Valeur attendue", "Référence"],
+        rows, [25*mm, 25*mm, 61*mm, 20*mm, 21*mm, 33*mm, 33*mm, 27*mm],
+        "Le score global porte uniquement sur les contrôles applicables et collectés. Les résultats inconnus doivent être vérifiés avant toute conclusion de conformité.",
+    )
 
 # ─── Assistant IA (BYO model) ────────────────────────────────────────────────
 def _ai_context() -> str:
@@ -2705,8 +3036,11 @@ def _ai_exports_for(message: str) -> list:
         return []
     return [
         {"label": "Inventaire CSV", "path": "/api/exports/servers.csv", "filename": "heimdall-inventaire.csv"},
+        {"label": "Inventaire PDF", "path": "/api/exports/servers.pdf", "filename": "heimdall-inventaire.pdf"},
         {"label": "Vulnérabilités CSV", "path": "/api/exports/vulnerabilities.csv", "filename": "heimdall-vulnerabilites.csv"},
+        {"label": "Vulnérabilités PDF", "path": "/api/exports/vulnerabilities.pdf", "filename": "heimdall-vulnerabilites.pdf"},
         {"label": "Conformité CSV", "path": "/api/exports/compliance.csv", "filename": "heimdall-conformite.csv"},
+        {"label": "Conformité PDF", "path": "/api/exports/compliance.pdf", "filename": "heimdall-conformite.pdf"},
     ]
 
 @app.route('/api/ai/chat', methods=['GET'])

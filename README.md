@@ -171,8 +171,8 @@ qu'il faut pour installer un agent :
 | ----------------- | --------------------------------------------------------------------- |
 | `admin`           | Tout : utilisateurs, règles de conformité, rescan CVE, clé de déploiement, téléchargements |
 | `deployment`      | Clé de déploiement, téléchargements et installateurs, liste des serveurs et inventaire |
-| `inspection_logs` | Consultation : serveurs, vulnérabilités, conformité, mises à jour, logs des agents, exports CSV, quota CVE |
-| `codir`           | Consultation : serveurs, conformité, mises à jour, logs, exports CSV  |
+| `inspection_logs` | Consultation : serveurs, vulnérabilités, conformité, mises à jour, logs des agents, exports CSV/PDF, quota CVE |
+| `codir`           | Consultation : serveurs, conformité, mises à jour, logs, exports CSV/PDF  |
 
 Les utilisateurs et leurs rôles se gèrent depuis la page *Utilisateurs* (admin uniquement).
 

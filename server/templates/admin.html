@@ -413,7 +413,7 @@
     <div class="page" id="page-dashboard">
       <div class="header-row">
         <div><h1>Tableau de bord</h1><p>Vue d'ensemble en temps réel</p></div>
-        <div class="flex gap-2"><button class="btn btn-ghost btn-sm" onclick="downloadExport('/api/exports/servers.csv', 'heimdall-inventaire.csv')">⇩ Exporter CSV</button><button class="btn btn-ghost btn-sm" onclick="loadDashboard()">↻ Actualiser</button></div>
+        <div class="flex gap-2"><button class="btn btn-ghost btn-sm" onclick="downloadExport('/api/exports/servers.csv', 'heimdall-inventaire.csv')">⇩ CSV</button><button class="btn btn-primary btn-sm" onclick="downloadExport('/api/exports/servers.pdf', 'heimdall-inventaire.pdf')">▣ PDF</button><button class="btn btn-ghost btn-sm" onclick="loadDashboard()">↻ Actualiser</button></div>
       </div>
       <div class="cards" id="stat-cards"><div class="spinner"></div></div>
       <div class="chart-wrap mb-6" id="cve-usage-wrap" style="display:none"><div class="chart-title">Consommation API CVE — 30 jours</div><div id="cve-usage-history"></div></div>
@@ -448,7 +448,7 @@
             <button id="view-table-btn"   class="btn btn-sm btn-active" onclick="setServersView('table')">Tableau</button>
             <button id="view-network-btn" class="btn btn-sm btn-ghost"  onclick="setServersView('network')">🌐 Réseau</button>
           </div>
-          <button class="btn btn-ghost btn-sm" onclick="downloadExport('/api/exports/servers.csv', 'heimdall-inventaire.csv')">⇩ CSV</button><button class="btn btn-ghost btn-sm" onclick="loadServers()">↻</button>
+          <button class="btn btn-ghost btn-sm" onclick="downloadExport('/api/exports/servers.csv', 'heimdall-inventaire.csv')">⇩ CSV</button><button class="btn btn-primary btn-sm" onclick="downloadExport('/api/exports/servers.pdf', 'heimdall-inventaire.pdf')">▣ PDF</button><button class="btn btn-ghost btn-sm" onclick="loadServers()">↻</button>
         </div>
       </div>
       <div id="servers-content"><div class="loading-center"><div class="spinner"></div></div></div>
@@ -463,6 +463,7 @@
           <button class="btn btn-ghost btn-sm" id="btn-cve-check" onclick="checkCveConfiguration()" style="display:none" title="Vérifie l'URL et la clé CVE sans lancer d'analyse">✓ Vérifier</button>
           <button class="btn btn-primary btn-sm" id="btn-cve-rescan" onclick="startCveRescan()" style="display:none" title="Relancer l'analyse CVE depuis les inventaires déjà reçus">🔎 Analyser le parc</button>
           <button class="btn btn-ghost btn-sm" onclick="downloadExport('/api/exports/vulnerabilities.csv', 'heimdall-vulnerabilites.csv')">⇩ CSV</button>
+          <button class="btn btn-primary btn-sm" onclick="downloadExport('/api/exports/vulnerabilities.pdf', 'heimdall-vulnerabilites.pdf')">▣ PDF</button>
           <button class="btn btn-ghost btn-sm" id="btn-front-url" onclick="openFrontUrlEditor()" style="display:none" title="Configurer l'URL du site front pour les liens CVE">🔗 URL front</button>
           <button class="btn btn-ghost btn-sm" onclick="loadVulns()">↻</button>
         </div>
@@ -490,6 +491,7 @@
         <div><h1>Conformité</h1><p id="comp-subtitle">Règles de sécurité personnalisées</p></div>
         <div class="flex gap-2">
           <button class="btn btn-ghost btn-sm" onclick="downloadExport('/api/exports/compliance.csv', 'heimdall-conformite.csv')">⇩ CSV</button>
+          <button class="btn btn-primary btn-sm" onclick="downloadExport('/api/exports/compliance.pdf', 'heimdall-conformite.pdf')">▣ PDF</button>
           <button class="btn btn-ghost btn-sm" id="btn-add-rule" onclick="openRuleModal(null)" style="display:none">+ Règle</button>
           <button class="btn btn-success btn-sm" id="btn-save-rules" onclick="saveComplianceRules()" style="display:none">💾 Sauvegarder</button>
           <button class="btn btn-ghost btn-sm" id="btn-discard-rules" onclick="discardRuleChanges()" style="display:none">✕ Annuler</button>
