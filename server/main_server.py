@@ -448,10 +448,14 @@ _cve_public_prefix_lock = threading.Lock()
 _cve_budget_lock = threading.Lock()
 _cve_budget_day = None
 _cve_budget_used = 0
-CVE_DAILY_QUERY_BUDGET = max(1, int(os.getenv("CVE_DAILY_QUERY_BUDGET", "50")))
+# Plafond local facultatif de requêtes CVE/jour. 0 (défaut) = désactivé : la seule
+# limite est alors le quota du compte côté API (quota journalier du plan puis crédits).
+CVE_DAILY_QUERY_BUDGET = max(0, int(os.getenv("CVE_DAILY_QUERY_BUDGET", "0") or 0))
 
 def _claim_cve_query() -> bool:
-    """Borne les appels facturables : 50/jour par défaut, configurable."""
+    """Borne les appels facturables si CVE_DAILY_QUERY_BUDGET > 0 (désactivé par défaut)."""
+    if CVE_DAILY_QUERY_BUDGET <= 0:
+        return True
     global _cve_budget_day, _cve_budget_used
     today = datetime.utcnow().date()
     with _cve_budget_lock:

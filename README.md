@@ -140,7 +140,7 @@ s'auto-mettent à jour sur la version exposée par le serveur.
 | `HEIMDALL_CVE_API`       | `http://cve_api:5000`      | API CVE interrogée pour les corrélations (hors réseau Docker Heimdall : `https://cve.heimdall-security.com/api`) |
 | `HEIMDALL_RSS_URL`       | `http://cve_api:5000/cves/rss` | Flux RSS des nouvelles CVE (rafraîchissement du cache) |
 | `CVE_API_KEY`            | _(vide)_                   | Clé API CVE nominative — **obligatoire** pour la corrélation de vulnérabilités (sans elle, aucun appel à l'API, 0 vulnérabilité détectée) ; chaque logiciel analysé consomme 1 crédit |
-| `CVE_DAILY_QUERY_BUDGET` | `50`                       | Nombre maximal de requêtes CVE par jour pour ce serveur (les produits au-delà sont analysés le lendemain ; un même produit n'est interrogé qu'une fois par 24 h, quel que soit le nombre de postes) — à ajuster à votre plan |
+| `CVE_DAILY_QUERY_BUDGET` | `0` (désactivé)            | Plafond local facultatif de requêtes CVE par jour pour ce serveur. Désactivé par défaut : la limite est celle du compte (quota journalier du plan, puis crédits). Un même produit n'est interrogé qu'une fois par 24 h, quel que soit le nombre de postes |
 | `MAX_CVES_PER_SOFTWARE`  | `50`                       | Nombre maximal de CVE conservées par logiciel (100 max) |
 | `AI_TIMEOUT_SECONDS`     | `60`                       | Délai maximal d'une réponse de l'assistant IA (10 à 120 s) |
 | `AI_PROVIDER`            | _(vide)_                   | Assistant : `openai_compatible`, `anthropic` ou `ollama` |

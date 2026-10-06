@@ -47,8 +47,8 @@ services:
       # sans elle, aucun appel n'est fait à l'API (0 vulnérabilité détectée) plutôt
       # que de la contourner et ne jamais décompter le quota du plan payant.
       CVE_API_KEY: "${CVE_API_KEY:-}"
-      # Requêtes CVE max/jour (1 requête = 1 crédit du plan) et CVE conservées par logiciel
-      CVE_DAILY_QUERY_BUDGET: "${CVE_DAILY_QUERY_BUDGET:-50}"
+      # Plafond local de requêtes CVE/jour (0 = désactivé, limite = quota du compte) et CVE conservées par logiciel
+      CVE_DAILY_QUERY_BUDGET: "${CVE_DAILY_QUERY_BUDGET:-0}"
       MAX_CVES_PER_SOFTWARE: "${MAX_CVES_PER_SOFTWARE:-50}"
       # Assistant IA facultatif (la clé ne quitte jamais ce conteneur).
       # AI_PROVIDER: openai_compatible | anthropic | ollama
