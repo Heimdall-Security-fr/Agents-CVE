@@ -1035,6 +1035,15 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
                     mongo.db.cve_search_cache.update_one(
                         {"product": cache_key}, {"$set": {"cves": cves_raw,
                          "fetched_at": datetime.utcnow()}}, upsert=True)
+                elif resp.status_code == 400:
+                    # Nom refusé par l'API (caractères non admis) : réessayer ne changera
+                    # rien. On ne bloque pas tout l'hôte en « en attente » pour un seul
+                    # produit, et on met le refus en cache 24 h pour ne pas repayer une
+                    # requête à chaque analyse.
+                    logger.info(f"[CVE API] Nom de produit refusé par l'API, ignoré : {product}")
+                    mongo.db.cve_search_cache.update_one(
+                        {"product": cache_key}, {"$set": {"cves": [], "fetched_at": datetime.utcnow(),
+                                                          "rejected": True}}, upsert=True)
                 elif resp.status_code == 429:
                     complete = False
                     logger.warning(f"[CVE API] Quota épuisé pour {product} — analyse mise en attente.")
