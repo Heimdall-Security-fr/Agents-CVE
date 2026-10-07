@@ -1020,7 +1020,7 @@ function renderServers() {
       if (crit)     secBadges.push('<span class="badge badge-red" title="Critiques">'+crit+' crit.</span>');
       if (high)     secBadges.push('<span class="badge badge-orange" title="Élevés">'+high+' élevés</span>');
       if (cveTotal) secBadges.push('<span class="badge badge-gray" title="Total CVE">'+cveTotal+' CVE</span>');
-      if (scanStatus === 'deferred') secBadges.push('<span class="badge badge-orange" title="Analyse incomplète ou refusée ; le dernier résultat complet est conservé">Analyse en attente</span>');
+      if (scanStatus === 'deferred') secBadges.push('<span class="badge badge-orange" title="'+esc(s.cve_scan_reason || 'Analyse incomplète ou refusée')+' — le dernier résultat complet est conservé">Analyse en attente</span>');
       const vuln = secBadges.length
         ? secBadges.join(' ')
         : (scanStatus === 'complete'
@@ -1219,7 +1219,7 @@ async function watchCveRescan() {
     btn.disabled = false;
     btn.textContent = '🔎 Analyser le parc';
     if (state.error) toast('Analyse terminée avec erreur : ' + state.error, 'err');
-    else if (state.deferred_hosts) toast((state.target_hostname ? 'Analyse de '+state.target_hostname : 'Analyse CVE') + ' en attente. Vérifiez la limite de postes et le quota.', 'err');
+    else if (state.deferred_hosts) toast((state.target_hostname ? 'Analyse de '+state.target_hostname : 'Analyse CVE') + ' en attente — ' + (state.last_reason || 'raison inconnue (voir les logs du serveur agent)'), 'err');
     else toast(state.target_hostname ? 'Analyse CVE de '+state.target_hostname+' terminée.' : 'Analyse CVE terminée : ' + state.processed_hosts + ' serveur(s) analysé(s).', 'ok');
     loadCveQuota();
     loadVulns();
@@ -1364,7 +1364,7 @@ function renderVulns() {
       crit ? '<span class="badge badge-red">'+crit+'</span>' : '',
       high ? '<span class="badge badge-orange">'+high+'</span>' : '',
       med  ? '<span class="badge badge-yellow">'+med+'</span>' : '',
-      pending ? '<span class="badge badge-orange">'+(agent.cve_scan_status === 'deferred' ? 'en attente' : 'non analysé')+'</span>' : '',
+      pending ? '<span class="badge badge-orange" title="'+esc(agent.cve_scan_reason || '')+'">'+(agent.cve_scan_status === 'deferred' ? 'en attente' : 'non analysé')+'</span>' : '',
       cves.length ? '<span class="badge badge-gray">'+cves.length+' CVE</span>' : ''
     ].filter(Boolean).join('');
     var sel = (agent.hostname === _vulnSelectedHost) ? ' selected' : '';
@@ -1393,8 +1393,9 @@ function renderVulns() {
       crit ? '<span class="badge badge-red">'+crit+' crit.</span>' : '',
       high ? '<span class="badge badge-orange">'+high+' élevé'+(high>1?'s':'')+'</span>' : '',
       med  ? '<span class="badge badge-yellow">'+med+' moy.</span>' : '',
-      pending ? '<span class="badge badge-orange">'+(selectedAgent.cve_scan_status === 'deferred' ? 'analyse en attente' : 'non analysé')+'</span>' : ''
-    ].filter(Boolean).join(' ');
+      pending ? '<span class="badge badge-orange" title="'+esc(selectedAgent.cve_scan_reason || '')+'">'+(selectedAgent.cve_scan_status === 'deferred' ? 'analyse en attente' : 'non analysé')+'</span>' : ''
+    ].filter(Boolean).join(' ')
+      + (pending && selectedAgent.cve_scan_reason ? '<div class="text-muted" style="font-size:12px;margin-top:6px">⚠️ '+esc(selectedAgent.cve_scan_reason)+'</div>' : '');
     var cveRows = cves.slice().sort(function(a,b){ return (b.cvss_score||0)-(a.cvss_score||0); }).map(function(c) {
       var score = c.cvss_score;
       var cveLabel = esc(c.cve_id||'?');

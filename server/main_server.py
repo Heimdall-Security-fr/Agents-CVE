@@ -525,7 +525,8 @@ _cve_rescan_lock = threading.Lock()
 _cve_rescan_status = {"running": False, "started_at": None, "finished_at": None,
                       "total_hosts": 0, "processed_hosts": 0, "completed_hosts": 0,
                       "deferred_hosts": 0, "estimated_requests": 0,
-                      "target_hostname": None, "current_host": None, "error": None}
+                      "target_hostname": None, "current_host": None, "error": None,
+                              "last_reason": None}
 
 # ─── Dashboard auth (JWT) ─────────────────────────────────────────────────────
 DASHBOARD_JWT_SECRET    = os.getenv("DASHBOARD_JWT_SECRET", "")
@@ -971,8 +972,14 @@ def _endpoint_checkin(hostname: str, cve_api_key: str):
             return False, "refusé"
     return True, "ok"
 
+def _defer(status, reason: str):
+    """Mémorise la première raison pour laquelle l'analyse d'un hôte reste « en attente »."""
+    if status is not None and not status.get("reason"):
+        status["reason"] = reason[:300]
+
 def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: str = "",
-                              return_status: bool = False, hostname: str = ""):
+                              return_status: bool = False, hostname: str = "",
+                              status: dict | None = None):
     """Pour chaque logiciel, interroge l'API CVE publique (toujours — jamais de lecture
     directe en base). C'est ce qui fait consommer 1 requête du quota du compte
     propriétaire de `cve_api_key` (CVE_API_KEY, la clé nominative du client sur ce
@@ -980,8 +987,10 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
     payant du client (quota journalier lié au nombre de serveurs) n'est jamais décompté.
     Filtre les CVE dont la version installée est en dehors des plages affectées.
     os_build: build NT de l'OS hôte (ex: '10.0.19045 SP0'), utilisé pour les CVE
-    dont les versions affectées sont des releases Windows."""
+    dont les versions affectées sont des releases Windows.
+    status: dict facultatif, reçoit {"reason": ...} si l'analyse reste incomplète."""
     if not cve_api_key:
+        _defer(status, "CVE_API_KEY non configurée sur le serveur agent")
         logger.warning("[CVE API] Aucune clé configurée (CVE_API_KEY) — corrélation désactivée, "
                        "aucune requête ne sera comptée sur un plan client.")
         return ([], False) if return_status else []
@@ -991,6 +1000,7 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
         allowed, msg = _endpoint_checkin(hostname, cve_api_key)
         if not allowed:
             logger.error(f"[CVE API] {hostname} non analysé : {msg}")
+            _defer(status, f"Refusé par l'API CVE : {msg}")
             return ([], False) if return_status else []
     api_headers = {"x-api-key": cve_api_key}
     cache_cutoff = datetime.utcnow() - timedelta(hours=24)
@@ -1015,6 +1025,7 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
         else:
             if not _claim_cve_query():
                 complete = False
+                _defer(status, f"Plafond local CVE_DAILY_QUERY_BUDGET atteint ({CVE_DAILY_QUERY_BUDGET} requêtes/jour)")
                 logger.info("[CVE API] Budget journalier local atteint (%s requêtes) — produit reporté: %s",
                             CVE_DAILY_QUERY_BUDGET, product)
                 continue
@@ -1046,15 +1057,19 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
                                                           "rejected": True}}, upsert=True)
                 elif resp.status_code == 429:
                     complete = False
+                    _defer(status, "Quota épuisé : quota journalier du plan et crédits à 0")
                     logger.warning(f"[CVE API] Quota épuisé pour {product} — analyse mise en attente.")
                 elif resp.status_code == 401:
                     complete = False
+                    _defer(status, "Clé API CVE invalide ou expirée (CVE_API_KEY)")
                     logger.error(f"[CVE API] Clé API invalide/expirée pour {product} — vérifiez CVE_API_KEY.")
                 else:
                     complete = False
+                    _defer(status, f"API CVE : HTTP {resp.status_code} (ex. produit « {product} »)")
                     logger.warning(f"[CVE API] HTTP {resp.status_code} pour {product}")
             except Exception as e:
                 complete = False
+                _defer(status, f"API CVE injoignable : {str(e)[:150]}")
                 logger.warning(f"Appel API CVE échoué pour {product}: {e}")
 
         # Filtrage strict par version — pas de fallback si tout est filtré
@@ -1173,8 +1188,10 @@ def agent_report():
         # pour que l'utilisateur ait au moins quelque chose à voir.
         display_ips = sorted({ip for ip in candidate_ips if not _is_docker_ip(ip)})
 
+    scan_status = {}
     vulns, cve_complete = correlate_vulnerabilities(software_list, cve_api_key, os_build,
-                                                     return_status=True, hostname=hostname)
+                                                     return_status=True, hostname=hostname,
+                                                     status=scan_status)
     # Chaque rapport est déjà une sauvegarde complète dans agent_reports. On
     # calcule aussi l'écart avec le dernier inventaire pour signaler tout ajout.
     existing_agent = mongo.db.agents.find_one({"hostname": hostname}, {"software": 1}) or {}
@@ -1229,6 +1246,7 @@ def agent_report():
         "inventory_changes": inventory_changes,
         "cve_scan_status":  "complete" if cve_complete else "deferred",
         "cve_scan_deferred": not cve_complete,
+        "cve_scan_reason":  None if cve_complete else scan_status.get("reason"),
     }
     if cve_complete:
         report["cve_last_checked_at"] = datetime.utcnow()
@@ -1322,9 +1340,11 @@ def _manual_cve_rescan(hostname: str | None = None):
         for agent in agents:
             with _cve_rescan_lock:
                 _cve_rescan_status["current_host"] = agent.get("hostname", "")
+            scan_status = {}
             vulns, complete = correlate_vulnerabilities(agent.get("software") or [], SERVER_CVE_API_KEY,
                                                         agent.get("os_build", ""), return_status=True,
-                                                        hostname=agent.get("hostname", ""))
+                                                        hostname=agent.get("hostname", ""),
+                                                        status=scan_status)
             update = {
                 "vulnerabilities": vulns,
                 **_vulnerability_totals(vulns),
@@ -1332,17 +1352,22 @@ def _manual_cve_rescan(hostname: str | None = None):
                 "cve_last_checked_at": datetime.utcnow(),
                 "cve_scan_status": "complete",
                 "cve_scan_deferred": False,
+                "cve_scan_reason": None,
             }
             # Si le budget s'est arrêté au milieu de l'hôte, conserver le
             # dernier résultat plutôt que de le remplacer par un faux « sain ».
             if not complete:
                 update = {"cve_last_manual_scan": datetime.utcnow(),
                           "cve_scan_status": "deferred",
-                          "cve_scan_deferred": True}
+                          "cve_scan_deferred": True,
+                          "cve_scan_reason": scan_status.get("reason")}
             mongo.db.agents.update_one({"hostname": agent.get("hostname", "Unknown")}, {"$set": update})
             with _cve_rescan_lock:
                 _cve_rescan_status["processed_hosts"] += 1
                 _cve_rescan_status["completed_hosts" if complete else "deferred_hosts"] += 1
+                if not complete:
+                    _cve_rescan_status["last_reason"] = (f"{agent.get('hostname', '')} : "
+                                                         f"{scan_status.get('reason') or 'raison inconnue'}")
     except Exception as exc:
         logger.exception("[CVE RESCAN] Échec de l'analyse manuelle")
         with _cve_rescan_lock:
@@ -1405,7 +1430,7 @@ def cve_rescan():
                               "total_hosts": len(agents), "processed_hosts": 0,
                               "completed_hosts": 0, "deferred_hosts": 0,
                               "estimated_requests": estimate, "target_hostname": None,
-                              "current_host": None, "error": None}
+                              "current_host": None, "error": None, "last_reason": None}
         threading.Thread(target=_manual_cve_rescan, name="ManualCveRescan", daemon=True).start()
         return jsonify(_clean(dict(_cve_rescan_status))), 202
 
@@ -1432,6 +1457,7 @@ def agent_cve_rescan(hostname):
             "total_hosts": 1, "processed_hosts": 0, "completed_hosts": 0,
             "deferred_hosts": 0, "estimated_requests": estimate,
             "target_hostname": hostname, "current_host": hostname, "error": None,
+            "last_reason": None,
         }
         threading.Thread(target=_manual_cve_rescan, args=(hostname,),
                          name=f"CveRescan-{hostname}"[:60], daemon=True).start()
@@ -1458,7 +1484,7 @@ def _daily_cve_scheduler():
                                        "deferred_hosts": 0,
                                        "estimated_requests": sum(len(a.get("software") or []) for a in agents),
                                        "target_hostname": None, "current_host": None,
-                                       "error": None})
+                                       "error": None, "last_reason": None})
             threading.Thread(target=_manual_cve_rescan, name="DailyCveRescan", daemon=True).start()
         finally:
             _cve_rescan_lock.release()
@@ -2394,7 +2420,7 @@ def all_vulnerabilities():
             {}, {"_id": 0, "hostname": 1, "os": 1, "vulnerabilities": 1,
                  "vulnerable_count": 1, "cve_count": 1, "critical_count": 1,
                  "high_count": 1, "ip_addresses": 1, "cve_scan_status": 1,
-                 "cve_scan_deferred": 1, "cve_last_checked_at": 1}
+                 "cve_scan_deferred": 1, "cve_scan_reason": 1, "cve_last_checked_at": 1}
         ))
     result = []
     for a in agents:
