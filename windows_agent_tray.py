@@ -144,13 +144,20 @@ from datetime import datetime
 AGENT_VERSION = "1.0.1"  # remplacé à chaque build par la CI (voir VERSION et server/Dockerfile)
 
 # ─── Dépendances tierces ──────────────────────────────────────────────────────
+# Mode service : lancé par la tâche planifiée au démarrage de la machine, sous le compte
+# SYSTEM, sans session ouverte (session 0). Aucune fenêtre ne doit s'y afficher : une
+# boîte de dialogue y bloquerait l'agent indéfiniment, personne ne pouvant la fermer.
+SERVICE_MODE = "--service" in sys.argv[1:]
+
 def _msgbox(title, msg, icon=0x40):
     """MessageBox natif Windows via ctypes — fonctionne même sans tkinter."""
+    if SERVICE_MODE:
+        return 0
     try:
         import ctypes
-        ctypes.windll.user32.MessageBoxW(0, str(msg), str(title), icon)
+        return ctypes.windll.user32.MessageBoxW(0, str(msg), str(title), icon)
     except Exception:
-        pass
+        return 0
 
 try:
     import requests
@@ -191,7 +198,9 @@ def _dlg_info(title, msg, parent=None):
         _msgbox(title, msg, 0x40)
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
-_LOG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "HeimdallAgent")
+_PROGRAMDATA_DIR = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "HeimdallAgent")
+_LOG_DIR = (_PROGRAMDATA_DIR if SERVICE_MODE
+            else os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "HeimdallAgent"))
 os.makedirs(_LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(_LOG_DIR, "agent.log")
 
@@ -905,10 +914,10 @@ def _collect_custom_rules() -> dict:
             logger.debug(f"Collecteur '{rid}' échoué : {e}")
     return out
 
-# ─── Logiciels à mettre à jour (winget) ──────────────────────────────────────
-# `winget upgrade` liste les applications dont une version plus récente existe.
-# L'agent ne fait que lire : il n'installe rien. Absent (winget non installé,
-# Windows Server ancien…) → la vérification est simplement indiquée « non disponible ».
+# ─── Logiciels à mettre à jour (winget + Windows Update) ─────────────────────
+# Windows classique : `winget upgrade` (applications) + Windows Update (système).
+# Windows Server : Windows Update seulement (pas de winget ; les logiciels installés
+# sont inventoriés depuis le registre). L'agent ne fait que lire : il n'installe rien.
 _UPDATE_CACHE = {"at": 0.0, "data": None, "force": False}
 _MAX_UPDATE_ITEMS = 500
 
@@ -952,15 +961,33 @@ def collect_outdated_software() -> dict:
         return _UPDATE_CACHE["data"]
     _UPDATE_CACHE["force"] = False
 
-    winget = _find_winget()
-    result = _winget_upgrades(winget) if winget else None
-    if result is None or not result.get("ok"):
-        # winget absent (Windows Server) ou en échec : Windows Update reste interrogeable
-        wu = _windows_update_pending()
-        if wu.get("ok") or result is None:
-            result = wu
+    # Windows Server : pas de winget. Les logiciels installés viennent du registre (inventaire
+    # du rapport) et les mises à jour en attente de Windows Update uniquement.
+    # Windows classique : winget (applications) ET Windows Update (système), cumulés.
+    wu = _windows_update_pending()
+    if _is_windows_server():
+        result = wu
+    else:
+        winget = _find_winget()
+        wg = _winget_upgrades(winget) if winget else {
+            "manager": "winget", "ok": False, "error": "winget introuvable", "count": None, "items": []}
+        result = _merge_update_checks([wg, wu])
     _UPDATE_CACHE.update(at=time.time(), data=result)
     return result
+
+def _merge_update_checks(checks: list) -> dict:
+    """Cumule plusieurs sources (winget + Windows Update). Réussi si au moins une
+    source a répondu ; les échecs partiels sont signalés dans `error`."""
+    ok = [c for c in checks if c.get("ok")]
+    failed = [f"{c.get('manager')} : {c.get('error')}" for c in checks if not c.get("ok")]
+    if not ok:
+        return {"manager": " + ".join(c.get("manager") or "?" for c in checks), "ok": False,
+                "error": " ; ".join(failed)[:200] or "indisponible", "count": None, "items": []}
+    items = [it for c in ok for it in c.get("items") or []][:_MAX_UPDATE_ITEMS]
+    return {"manager": " + ".join(c["manager"] for c in ok), "ok": True,
+            "count": sum(c.get("count") or 0 for c in ok), "items": items,
+            "checked_at": datetime.now().isoformat(),
+            **({"error": ("partiel — " + " ; ".join(failed))[:200]} if failed else {})}
 
 def _find_winget():
     """winget.exe : PATH, sinon les emplacements d'App Installer (absents du PATH sous
@@ -1147,7 +1174,10 @@ def _set_status(msg: str, connected=None, vulns: bool = False):
 # ─── Boucle agent ────────────────────────────────────────────────────────────
 def agent_loop():
     while state.running:
-        send_report()
+        if SERVICE_MODE or not _service_running():
+            send_report()
+        else:
+            _set_status("Rapports envoyés par le service système", connected=True)
         cfg      = state.config or configparser.ConfigParser()
         try:
             interval = max(1, int(cfg.get("agent", "interval_minutes", fallback="60"))) * 60
@@ -1191,7 +1221,8 @@ def heartbeat_loop():
     """Boucle de heartbeat — s'exécute en parallèle de l'agent loop."""
     time.sleep(5)  # courte attente initiale pour laisser la config se charger
     while state.running:
-        send_heartbeat()
+        if SERVICE_MODE or not _service_running():
+            send_heartbeat()
         for _ in range(HEARTBEAT_INTERVAL):
             if not state.running:
                 break
@@ -1239,7 +1270,7 @@ def check_for_update(silent: bool = False) -> bool:
             _set_status(f"⬆️  Mise à jour v{server_version} disponible…")
             # Automatique par défaut (même comportement que les agents Linux/macOS).
             # `[agent] auto_update = false` dans agent.conf repasse en confirmation manuelle.
-            auto = _cfg_bool(cfg, "agent", "auto_update", True)
+            auto = SERVICE_MODE or _cfg_bool(cfg, "agent", "auto_update", True)
             if auto:
                 if state.tray_icon and TRAY_OK:
                     try:
@@ -1331,7 +1362,7 @@ def _do_self_update(base: str, token: str, url: str):
             os.replace(old_exe, curr_exe)
             raise
         logger.info("Mise à jour installée — redémarrage sur la nouvelle version…")
-        subprocess.Popen([curr_exe], close_fds=True,
+        subprocess.Popen([curr_exe] + (["--service"] if SERVICE_MODE else []), close_fds=True,
                          creationflags=subprocess.DETACHED_PROCESS)
         _on_quit()
     except Exception as e:
@@ -1405,6 +1436,174 @@ def _set_autostart(enable: bool):
         logger.warning(f"Démarrage automatique: {e}")
 
 
+# ─── Service : démarrage avec la machine, avant toute ouverture de session ────
+# La clé Run (ci-dessus) ne lance l'agent qu'à l'ouverture d'une session : sur un
+# serveur où personne ne se connecte, il ne tournerait jamais. Le service est une
+# tâche planifiée « au démarrage », sous le compte SYSTEM, qui lance l'agent sans
+# icône (--service). L'icône, si elle est lancée dans une session, reste l'interface
+# et laisse le service envoyer rapports et heartbeats (pas de doublon).
+_SERVICE_TASK  = "HeimdallSecurityAgentService"
+_SERVICE_MUTEX = "Global\\HeimdallAgentService"
+_SERVICE_CONF  = os.path.join(_PROGRAMDATA_DIR, "agent.conf")
+_service_installed_cache = None
+
+def _is_admin() -> bool:
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+def _service_running() -> bool:
+    """Le service tourne-t-il ? (mutex global créé par le processus --service)"""
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = k32.OpenMutexW(0x00100000, False, _SERVICE_MUTEX)  # SYNCHRONIZE
+        if h:
+            k32.CloseHandle(h)
+            return True
+        # Créé par SYSTEM : un utilisateur standard peut se voir refuser l'accès, mais
+        # le mutex existe bien (ERROR_ACCESS_DENIED), donc le service tourne.
+        return ctypes.get_last_error() == 5
+    except Exception:
+        pass
+    return False
+
+def _is_service_installed(refresh: bool = False) -> bool:
+    global _service_installed_cache
+    if _service_installed_cache is None or refresh:
+        try:
+            r = subprocess.run(["schtasks", "/Query", "/TN", _SERVICE_TASK],
+                               capture_output=True, timeout=15)
+            _service_installed_cache = r.returncode == 0
+        except Exception:
+            _service_installed_cache = False
+    return _service_installed_cache
+
+def _ps_quote(v: str) -> str:
+    return "'" + str(v).replace("'", "''") + "'"
+
+def _run_powershell(script: str, timeout: int = 60):
+    return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                           "-Command", script], capture_output=True, text=True, errors="replace",
+                          timeout=timeout)
+
+def _install_service():
+    """Crée la tâche « au démarrage » (SYSTEM) et la démarre. Droits administrateur requis.
+    Returns (ok, message)."""
+    if not _is_admin():
+        return False, "Droits administrateur requis."
+    if not config_exists():
+        return False, "Agent non configuré : renseignez d'abord le serveur et le token."
+    exe = os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)
+    try:
+        # SYSTEM ne voit pas le %APPDATA% de l'utilisateur : copie de la configuration
+        # dans ProgramData, lisible uniquement par SYSTEM et les administrateurs (token).
+        cfg = load_config()
+        os.makedirs(_PROGRAMDATA_DIR, exist_ok=True)
+        if os.path.abspath(_config_path_existing() or "") != os.path.abspath(_SERVICE_CONF):
+            with open(_SERVICE_CONF, "w", encoding="utf-8") as f:
+                cfg.write(f)
+        subprocess.run(["icacls", _SERVICE_CONF, "/inheritance:r", "/grant:r",
+                        "*S-1-5-18:F", "*S-1-5-32-544:F"], capture_output=True, timeout=15)
+        # Register-ScheduledTask plutôt que schtasks : schtasks ne sait pas retirer la
+        # limite d'exécution par défaut de 72 h, qui couperait l'agent au bout de 3 jours.
+        script = (
+            "$ErrorActionPreference='Stop';"
+            f"$a=New-ScheduledTaskAction -Execute {_ps_quote(exe)} -Argument '--service';"
+            "$t=New-ScheduledTaskTrigger -AtStartup;"
+            "$p=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest;"
+            "$s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 "
+            "-RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries "
+            "-DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew;"
+            f"Register-ScheduledTask -TaskName {_ps_quote(_SERVICE_TASK)} -Action $a -Trigger $t "
+            "-Principal $p -Settings $s -Description 'Heimdall Security Agent (demarrage de la machine)' -Force | Out-Null;"
+            f"Start-ScheduledTask -TaskName {_ps_quote(_SERVICE_TASK)}"
+        )
+        r = _run_powershell(script)
+        if r.returncode != 0:
+            return False, ((r.stderr or r.stdout).strip().splitlines() or ["échec"])[-1][:300]
+    except Exception as e:
+        return False, str(e)[:300]
+    _is_service_installed(refresh=True)
+    logger.info("Service (tâche au démarrage) installé.")
+    return True, "L'agent démarrera désormais avec la machine, avant toute ouverture de session."
+
+def _uninstall_service():
+    if not _is_admin():
+        return False, "Droits administrateur requis."
+    r = _run_powershell(
+        f"Stop-ScheduledTask -TaskName {_ps_quote(_SERVICE_TASK)} -ErrorAction SilentlyContinue;"
+        f"Unregister-ScheduledTask -TaskName {_ps_quote(_SERVICE_TASK)} -Confirm:$false -ErrorAction SilentlyContinue")
+    # Arrêt du processus --service (Stop-ScheduledTask ne suffit pas après une auto-mise à jour,
+    # le processus relancé ne dépendant plus de la tâche)
+    _run_powershell("Get-CimInstance Win32_Process -Filter \"Name='HeimdallAgent.exe'\" | "
+                    "Where-Object { $_.CommandLine -like '*--service*' } | "
+                    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+    _is_service_installed(refresh=True)
+    logger.info("Service (tâche au démarrage) retiré.")
+    return True, "Le démarrage avec la machine est désactivé."
+
+def _run_elevated_and_wait(flag: str) -> bool:
+    """Relance l'agent avec `flag` en administrateur (invite UAC) et attend sa fin."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong), ("hwnd", wintypes.HWND),
+                    ("lpVerb", wintypes.LPCWSTR), ("lpFile", wintypes.LPCWSTR),
+                    ("lpParameters", wintypes.LPCWSTR), ("lpDirectory", wintypes.LPCWSTR),
+                    ("nShow", ctypes.c_int), ("hInstApp", wintypes.HINSTANCE),
+                    ("lpIDList", ctypes.c_void_p), ("lpClass", wintypes.LPCWSTR),
+                    ("hkeyClass", wintypes.HKEY), ("dwHotKey", wintypes.DWORD),
+                    ("hIcon", wintypes.HANDLE), ("hProcess", wintypes.HANDLE)]
+    frozen = getattr(sys, "frozen", False)
+    exe = sys.executable
+    params = flag if frozen else f'"{os.path.abspath(__file__)}" {flag}'
+    info = SHELLEXECUTEINFOW(cbSize=ctypes.sizeof(SHELLEXECUTEINFOW), fMask=0x40,  # NOCLOSEPROCESS
+                             lpVerb="runas", lpFile=exe, lpParameters=params, nShow=0)
+    if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
+        return False  # UAC refusée
+    ctypes.windll.kernel32.WaitForSingleObject(info.hProcess, 120000)
+    code = wintypes.DWORD()
+    ctypes.windll.kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+    ctypes.windll.kernel32.CloseHandle(info.hProcess)
+    return code.value == 0
+
+def _on_toggle_service(_icon=None, _item=None):
+    enable = not _is_service_installed()
+    def _work():
+        ok = _run_elevated_and_wait("--service-install" if enable else "--service-uninstall")
+        _is_service_installed(refresh=True)
+        if ok:
+            _dlg_info("Heimdall — Démarrage avec la machine",
+                      "Activé : l'agent démarre désormais avec la machine, même sans session ouverte.\n"
+                      "L'icône reste disponible quand vous êtes connecté."
+                      if enable else "Désactivé : l'agent ne démarrera plus avant l'ouverture de session.")
+        else:
+            _dlg_error("Heimdall — Démarrage avec la machine",
+                       "Opération annulée ou refusée (droits administrateur requis).\n"
+                       f"Détails dans le journal : {LOG_FILE}")
+    threading.Thread(target=_work, daemon=True, name="ToggleService").start()
+
+def _run_service():
+    """Mode --service : pas d'icône ni de fenêtre, rapports + heartbeat + mises à jour."""
+    import ctypes
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, _SERVICE_MUTEX)
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        logger.info("Service déjà en cours d'exécution — sortie.")
+        return
+    logger.info(f"Agent démarré en mode service (v{AGENT_VERSION}).")
+    while state.running and not config_exists():
+        logger.error(f"Configuration introuvable ({_SERVICE_CONF}) — nouvelle tentative dans 60 s.")
+        time.sleep(60)
+    load_config()
+    threading.Thread(target=heartbeat_loop, daemon=True, name="Heartbeat").start()
+    threading.Thread(target=update_loop,    daemon=True, name="UpdateCheck").start()
+    agent_loop()
+    ctypes.windll.kernel32.CloseHandle(mutex)
+
 def _on_toggle_autostart(_icon=None, _item=None):
     """Bascule le démarrage automatique avec Windows."""
     new_val = not _is_autostart_enabled()
@@ -1456,7 +1655,11 @@ def _fmt_time(s: int) -> str:
 
 # ─── Menu tray ────────────────────────────────────────────────────────────────
 def _on_scan_now(_icon=None, _item=None):
-    state.scan_event.set()
+    if _service_running():
+        # Le service fait les envois réguliers ; un scan demandé depuis l'icône part tout de suite
+        threading.Thread(target=send_report, daemon=True, name="ScanNow").start()
+    else:
+        state.scan_event.set()
 
 def _on_open_dashboard(_icon=None, _item=None):
     webbrowser.open(_base_url())
@@ -1505,6 +1708,12 @@ def _do_uninstall():
     except Exception as e:
         logger.warning(f"_set_autostart(False) a échoué: {e}")
 
+    # 1 bis. Retirer le service (démarrage avec la machine) — demande les droits admin
+    if _is_service_installed(refresh=True):
+        ok = _uninstall_service()[0] if _is_admin() else _run_elevated_and_wait("--service-uninstall")
+        if not ok:
+            logger.warning("Service non retiré (droits administrateur refusés).")
+
     # 2. Supprimer la configuration utilisateur
     cfg_dir = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "HeimdallAgent")
     cfg_dir_appdata = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "HeimdallAgent")
@@ -1551,7 +1760,7 @@ def _on_uninstall(_icon=None, _item=None):
         "Désinstaller l'agent Heimdall ?\n\n"
         "Cette action :\n"
         "  • arrête l'agent\n"
-        "  • retire le démarrage automatique\n"
+        "  • retire le démarrage automatique (et le service, droits admin)\n"
         "  • supprime la configuration locale\n"
         "  • supprime l'exécutable (mode .exe compilé)\n\n"
         "Continuer ?"
@@ -1913,6 +2122,12 @@ def main():
                         help="HTTPS : ne pas vérifier le certificat (certificat auto-signé)")
     parser.add_argument("--no-auto-update", action="store_true",
                         help="Désactiver la mise à jour automatique (demande confirmation à la place)")
+    parser.add_argument("--service",    action="store_true",
+                        help="Mode service (sans icône) — lancé par la tâche « au démarrage »")
+    parser.add_argument("--service-install", action="store_true",
+                        help="Démarrer l'agent avec la machine, avant toute session (admin requis)")
+    parser.add_argument("--service-uninstall", action="store_true",
+                        help="Ne plus démarrer l'agent avec la machine (admin requis)")
     parser.add_argument("--logs",       action="store_true", help="Afficher les derniers logs locaux puis exit")
     parser.add_argument("-f", "--follow", action="store_true", help="Avec --logs : suivre en direct")
     parser.add_argument("--lines",      type=int, default=200, help="Avec --logs : nombre de lignes (défaut 200)")
@@ -1946,6 +2161,10 @@ def main():
     if args.install:
         install_scheduled_task()
 
+    if args.service:
+        _run_service()
+        return
+
     # Créer la racine tkinter UNE SEULE FOIS pour tout le processus
     if TKINTER_OK:
         root = tk.Tk()
@@ -1956,10 +2175,11 @@ def main():
     # Les paramètres de connexion passés en ligne de commande sont TOUJOURS pris en
     # compte. Sans assistant graphique (--silent, --once, --no-tray, tkinter absent)
     # on les enregistre directement ; sinon ils pré-remplissent l'assistant.
-    headless = args.silent or args.once or args.no_tray or not TKINTER_OK
+    service_cmd = args.service_install or args.service_uninstall
+    headless = args.silent or args.once or args.no_tray or service_cmd or not TKINTER_OK
     if args.server and headless:
         _apply_cli_config(args)
-    elif (not config_exists() or args.server) and not (args.once or args.no_tray):
+    elif (not config_exists() or args.server) and not (args.once or args.no_tray or service_cmd):
         if TKINTER_OK:
             wizard = SetupWizard(
                 state.tk_root,
@@ -1984,6 +2204,16 @@ def main():
 
     if args.autostart:
         _set_autostart(True)
+
+    if args.service_install or args.service_uninstall:
+        if not _is_admin():
+            ok = _run_elevated_and_wait("--service-install" if args.service_install else "--service-uninstall")
+        else:
+            ok, msg = _install_service() if args.service_install else _uninstall_service()
+            (logger.info if ok else logger.error)(f"Service : {msg}")
+            if not args.silent:
+                _msgbox("Heimdall — Démarrage avec la machine", msg, 0x40 if ok else 0x10)
+        sys.exit(0 if ok else 1)
 
     load_config()
 
@@ -2021,6 +2251,8 @@ def main():
         pystray.MenuItem("🗑  Désinstaller…", _on_uninstall),
         pystray.MenuItem("Démarrer avec Windows", _on_toggle_autostart,
                          checked=lambda _: _is_autostart_enabled()),
+        pystray.MenuItem("Démarrer avec la machine (sans session, admin)", _on_toggle_service,
+                         checked=lambda _: _is_service_installed()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("❌  Quitter",              _on_quit),
     )

@@ -977,6 +977,13 @@ def _defer(status, reason: str):
     if status is not None and not status.get("reason"):
         status["reason"] = reason[:300]
 
+def _epss_pct(value):
+    """EPSS (0-1) → pourcentage lisible, ou "" si inconnu."""
+    try:
+        return round(float(value) * 100, 2) if value is not None else ""
+    except (TypeError, ValueError):
+        return ""
+
 def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: str = "",
                               return_status: bool = False, hostname: str = "",
                               status: dict | None = None):
@@ -1097,7 +1104,10 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
                 # `affected_components` (CNA cvelistv5). Ainsi /api/agents/<host>/software
                 # n'a plus besoin de faire un _lookup_cve par CVE pour filtrer par version :
                 # toutes les données nécessaires sont déjà inline → fin du N+1.
+                "epss_max":   max((float(c.get("epss_score") or 0) for c in cves), default=0),
                 "cves": [{"cve_id": c.get("id"), "cvss_score": c.get("cvss_score", 0),
+                          # EPSS : probabilité d'exploitation sous 30 jours (0-1) et percentile
+                          "epss_score": c.get("epss_score"), "epss_percentile": c.get("epss_percentile"),
                           "description": c.get("description", c.get("title", "")),
                           "product": c.get("product"), "vendor": c.get("vendor"),
                           "version": c.get("version"),
@@ -1379,7 +1389,7 @@ def _manual_cve_rescan(hostname: str | None = None):
             _cve_rescan_status["current_host"] = None
 
 @app.route('/api/cve-quota', methods=['GET'])
-@require_role("admin", "inspection_logs")
+@require_role("admin", "deployment", "inspection_logs", "codir")
 def cve_quota():
     """Proxy du solde : la clé CVE ne quitte jamais le serveur agent."""
     if not SERVER_CVE_API_KEY:
@@ -1389,8 +1399,10 @@ def cve_quota():
                                 headers={"x-api-key": SERVER_CVE_API_KEY}, timeout=10)
         if response.status_code != 200:
             logger.warning("[CVE API] Vérification de configuration: HTTP %s", response.status_code)
+            detail = {401: "clé API CVE invalide", 403: "clé refusée (IP verrouillée ou compte suspendu)",
+                      404: "route introuvable (URL HEIMDALL_CVE_API ?)"}.get(response.status_code, "API en erreur")
             return jsonify({"configured": True, "available": False,
-                            "message": "API inaccessible, clé invalide ou API CVE non mise à jour."})
+                            "message": f"HTTP {response.status_code} : {detail}"})
         data = response.json()
         return jsonify({"configured": True, "available": True,
                         "daily_limit": data.get("daily_limit"),
@@ -2021,6 +2033,18 @@ def install_script_windows():
             exit 1
         }}
         Unblock-File -Path $exe
+
+        # Lancé en administrateur : l'agent démarre aussi avec la machine, avant toute
+        # ouverture de session (tâche planifiée « au démarrage », compte SYSTEM) — utile
+        # sur les serveurs où personne ne se connecte.
+        $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        if ($admin) {{
+            $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList @('--silent','--server',$server,'--port',$port,'--token',$token{https_arg},'--service-install')
+            if ($p.ExitCode -eq 0) {{ Write-Host "Démarrage avec la machine activé (avant toute ouverture de session)." -ForegroundColor Green }}
+            else {{ Write-Host "Démarrage avec la machine non activé : voir le journal de l'agent." -ForegroundColor Yellow }}
+        }} else {{
+            Write-Host "Astuce (serveurs) : relancez cette commande dans un PowerShell administrateur pour que l'agent démarre avec la machine, sans attendre une ouverture de session." -ForegroundColor Yellow
+        }}
 
         # Enregistre le serveur, démarre l'agent et active le lancement avec Windows
         Start-Process -FilePath $exe -ArgumentList @('--silent','--autostart','--server',$server,'--port',$port,'--token',$token{https_arg})
@@ -2818,15 +2842,16 @@ def export_vulnerabilities_csv():
             if not cves:
                 rows.append([a.get("hostname", ""), ", ".join(a.get("ip_addresses") or []),
                              a.get("os", ""), vuln.get("product", ""), vuln.get("version", ""),
-                             "", "", vuln.get("critical", 0), vuln.get("high", 0), ""])
+                             "", "", "", vuln.get("critical", 0), vuln.get("high", 0), ""])
             for cve in cves:
                 rows.append([a.get("hostname", ""), ", ".join(a.get("ip_addresses") or []),
                              a.get("os", ""), vuln.get("product", ""), vuln.get("version", ""),
                              cve.get("id", cve.get("cve_id", "")), cve.get("cvss_score", cve.get("cvss", cve.get("score", ""))),
+                             _epss_pct(cve.get("epss_score")),
                              vuln.get("critical", 0), vuln.get("high", 0), cve.get("title", cve.get("description", ""))])
     stamp = datetime.utcnow().strftime("%Y-%m-%d")
     return _csv_response(f"heimdall-vulnerabilites-{stamp}.csv", [
-        "Hôte", "Adresses IP", "OS", "Logiciel", "Version", "CVE", "CVSS",
+        "Hôte", "Adresses IP", "OS", "Logiciel", "Version", "CVE", "CVSS", "EPSS (%)",
         "Critiques sur le logiciel", "Élevées sur le logiciel", "Description",
     ], rows)
 
@@ -2848,7 +2873,7 @@ def export_vulnerabilities_pdf():
         if status != "complete":
             pending += 1
             if not totals["cve_count"]:
-                rows.append([a.get("hostname", ""), a.get("os", ""), "—", "—", "—",
+                rows.append([a.get("hostname", ""), a.get("os", ""), "—", "—", "—", "—",
                              "Non analysé" if status == "unknown" else "En attente",
                              "Aucun résultat CVE complet n'est disponible pour cet hôte."])
         for vuln in a.get("vulnerabilities") or []:
@@ -2863,11 +2888,12 @@ def export_vulnerabilities_pdf():
                 rows.append([
                     a.get("hostname", ""), a.get("os", ""), f"{product} {version}".strip(),
                     cve.get("cve_id", cve.get("id", "")), score if score is not None else "—",
+                    _epss_pct(cve.get("epss_score")) or "—",
                     severity, (cve.get("description") or cve.get("title") or "")[:500],
                 ])
     severity_rank = {"Critique": 0, "Élevée": 1, "Moyenne": 2, "Faible": 3,
                      "En attente": 4, "Non analysé": 5, "Inconnue": 6}
-    rows.sort(key=lambda row: (severity_rank.get(row[5], 9), str(row[0]).lower(), str(row[3])))
+    rows.sort(key=lambda row: (severity_rank.get(row[6], 9), str(row[0]).lower(), str(row[3])))
     stamp = datetime.utcnow().strftime("%Y-%m-%d")
     cve_rows = sum(1 for row in rows if str(row[3]).startswith("CVE-"))
     return _pdf_response(
@@ -2875,9 +2901,9 @@ def export_vulnerabilities_pdf():
         "Vulnérabilités détectées, classées par criticité et rattachées aux hôtes concernés.",
         [("CVE détectées", cve_rows), ("Critiques", critical), ("Élevées", high),
          ("Hôtes affectés", len(affected_hosts)), ("Analyses en attente", pending)],
-        ["Hôte", "OS", "Produit / version", "CVE", "CVSS", "Sévérité", "Description"],
-        rows, [25*mm, 24*mm, 43*mm, 25*mm, 14*mm, 20*mm, 90*mm],
-        "Priorisez les vulnérabilités critiques et élevées, puis confirmez l'exposition réelle avant remédiation. Les résultats dépendent de la fraîcheur des inventaires et des analyses CVE.",
+        ["Hôte", "OS", "Produit / version", "CVE", "CVSS", "EPSS %", "Sévérité", "Description"],
+        rows, [25*mm, 22*mm, 40*mm, 25*mm, 13*mm, 14*mm, 19*mm, 83*mm],
+        "Priorisez les vulnérabilités critiques et élevées, en commençant par celles dont l'EPSS (probabilité d'exploitation sous 30 jours) est élevé, puis confirmez l'exposition réelle avant remédiation. Les résultats dépendent de la fraîcheur des inventaires et des analyses CVE.",
     )
 
 @app.route('/api/exports/compliance.csv', methods=['GET'])

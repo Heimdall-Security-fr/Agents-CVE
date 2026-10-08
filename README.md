@@ -228,6 +228,25 @@ par navigateur.
 Autre possibilité : bouton *Télécharger l'installateur* de la page *Déploiement*, puis
 exécution de `Install-HeimdallAgent.ps1`. Le résultat est le même.
 
+**Serveurs : démarrer avec la machine, sans ouverture de session.** Par défaut, l'agent
+démarre à l'ouverture d'une session (icône dans la zone de notification). Sur un serveur où
+personne ne se connecte, il ne tournerait donc pas. Pour qu'il démarre avec la machine :
+
+- lancez la commande d'installation dans un **PowerShell administrateur** : c'est activé
+  automatiquement ;
+- ou, sur un agent déjà installé : clic droit sur l'icône → *Démarrer avec la machine*
+  (invite administrateur), ou `HeimdallAgent.exe --service-install` en administrateur.
+
+L'agent est alors lancé par une tâche planifiée « au démarrage » (`HeimdallSecurityAgentService`),
+sous le compte SYSTEM et sans icône. Il envoie les rapports et les heartbeats, et applique les
+mises à jour automatiquement. Sa configuration est copiée dans
+`C:\ProgramData\HeimdallAgent\agent.conf`, lisible uniquement par SYSTEM et les administrateurs,
+et son journal est `C:\ProgramData\HeimdallAgent\agent.log`. Quand quelqu'un ouvre une session,
+l'icône reste disponible et laisse le service faire les envois : il n'y a pas de rapport en double.
+Si vous modifiez ensuite la configuration depuis l'icône, désactivez puis réactivez *Démarrer avec
+la machine* pour la recopier dans le service. Pour le retirer : `--service-uninstall`, ou la même
+case du menu (la désinstallation de l'agent le retire aussi).
+
 **Installation manuelle.** Téléchargez l'exe seul depuis la page *Déploiement* (bouton
 *EXE seul*). Le navigateur peut afficher un avertissement SmartScreen tant que
 l'exécutable n'est pas signé (*Informations complémentaires* → *Exécuter quand même*).
@@ -247,6 +266,7 @@ HeimdallAgent.exe --silent --autostart --server <serveur> --port <port> --token 
 | `--once`      | Un seul envoi puis sortie                                             |
 | `--scan-ports` | Forcer le scan de ports                                              |
 | `--no-tray`   | Mode console, sans icône                                              |
+| `--service-install` / `--service-uninstall` | Démarrer (ou non) avec la machine, avant toute session — administrateur requis |
 | `--no-auto-update` | Redemander confirmation avant chaque mise à jour, au lieu de l'appliquer automatiquement |
 | `--logs`      | Derniers logs locaux (`--logs -f` pour suivre en direct) — aussi accessible depuis le menu de l'icône (*Voir les logs*) |
 
@@ -318,9 +338,16 @@ et la **résilience réseau** (backoff exponentiel si le serveur est injoignable
 
 Le dashboard évalue la configuration de chaque machine (pare-feu, SSH, mots de passe,
 TLS…) selon des règles modifiables, et liste les logiciels dont une version plus récente
-est disponible (winget, apt, dnf, yum, zypper, brew). Sur un Windows sans winget (cas
-habituel de Windows Server), l'agent remonte à la place les mises à jour **Windows Update**
-en attente, via l'API Windows Update intégrée (un WSUS configuré est respecté).
+est disponible :
+- **Windows (10/11)** : `winget` pour les applications **et** Windows Update pour le système, cumulés ;
+- **Windows Server** : pas de winget. Les logiciels installés sont inventoriés depuis le registre,
+  et les mises à jour en attente viennent de **Windows Update** (API intégrée, un WSUS configuré
+  est respecté) ;
+- **Linux / macOS** : apt, dnf, yum, zypper ou brew.
+
+**EPSS** : chaque CVE détectée affiche sa probabilité d'exploitation dans les 30 prochains jours
+(FIRST EPSS). Au-delà de 10 %, la CVE est signalée « exploitation probable ». À gravité CVSS égale,
+elle passe en tête de liste. L'EPSS figure aussi dans les exports CSV et PDF.
 
 **Vulnérabilités du système** : en plus des logiciels installés, chaque agent Windows
 déclare le système lui-même, par exemple « Windows Server 2022 » en version

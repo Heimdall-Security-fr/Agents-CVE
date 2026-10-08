@@ -178,8 +178,8 @@ L'agent interroge le **gestionnaire de paquets local** (lecture seule, rien n'es
 
 | Système                    | Source        | Remarque                                                            |
 | -------------------------- | ------------- | ------------------------------------------------------------------- |
-| Windows                    | `winget upgrade` | winget (App Installer, présent sur Windows 10/11 récents), recherché aussi hors du PATH |
-| Windows sans winget (Windows Server) | Windows Update | Mises à jour Windows en attente, via l'API Windows Update intégrée (respecte un WSUS) |
+| Windows 10 / 11            | `winget upgrade` + Windows Update | Applications (winget) et mises à jour système, cumulées |
+| Windows Server             | Windows Update | Pas de winget : logiciels inventoriés depuis le registre, mises à jour via l'API Windows Update (respecte un WSUS) |
 | Debian / Ubuntu            | `apt list --upgradable` | Lit le cache local : voir ci-dessous                       |
 | RHEL / Fedora / Rocky      | `dnf` / `yum check-update` | Interroge les dépôts                                   |
 | SUSE                       | `zypper list-updates`      |                                                        |
