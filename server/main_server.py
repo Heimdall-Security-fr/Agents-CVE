@@ -984,6 +984,20 @@ def _epss_pct(value):
     except (TypeError, ValueError):
         return ""
 
+# Recherche produit + version côté API (/cves/search?version=…). Désactivée une heure si
+# l'API répond sans `version_filtered` (ancienne version de l'API).
+_VERSION_PARAM_RE = re.compile(r'^[\w.\-+:~ ]{1,100}$')
+_api_version_search_off_until = 0.0
+
+def _api_version_search_enabled() -> bool:
+    return time.time() >= _api_version_search_off_until
+
+def _disable_api_version_search():
+    global _api_version_search_off_until
+    _api_version_search_off_until = time.time() + 3600
+    logger.warning("[CVE API] L'API ne gère pas encore la recherche par version — "
+                   "recherche par produit seul pendant 1 h (mettez à jour cve_api).")
+
 def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: str = "",
                               return_status: bool = False, hostname: str = "",
                               status: dict | None = None):
@@ -1017,14 +1031,20 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
         if not product:
             continue
 
-        # La limite envoyée à l'API doit couvrir le cap d'affichage ci-dessous (50 par
-        # défaut) sinon on tronque déjà à 10 côté API et le cap devient inopérant —
-        # le dashboard afficherait moins de CVE que ce que l'abonnement autorise.
-        # 100 est le maximum accepté par /cves/search (aucun coût de quota
-        # supplémentaire : 1 requête = 1 crédit, quel que soit `limit`).
-        fetch_limit = min(int(os.getenv("MAX_CVES_PER_SOFTWARE", "50")), 100)
+        # Produit + version : l'API renvoie en UNE requête toutes les CVE qui touchent
+        # cette version précise (jusqu'à 500), triées par gravité. Sans version (ou avec
+        # une API ancienne), on retombe sur les 100 CVE les plus récentes du produit,
+        # filtrées ici. 1 requête = 1 crédit, quel que soit `limit`.
+        with_version = _api_version_search_enabled() and bool(_VERSION_PARAM_RE.match(version or ""))
+        fetch_limit = 500 if with_version else min(int(os.getenv("MAX_CVES_PER_SOFTWARE", "50")), 100)
+        params = {"query": product, "type": "product", "limit": fetch_limit}
+        if with_version:
+            params["version"] = version
+            if sw.get("kind") == "os" and _parse_os_build(os_build):
+                params["os_build"] = "%d.%d.%d" % _parse_os_build(os_build)
         cves_raw = []
-        cache_key = product.strip().lower()
+        # La version fait partie de la clé : deux versions d'un même produit n'ont pas les mêmes CVE
+        cache_key = product.strip().lower() + (f"|{version.strip().lower()}" if with_version else "")
         cached = mongo.db.cve_search_cache.find_one(
             {"product": cache_key, "fetched_at": {"$gte": cache_cutoff}}, {"cves": 1})
         if cached is not None:
@@ -1037,12 +1057,19 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
                             CVE_DAILY_QUERY_BUDGET, product)
                 continue
             try:
-                resp = _cve_api_get(
-                    "/cves/search",
-                    params={"query": product, "type": "product", "limit": fetch_limit},
-                    headers=api_headers,
-                    timeout=10
-                )
+                resp = _cve_api_get("/cves/search", params=params, headers=api_headers, timeout=20)
+                # 400 « Invalid query value » = nom de produit refusé (géré plus bas) ; tout autre
+                # 400 sur une recherche avec version = paramètres version/limit non reconnus.
+                version_refused = resp.status_code == 400 and "Invalid query value" not in resp.text
+                if with_version and (version_refused or (
+                        resp.status_code == 200 and not (resp.json() or {}).get("version_filtered"))):
+                    # API (ou proxy du site) pas encore mise à jour : version refusée (400) ou
+                    # ignorée. On repasse en recherche par produit seul pour l'heure qui vient.
+                    _disable_api_version_search()
+                    params = {"query": product, "type": "product",
+                              "limit": min(int(os.getenv("MAX_CVES_PER_SOFTWARE", "50")), 100)}
+                    cache_key = product.strip().lower()
+                    resp = _cve_api_get("/cves/search", params=params, headers=api_headers, timeout=20)
                 if resp.status_code == 200:
                     raw = resp.json()
                     results = raw.get("results", []) if isinstance(raw, dict) else raw
@@ -1089,6 +1116,8 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
         # 50 est un plafond raisonnable pour éviter d'exploser la taille du doc Mongo
         # sur des logiciels avec beaucoup d'historique de CVE.
         cap = int(os.getenv("MAX_CVES_PER_SOFTWARE", "50"))
+        # Les plus graves d'abord (CVSS puis EPSS) avant d'appliquer le plafond de stockage
+        cves_filtered.sort(key=lambda c: (-float(c.get("cvss_score") or 0), -float(c.get("epss_score") or 0)))
         cves = cves_filtered[:cap]
 
         if cves:

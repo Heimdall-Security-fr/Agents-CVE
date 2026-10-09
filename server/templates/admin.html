@@ -189,14 +189,28 @@
     .filter-btn.active { background:rgba(var(--accent-rgb),.15); color:var(--accent); border-color:rgba(var(--accent-rgb),.4); box-shadow:0 0 0 1px rgba(var(--accent-rgb),.1); }
 
     /* Network map */
-    .subnet-block { background:var(--surface); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); border:1px solid var(--border); border-radius:12px; overflow:hidden; margin-bottom:12px; }
-    .subnet-header { padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px; background:rgba(var(--accent-2-rgb),.06); }
-    .subnet-nodes { padding:16px; display:flex; flex-wrap:wrap; gap:10px; }
-    .node-card { display:flex; align-items:center; gap:8px; padding:10px 14px; border-radius:8px; border:1px solid var(--border); background:rgba(10,18,36,.5); min-width:140px; }
-    .node-card.online  { border-color:rgba(74,222,128,.25); background:rgba(74,222,128,.05); }
-    .node-card.offline { opacity:.55; }
-    .node-hostname { font-size:12px; font-family:monospace; color:var(--text); }
-    .node-ip { font-size:10px; color:var(--muted); }
+    .network-toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:10px; }
+    .network-toolbar .hint { color:var(--muted); font-size:11px; margin-right:auto; }
+    .network-layout { display:grid; grid-template-columns:minmax(0,1fr) 270px; gap:12px; }
+    .network-viewport { height:min(680px,70vh); min-height:430px; overflow:hidden; position:relative; border:1px solid var(--border-strong); border-radius:14px; background:radial-gradient(circle at center,rgba(77,108,240,.1),transparent 65%),#0b142a; cursor:grab; touch-action:none; }
+    .network-viewport.dragging { cursor:grabbing; }
+    .network-world { position:absolute; left:0; top:0; width:1600px; height:1100px; transform-origin:0 0; background-image:radial-gradient(rgba(141,160,192,.19) 1px,transparent 1px); background-size:26px 26px; }
+    .network-lines { position:absolute; inset:0; width:100%; height:100%; overflow:visible; pointer-events:none; }
+    .network-subnet { position:absolute; border:1px solid rgba(77,108,240,.3); border-radius:30px; background:rgba(77,108,240,.055); pointer-events:none; }
+    .network-subnet-name { position:absolute; top:14px; left:18px; font-size:12px; font-weight:700; color:#aac0ff; font-family:monospace; }
+    .network-node { position:absolute; width:174px; min-height:150px; padding:12px; border:1px solid rgba(141,160,192,.4); border-radius:22px; background:#15213a; box-shadow:0 12px 28px rgba(0,0,0,.3); cursor:grab; user-select:none; touch-action:none; }
+    .network-node.online { border-color:rgba(74,222,128,.5); }
+    .network-node.selected { outline:2px solid var(--accent); z-index:3; }
+    .network-node:focus-visible { outline:2px solid var(--accent); }
+    .network-node .node-title { display:flex; align-items:center; gap:5px; font-weight:700; font-size:12px; overflow-wrap:anywhere; }
+    .network-node .node-ip { color:#b9c8e4; font-family:monospace; font-size:11px; margin-top:7px; overflow-wrap:anywhere; }
+    .network-node .node-ports { display:flex; flex-wrap:wrap; gap:4px; margin-top:9px; }
+    .network-node .node-ports span { color:#c7d7ff; background:rgba(77,108,240,.2); border-radius:6px; padding:2px 5px; font-size:10px; }
+    .network-inspector { padding:16px; background:var(--surface); border:1px solid var(--border); border-radius:12px; align-self:start; min-width:0; overflow-wrap:anywhere; }
+    .network-inspector h3 { margin-bottom:12px; font-size:14px; }
+    .network-inspector .field { margin-top:12px; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+    .network-inspector .value { margin-top:4px; font-size:12px; color:var(--text); }
+    @media(max-width:900px) { .network-layout { grid-template-columns:1fr; } .network-viewport { height:540px; } }
 
     /* Compliance */
     .plat-filter { display:flex; gap:6px; margin-bottom:16px; flex-wrap:wrap; }
@@ -332,6 +346,12 @@
     .vuln-detail-body { max-height:calc(100vh - 320px); overflow-y:auto; }
     .vuln-detail-body table { width:100%; }
     .vuln-detail-body th { position:sticky; top:0; z-index:1; background:#0e1530; }
+    .vuln-product { margin:12px; border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+    .vuln-product summary { cursor:pointer; padding:12px 14px; background:rgba(77,108,240,.09); font-weight:600; display:flex; align-items:center; gap:8px; }
+    .vuln-product summary::marker { color:var(--accent); }
+    .vuln-product .table-wrap { border:0; border-radius:0; overflow-x:auto; }
+    .cve-detail-link { color:var(--accent); font-weight:600; text-decoration:none; white-space:nowrap; }
+    .cve-detail-link:hover { text-decoration:underline; }
 
     @media (max-width:768px) {
       .vuln-layout { grid-template-columns:1fr; }
@@ -979,6 +999,12 @@ async function loadDashboard() {
 /* ── Servers ── */
 var _serversData = { servers: [], subnet_map: {} };
 var _serversView = 'table';
+var _networkZoom = 1;
+var _networkOffset = { x: 24, y: 24 };
+var _networkNodes = [];
+var _networkSelected = null;
+var _networkPositions = {};
+try { _networkPositions = JSON.parse(localStorage.getItem('heimdall-network-positions') || '{}') || {}; } catch(e) {}
 
 function setServersView(v) {
   _serversView = v;
@@ -1012,6 +1038,10 @@ function renderServers() {
     var paged = paginate(servers, _paging, 'servers');
     const rows = paged.slice.map(function(s) {
       const ips   = (s.ip_addresses||[]).map(function(ip){ return '<span class="code">'+esc(ip)+'</span>'; }).join(' ') || '<span class="text-muted">—</span>';
+      const ports = (s.open_ports||[]).length
+        ? (s.open_ports||[]).slice(0,6).map(function(p){ return '<span class="badge badge-blue" style="margin:2px">:'+esc(p)+'</span>'; }).join('')
+          + ((s.open_ports||[]).length>6 ? '<span class="text-muted">+'+((s.open_ports||[]).length-6)+'</span>' : '')
+        : '<span class="text-muted" title="Scan non effectué ou aucun port détecté">—</span>';
       const peers = (s.subnet_peers||[]).length
         ? s.subnet_peers.slice(0,3).map(function(p){ return '<button class="badge badge-gray" style="font-size:10px;cursor:pointer" title="Supprimer ce lien supposé" onclick="event.stopPropagation();removeNetworkLink(\''+esc(s.hostname).replace(/'/g,"\\'")+'\',\''+esc(p).replace(/'/g,"\\'")+'\')">'+esc(p)+' ×</button>'; }).join(' ')
           + (s.subnet_peers.length>3 ? ' <span class="text-muted" style="font-size:11px">+'+s.subnet_peers.length+'</span>':'')
@@ -1053,49 +1083,170 @@ function renderServers() {
         +'<td>'+hostLine+'</td>'
         +'<td><span class="badge '+(s.online?'badge-green':'badge-gray')+'">'+(s.online?'En ligne':'Hors ligne')+'</span></td>'
         +'<td>'+osLine+'</td>'
-        +'<td>'+ips+'</td><td>'+vuln+hostScanBtn+'</td>'
+        +'<td>'+ips+'</td><td>'+ports+'</td><td>'+vuln+hostScanBtn+'</td>'
         +'<td class="text-muted" style="font-size:11px">'+esc(s.subnet||'—')+'</td>'
         +'<td>'+peers+'</td>'
         +'<td style="font-size:11px;color:var(--muted)">'+(s.last_seen ? new Date(s.last_seen).toLocaleString('fr-FR') : '—')+'</td>'
         +'</tr>';
     }).join('');
     el.innerHTML = '<div class="table-wrap"><table>'
-      +'<thead><tr><th>Hôte</th><th>Statut</th><th>OS</th><th>IP(s)</th><th>Sécurité</th><th>Sous-réseau</th><th>Pairs</th><th>Dernière vue</th></tr></thead>'
+      +'<thead><tr><th>Hôte</th><th>Statut</th><th>OS</th><th>IP(s)</th><th>Ports</th><th>Sécurité</th><th>Sous-réseau</th><th>Pairs</th><th>Dernière vue</th></tr></thead>'
       +'<tbody>'+rows+'</tbody></table>'
       +paginationBar(paged, 'goServersPage')
       +'</div>';
   } else {
-    /* Network map */
-    // subnet_map est construit à partir de TOUTES les IP de chaque agent.
-    // Ne pas utiliser seulement s.subnet : une machine multi-homée doit être
-    // visible dans chacun de ses réseaux.
-    const byHostname = Object.fromEntries(servers.map(function(s){ return [s.hostname, s]; }));
-    const bySubnet = {};
-    Object.keys(subnet_map).forEach(function(sn) {
-      bySubnet[sn] = (subnet_map[sn] || []).map(function(host){ return byHostname[host]; }).filter(Boolean);
-    });
-    servers.filter(function(s){ return !(s.subnets || []).length; }).forEach(function(s) {
-      if (!bySubnet['Inconnu']) bySubnet['Inconnu'] = [];
-      bySubnet['Inconnu'].push(s);
-    });
-    const keys = Object.keys(bySubnet);
-    if (!keys.length) { el.innerHTML = '<div class="loading-center text-muted">Pas encore de données réseau</div>'; return; }
-    el.innerHTML = keys.map(function(sn) {
-      const nodes = bySubnet[sn];
-      return '<div class="subnet-block"><div class="subnet-header"><span>🌐</span>'
-        +'<span style="font-family:monospace;font-weight:600;color:var(--accent)">'+esc(sn)+'</span>'
-        +'<span class="text-muted" style="font-size:12px">— '+nodes.length+' hôte'+(nodes.length>1?'s':'')+'</span></div>'
-        +'<div class="subnet-nodes">'
-        +nodes.map(function(n) {
-          return '<div class="node-card '+(n.online?'online':'offline')+'">'
-            +'<span class="dot '+(n.online?'dot-green':'dot-red')+'"></span>'
-            +'<div><div class="node-hostname">'+esc(osIcon(n.os))+' '+esc(n.hostname)+'</div>'
-            +'<div class="node-ip">'+esc((n.ip_addresses||[])[0]||'—')+'</div>'
-            +((n.vulnerable_count||0)>0 ? '<span class="badge badge-orange" style="font-size:10px;margin-top:3px">'+n.vulnerable_count+' CVE</span>' : '')
-            +'</div></div>';
-        }).join('')+'</div></div>';
-    }).join('');
+    renderNetwork(servers, subnet_map);
   }
+}
+
+function renderNetwork(servers, subnetMap) {
+  const el = document.getElementById('servers-content');
+  const byHost = Object.fromEntries(servers.map(function(s){ return [s.hostname, s]; }));
+  const groups = Object.keys(subnetMap).sort().map(function(subnet) {
+    return { subnet: subnet, hosts: (subnetMap[subnet] || []).map(function(name){ return byHost[name]; }).filter(Boolean) };
+  });
+  const unknown = servers.filter(function(s){ return !(s.subnets || []).length; });
+  if (unknown.length) groups.push({ subnet: 'Adresse inconnue', hosts: unknown });
+  const cols = Math.max(1, Math.min(2, groups.length));
+  const rowTops = [];
+  let nextTop = 28;
+  for (let row=0; row<Math.ceil(groups.length/cols); row++) {
+    rowTops[row] = nextTop;
+    const rowHeight = Math.max(...groups.slice(row*cols,(row+1)*cols).map(function(g){ return Math.max(220,64+Math.ceil(g.hosts.length/3)*174); }));
+    nextTop += rowHeight + 28;
+  }
+  let maxBottom = 500;
+  _networkNodes = [];
+  const regions = groups.map(function(g, gi) {
+    const x = 28 + (gi % cols) * 620;
+    const y = rowTops[Math.floor(gi / cols)];
+    const rows = Math.ceil(g.hosts.length / 3);
+    const height = Math.max(220, 64 + rows * 174);
+    maxBottom = Math.max(maxBottom, y + height + 28);
+    const html = '<div class="network-subnet" style="left:'+x+'px;top:'+y+'px;width:590px;height:'+height+'px"><span class="network-subnet-name">'+esc(g.subnet)+' · '+g.hosts.length+' hôte'+(g.hosts.length>1?'s':'')+'</span></div>';
+    g.hosts.forEach(function(host, hi) {
+      const key = g.subnet + '|' + host.hostname;
+      const saved = _networkPositions[key];
+      const defaultX = x + 24 + (hi % 3) * 186;
+      const defaultY = y + 44 + Math.floor(hi / 3) * 174;
+      // Les positions enregistrées sont limitées au cadre de leur réseau.
+      const px = saved && Number.isFinite(saved.x) ? Math.max(x+8, Math.min(x+408, saved.x)) : defaultX;
+      const py = saved && Number.isFinite(saved.y) ? Math.max(y+36, Math.min(y+height-155, saved.y)) : defaultY;
+      _networkNodes.push({key:key, subnet:g.subnet, host:host, x:px, y:py, bounds:{x:x,y:y,width:590,height:height}});
+    });
+    return html;
+  }).join('');
+  const width = Math.max(650, 28 + cols * 620);
+  const nodesHtml = _networkNodes.map(function(n, i) {
+    const ips = (n.host.ip_addresses || []).filter(function(ip){ return n.subnet === 'Adresse inconnue' || ip.startsWith(n.subnet.split('/')[0].split('.').slice(0,3).join('.')+'.'); });
+    const ports = (n.host.open_ports || []).filter(function(p){ return Number.isInteger(Number(p)); });
+    const total = n.host.cve_count != null ? n.host.cve_count : (n.host.vulnerable_count || 0);
+    return '<div class="network-node '+(n.host.online?'online':'offline')+(_networkSelected===n.key?' selected':'')+'" data-node="'+i+'" tabindex="0" role="button" aria-label="'+esc(n.host.hostname)+' : détails réseau" style="left:'+n.x+'px;top:'+n.y+'px">'
+      +'<div class="node-title"><span class="dot '+(n.host.online?'dot-green':'dot-red')+'"></span>'+esc(n.host.hostname)+'</div>'
+      +'<div class="node-ip">'+(ips.length ? ips.map(esc).join('<br>') : 'IP non remontée')+'</div>'
+      +'<div class="node-ports">'+(ports.length ? ports.slice(0,5).map(function(p){ return '<span>:'+esc(p)+'</span>'; }).join('')+(ports.length>5?'<span>+'+(ports.length-5)+'</span>':'') : '<span>Ports non analysés</span>')+'</div>'
+      +(total ? '<span class="badge badge-orange" style="margin-top:8px">'+total+' CVE</span>' : '')+'</div>';
+  }).join('');
+  el.innerHTML = '<div class="network-toolbar"><span class="hint">Déplacez la carte ou les bulles · Molette pour zoomer · Pointillés = sous-réseau partagé · Trait continu = même hôte multi réseau</span>'
+    +'<button class="btn btn-ghost btn-sm" type="button" onclick="networkZoom(-0.15)">−</button>'
+    +'<button class="btn btn-ghost btn-sm" type="button" onclick="networkZoom(0.15)">+</button>'
+    +'<button class="btn btn-ghost btn-sm" type="button" onclick="resetNetworkView()">Recentrer</button></div>'
+    +'<div class="network-layout"><div class="network-viewport" id="network-viewport"><div class="network-world" id="network-world" style="width:'+width+'px;height:'+maxBottom+'px">'
+    +regions+'<svg class="network-lines" id="network-lines" viewBox="0 0 '+width+' '+maxBottom+'" aria-hidden="true"></svg>'+nodesHtml+'</div></div>'
+    +'<aside class="network-inspector" id="network-inspector" aria-live="polite"></aside></div>';
+  updateNetworkTransform();
+  drawNetworkLinks();
+  showNetworkInspector();
+  bindNetworkInteractions();
+}
+
+function updateNetworkTransform() {
+  const world = document.getElementById('network-world');
+  if (world) world.style.transform = 'translate('+_networkOffset.x+'px,'+_networkOffset.y+'px) scale('+_networkZoom+')';
+}
+function networkZoom(delta) {
+  _networkZoom = Math.max(.45, Math.min(1.8, Math.round((_networkZoom+delta)*100)/100));
+  updateNetworkTransform();
+}
+function resetNetworkView() {
+  _networkZoom = 1; _networkOffset = {x:24,y:24}; updateNetworkTransform();
+}
+function drawNetworkLinks() {
+  const svg = document.getElementById('network-lines');
+  if (!svg) return;
+  const links = [];
+  _networkNodes.forEach(function(a, i) {
+    _networkNodes.forEach(function(b, j) {
+      if (j <= i) return;
+      const sameHost = a.host.hostname === b.host.hostname;
+      if (!sameHost && (a.subnet !== b.subnet || !(a.host.subnet_peers || []).includes(b.host.hostname))) return;
+      links.push('<line x1="'+(a.x+87)+'" y1="'+(a.y+75)+'" x2="'+(b.x+87)+'" y2="'+(b.y+75)+'" stroke="'+(sameHost?'#ff9b56':'#7191cc')+'" stroke-opacity="'+(sameHost?'.7':'.43')+'" stroke-width="2" '+(sameHost?'':'stroke-dasharray="6 6"')+'/>');
+    });
+  });
+  svg.innerHTML = links.join('');
+}
+function showNetworkInspector() {
+  const panel = document.getElementById('network-inspector');
+  if (!panel) return;
+  const n = _networkNodes.find(function(item){ return item.key === _networkSelected; });
+  if (!n) { panel.innerHTML = '<h3>Explorer le réseau</h3><p class="text-muted" style="font-size:12px;line-height:1.5">Sélectionnez une bulle pour voir toutes les adresses, les ports analysés et les machines du même sous-réseau.</p>'; return; }
+  const h = n.host;
+  const peers = (h.subnet_peers || []).filter(function(name){ return _networkNodes.some(function(x){ return x.subnet===n.subnet && x.host.hostname===name; }); });
+  panel.innerHTML = '<h3>'+esc(h.hostname)+'</h3><span class="badge '+(h.online?'badge-green':'badge-gray')+'">'+(h.online?'En ligne':'Hors ligne')+'</span>'
+    +'<div class="field">Sous-réseau</div><div class="value code">'+esc(n.subnet)+'</div>'
+    +'<div class="field">Adresses IP</div><div class="value">'+((h.ip_addresses||[]).map(function(ip){return '<div class="code" style="margin:3px 0">'+esc(ip)+'</div>';}).join('')||'Non remontées')+'</div>'
+    +'<div class="field">Ports observés</div><div class="value">'+((h.open_ports||[]).length ? (h.open_ports||[]).map(function(p){return '<span class="badge badge-blue" style="margin:2px">:'+esc(p)+'</span>';}).join('') : 'Scan de ports non effectué ou aucun port détecté')+'</div>'
+    +'<div class="field">Machines du même réseau</div><div class="value">'+(peers.length ? peers.map(esc).join(' · ') : 'Aucune autre machine détectée')+'</div>'
+    +'<p class="text-muted" style="font-size:11px;line-height:1.45;margin-top:12px">Les liens pointillés représentent une appartenance au même sous-réseau ; ils ne prouvent pas un échange de trafic.</p>'
+    +'<button class="btn btn-ghost btn-sm" type="button" id="network-inventory" style="margin-top:14px">Voir l’inventaire →</button>';
+  document.getElementById('network-inventory').addEventListener('click', function(){ openInventory(h.hostname); });
+}
+function bindNetworkInteractions() {
+  const viewport = document.getElementById('network-viewport');
+  let drag = null;
+  viewport.addEventListener('wheel', function(e) { e.preventDefault(); networkZoom(e.deltaY < 0 ? .1 : -.1); }, {passive:false});
+  viewport.addEventListener('pointerdown', function(e) {
+    const nodeEl = e.target.closest('.network-node');
+    if (nodeEl) {
+      const n = _networkNodes[Number(nodeEl.dataset.node)];
+      _networkSelected = n.key;
+      viewport.querySelectorAll('.network-node').forEach(function(el){el.classList.toggle('selected', el===nodeEl);});
+      showNetworkInspector();
+      drag = {node:n, el:nodeEl, x:e.clientX, y:e.clientY, startX:n.x, startY:n.y};
+    } else {
+      drag = {x:e.clientX,y:e.clientY,startX:_networkOffset.x,startY:_networkOffset.y};
+      viewport.classList.add('dragging');
+    }
+    viewport.setPointerCapture(e.pointerId);
+  });
+  viewport.addEventListener('pointermove', function(e) {
+    if (!drag) return;
+    if (drag.node) {
+      const n=drag.node, b=n.bounds;
+      n.x=Math.max(b.x+8,Math.min(b.x+b.width-182,drag.startX+(e.clientX-drag.x)/_networkZoom));
+      n.y=Math.max(b.y+36,Math.min(b.y+b.height-155,drag.startY+(e.clientY-drag.y)/_networkZoom));
+      drag.el.style.left=n.x+'px'; drag.el.style.top=n.y+'px'; drawNetworkLinks();
+    } else {
+      _networkOffset={x:drag.startX+e.clientX-drag.x,y:drag.startY+e.clientY-drag.y}; updateNetworkTransform();
+    }
+  });
+  function finish() {
+    if (drag && drag.node) {
+      _networkPositions[drag.node.key]={x:drag.node.x,y:drag.node.y};
+      try { localStorage.setItem('heimdall-network-positions',JSON.stringify(_networkPositions)); } catch(e) {}
+    }
+    drag=null; viewport.classList.remove('dragging');
+  }
+  viewport.addEventListener('pointerup', finish);
+  viewport.addEventListener('pointercancel', finish);
+  viewport.addEventListener('keydown', function(e) {
+    const nodeEl=e.target.closest('.network-node');
+    if (nodeEl && (e.key==='Enter' || e.key===' ')) {
+      e.preventDefault(); _networkSelected=_networkNodes[Number(nodeEl.dataset.node)].key;
+      viewport.querySelectorAll('.network-node').forEach(function(el){el.classList.toggle('selected',el===nodeEl);});
+      showNetworkInspector();
+    }
+  });
 }
 
 /* ── Vulnérabilités ── */
@@ -1317,6 +1468,15 @@ function cvssLabel(score) {
   return 'FAIBLE';
 }
 
+function cveDetailUrl(id) {
+  if (!_frontendUrl || !/^CVE-\d{4}-\d{4,}$/i.test(id || '')) return '';
+  try {
+    const base = new URL(_frontendUrl);
+    if (base.protocol !== 'http:' && base.protocol !== 'https:') return '';
+    return new URL('/cve/' + encodeURIComponent(id.toUpperCase()), base).href;
+  } catch(e) { return ''; }
+}
+
 function renderVulns() {
   const el = document.getElementById('vulns-content');
 
@@ -1415,17 +1575,32 @@ function renderVulns() {
       pending ? '<span class="badge badge-orange" title="'+esc(selectedAgent.cve_scan_reason || '')+'">'+(selectedAgent.cve_scan_status === 'deferred' ? 'analyse en attente' : 'non analysé')+'</span>' : ''
     ].filter(Boolean).join(' ')
       + (pending && selectedAgent.cve_scan_reason ? '<div class="text-muted" style="font-size:12px;margin-top:6px">⚠️ '+esc(selectedAgent.cve_scan_reason)+'</div>' : '');
-    // Tri : gravité CVSS, puis probabilité d'exploitation (EPSS) à gravité égale
-    var cveRows = cves.slice().sort(function(a,b){ return ((b.cvss_score||0)-(a.cvss_score||0)) || ((b.epss_score||0)-(a.epss_score||0)); }).map(function(c) {
+    // Regrouper par logiciel pour rendre les résultats actionnables.
+    var byProduct = {};
+    cves.forEach(function(c) {
+      var key = (c.product || 'Logiciel inconnu') + '|' + (c.version || '');
+      if (!byProduct[key]) byProduct[key] = {name:c.product || 'Logiciel inconnu', version:c.version || '', items:[]};
+      byProduct[key].items.push(c);
+    });
+    var productSections = Object.values(byProduct).sort(function(a,b) {
+      var maxA = Math.max(0,...a.items.map(function(c){return Number(c.cvss_score)||0;}));
+      var maxB = Math.max(0,...b.items.map(function(c){return Number(c.cvss_score)||0;}));
+      return maxB-maxA || a.name.localeCompare(b.name);
+    }).map(function(group, groupIndex) {
+      var cveRows = group.items.slice().sort(function(a,b){ return ((b.cvss_score||0)-(a.cvss_score||0)) || ((b.epss_score||0)-(a.epss_score||0)); }).map(function(c) {
       var score = c.cvss_score;
       var cveLabel = esc(c.cve_id||'?');
-      var cveTd = _frontendUrl
-        ? '<a href="'+esc(_frontendUrl)+'/cve/'+esc(c.cve_id||'')+'" target="_blank" rel="noopener" class="code" style="color:var(--accent);text-decoration:none" onmouseover="this.style.textDecoration=\'underline\'" onmouseout="this.style.textDecoration=\'none\'">'+cveLabel+'</a>'
-        : '<span class="code" title="Configurez l\'URL du site front pour activer les liens">'+cveLabel+'</span>';
+      var detailUrl = cveDetailUrl(c.cve_id);
+      var cveTd = detailUrl
+        ? '<a href="'+esc(detailUrl)+'" target="_blank" rel="noopener noreferrer" class="cve-detail-link" title="Ouvrir la fiche CVE sur le site">'+cveLabel+' ↗</a>'
+        : '<span class="code" title="Lien indisponible : configurez l’URL du site ou vérifiez l’identifiant CVE">'+cveLabel+'</span>';
       var badge = '<span class="badge '+cvssColor(score)+'">'+cvssLabel(score)+'</span>'+(score!=null?' <span class="text-muted" style="font-size:11px">'+Number(score).toFixed(1)+'</span>':'');
-      var prod  = esc(c.product||'?')+(c.version?' <span style="font-size:11px">'+esc(c.version)+'</span>':'');
       var desc  = esc((c.description||'').slice(0,160))+((c.description||'').length>160?'…':'');
-      return '<tr><td>'+cveTd+'</td><td>'+badge+'</td><td>'+epssBadge(c.epss_score, c.epss_percentile)+'</td><td class="text-muted" style="font-size:12px">'+prod+'</td><td style="font-size:11px;color:var(--muted)">'+desc+'</td></tr>';
+      return '<tr><td>'+cveTd+'</td><td>'+badge+'</td><td>'+epssBadge(c.epss_score, c.epss_percentile)+'</td><td style="font-size:11px;color:var(--muted)">'+desc+'</td></tr>';
+    }).join('');
+      var criticalCount = group.items.filter(function(c){return Number(c.cvss_score)>=9;}).length;
+      return '<details class="vuln-product" '+(criticalCount || groupIndex===0 ? 'open':'')+'><summary><span>'+esc(group.name)+(group.version?' <span class="text-muted">'+esc(group.version)+'</span>':'')+'</span><span class="badge badge-gray">'+group.items.length+' CVE</span>'+(criticalCount?'<span class="badge badge-red">'+criticalCount+' critique'+(criticalCount>1?'s':'')+'</span>':'')+'</summary>'
+        +'<div class="table-wrap"><table><thead><tr><th>CVE · détails</th><th>Sévérité</th><th title="Probabilité d’exploitation dans les 30 prochains jours">EPSS</th><th>Description</th></tr></thead><tbody>'+cveRows+'</tbody></table></div></details>';
     }).join('');
     detailHtml =
       '<div class="vuln-detail-header">'
@@ -1439,8 +1614,8 @@ function renderVulns() {
         +'</div>'
       +'</div>'
       +'<div class="vuln-detail-body">'
-        +(cveRows
-          ? '<table><thead><tr><th>CVE ID</th><th>Sévérité</th><th title="Probabilité d\'exploitation dans les 30 prochains jours (FIRST EPSS)">EPSS</th><th>Produit</th><th>Description</th></tr></thead><tbody>'+cveRows+'</tbody></table>'
+        +(productSections
+          ? productSections
           : '<div style="padding:16px;color:var(--muted);font-size:13px">'+(pending ? 'Aucune analyse CVE complète enregistrée pour cet hôte.' : 'Aucune CVE détectée.')+'</div>')
       +'</div>';
   }
