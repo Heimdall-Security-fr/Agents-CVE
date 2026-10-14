@@ -1429,7 +1429,9 @@ def cve_quota():
         if response.status_code != 200:
             logger.warning("[CVE API] Vérification de configuration: HTTP %s", response.status_code)
             detail = {401: "clé API CVE invalide", 403: "clé refusée (IP verrouillée ou compte suspendu)",
-                      404: "route introuvable (URL HEIMDALL_CVE_API ?)"}.get(response.status_code, "API en erreur")
+                      404: "route introuvable (URL HEIMDALL_CVE_API ?)",
+                      429: "quota du jour et crédits épuisés (ou site CVE pas encore mis à jour)"}.get(
+                          response.status_code, "API en erreur")
             return jsonify({"configured": True, "available": False,
                             "message": f"HTTP {response.status_code} : {detail}"})
         data = response.json()
