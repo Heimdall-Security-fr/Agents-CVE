@@ -32,9 +32,8 @@ interval_minutes = 60
 ; Activer le scan de ports à chaque collecte (true/false)
 port_scan = false
 ; Vérification des logiciels à mettre à jour (winget / apt / dnf / yum / zypper / brew).
-; Linux/macOS : intervalle en heures entre deux vérifications.
-; Windows : vérifié au démarrage de l'agent puis à la demande depuis le dashboard
-; (bouton « Revérifier ») — la valeur ne sert qu'à désactiver. 0 = désactivée partout.
+; Intervalle en heures entre deux vérifications (tous systèmes), en plus du démarrage de
+; l'agent et du bouton « Revérifier » du dashboard. 0 = désactivée partout.
 update_check_hours = 6
 ; Mise à jour AUTOMATIQUE de l'agent lui-même (recommandé). Sur Linux/macOS, se fait
 ; toujours sans confirmation. Sur Windows, auto_update = false redemande confirmation

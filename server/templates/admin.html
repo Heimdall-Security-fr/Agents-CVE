@@ -2026,7 +2026,7 @@ async function loadUpdates() {
       +'<div class="table-wrap"><table><thead><tr><th>Serveur</th><th>OS</th><th>État</th><th>En attente</th><th>Source</th></tr></thead><tbody>'
       +(body || '<tr><td colspan="5" style="padding:24px;text-align:center;color:var(--muted)">Aucun agent n\'a encore envoyé de rapport.</td></tr>')
       +'</tbody></table></div>'
-      +'<p class="text-muted" style="font-size:12px;margin-top:12px">Cliquez sur une ligne pour voir le détail. La liste provient du gestionnaire de paquets de chaque machine (winget, apt, dnf, yum, zypper, brew) ; sans winget (Windows Server), ce sont les mises à jour Windows Update en attente. Sous Windows, elle est vérifiée au démarrage de l\'agent puis à la demande (bouton « Revérifier ») ; sous Linux/macOS, toutes les 6 h.</p>';
+      +'<p class="text-muted" style="font-size:12px;margin-top:12px">Cliquez sur une ligne pour voir le détail. La liste provient du gestionnaire de paquets de chaque machine (winget, apt, dnf, yum, zypper, brew) ; sans winget (Windows Server), ce sont les mises à jour Windows Update en attente. Elle est vérifiée au démarrage de l\'agent, puis toutes les 6 h et à la demande (bouton « Revérifier »).</p>';
   } catch(err) { el.innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>'; }
 }
 

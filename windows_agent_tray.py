@@ -922,32 +922,38 @@ _UPDATE_CACHE = {"at": 0.0, "data": None, "force": False}
 _MAX_UPDATE_ITEMS = 500
 
 def _parse_winget_table(text: str) -> list:
-    """Analyse la table de `winget upgrade`. Indépendant de la langue : les colonnes
-    sont repérées d'après la ligne d'en-tête située juste au-dessus des tirets."""
-    lines = [l.rstrip() for l in text.replace("\r", "\n").split("\n")]
-    sep = next((i for i, l in enumerate(lines) if re.fullmatch(r"-{5,}", l.strip())), None)
-    if not sep:
-        return []
-    starts = [m.start() for m in re.finditer(r"\S+(?: \S+)*", lines[sep - 1])]
-    if len(starts) < 4:            # Nom, Id, Version, Disponible (Source facultative)
-        return []
-    items = []
-    for line in lines[sep + 1:]:
-        if not line.strip():
-            break
-        if re.match(r"^\s*\d+\s+\S+", line) and len(line.split()) <= 6:
-            break                  # ligne récapitulative « 12 mises à niveau disponibles »
-        cells = [line[s:(starts[i + 1] if i + 1 < len(starts) else None)].strip()
-                 for i, s in enumerate(starts)]
-        if cells[0] and cells[3]:
-            items.append({"name": cells[0], "id": cells[1],
-                          "installed": cells[2], "available": cells[3]})
+    """Analyse TOUTES les tables de `winget upgrade` (mises à jour classiques, versions
+    inconnues, paquets épinglés ou à cibler explicitement). Indépendant de la langue : les
+    colonnes sont repérées d'après la ligne d'en-tête située au-dessus des tirets.
+    Tolère les fins de ligne Windows et les barres de progression (retours chariot)."""
+    lines = [l.split("\r")[-1].rstrip() for l in text.replace("\r\n", "\n").split("\n")]
+    items, seen = [], set()
+    for sep, line in enumerate(lines):
+        if not re.fullmatch(r"-{5,}", line.strip()):
+            continue
+        header = next((lines[j] for j in range(sep - 1, -1, -1) if lines[j].strip()), "")
+        starts = [m.start() for m in re.finditer(r"\S+(?: \S+)*", header)]
+        if len(starts) < 4:            # Nom, Id, Version, Disponible (Source facultative)
+            continue
+        for row in lines[sep + 1:]:
+            if not row.strip() or re.fullmatch(r"-{5,}", row.strip()):
+                break                  # fin de cette table (une autre peut suivre)
+            if len(re.findall(r"\s{2,}", row.strip())) < 2:
+                break                  # phrase (« 12 mises à niveau disponibles. ») et non ligne de tableau
+            cells = [row[st:(starts[i + 1] if i + 1 < len(starts) else None)].strip()
+                     for i, st in enumerate(starts)]
+            if len(cells) >= 4 and cells[0] and cells[3]:
+                key = (cells[1] or cells[0]).lower()
+                if key not in seen:
+                    seen.add(key)
+                    items.append({"name": cells[0], "id": cells[1],
+                                  "installed": cells[2], "available": cells[3]})
     return items
 
 def collect_outdated_software() -> dict:
-    """Résultat : {manager, ok, count, items[], checked_at, error?}. winget n'est lancé
-    qu'au premier rapport après le démarrage, puis uniquement sur demande du dashboard
-    (`_UPDATE_CACHE["force"]`) ; entre-temps le dernier résultat est réutilisé.
+    """Résultat : {manager, ok, count, items[], checked_at, error?}. Vérification au premier
+    rapport, puis toutes les `update_check_hours` (6 h par défaut) et à la demande du
+    dashboard (`_UPDATE_CACHE["force"]`) ; entre-temps le dernier résultat est réutilisé.
     `update_check_hours = 0` désactive la vérification."""
     hours = 6.0
     if state.config is not None:
@@ -957,7 +963,8 @@ def collect_outdated_software() -> dict:
             pass
     if hours <= 0:
         return {"manager": None, "ok": False, "error": "désactivé", "count": None, "items": []}
-    if _UPDATE_CACHE["data"] and not _UPDATE_CACHE.get("force"):
+    fresh = time.time() - _UPDATE_CACHE["at"] < hours * 3600
+    if _UPDATE_CACHE["data"] and fresh and not _UPDATE_CACHE.get("force"):
         return _UPDATE_CACHE["data"]
     _UPDATE_CACHE["force"] = False
 
@@ -971,11 +978,66 @@ def collect_outdated_software() -> dict:
         winget = _find_winget()
         wg = _winget_upgrades(winget) if winget else {
             "manager": "winget", "ok": False, "error": "winget introuvable", "count": None, "items": []}
-        result = _merge_update_checks([wg, wu])
+        checks = [wg]
+        if SERVICE_MODE:
+            # Sous SYSTEM, winget ne voit que les applications installées pour toute la
+            # machine (et échoue souvent) : on y ajoute la liste relevée par l'icône dans
+            # la session de l'utilisateur, qui voit aussi ses applications personnelles.
+            user_wg = _read_user_winget(max_age=hours * 3600 * 2)
+            if user_wg:
+                checks.append(user_wg)
+        result = _merge_update_checks(checks + [wu], dedupe=True)
     _UPDATE_CACHE.update(at=time.time(), data=result)
     return result
 
-def _merge_update_checks(checks: list) -> dict:
+# Liste winget relevée dans la session de l'utilisateur, transmise au service (SYSTEM)
+_USER_WINGET_FILE = os.path.join(_PROGRAMDATA_DIR, "winget-user.json")
+
+def _write_user_winget(data: dict):
+    import json
+    try:
+        os.makedirs(_PROGRAMDATA_DIR, exist_ok=True)
+        tmp = _USER_WINGET_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({**data, "user": os.environ.get("USERNAME", ""), "at": time.time()}, f)
+        os.replace(tmp, _USER_WINGET_FILE)
+    except Exception as e:
+        logger.warning(f"Liste winget non transmise au service : {e}")
+
+def _read_user_winget(max_age: float):
+    import json
+    try:
+        with open(_USER_WINGET_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("ok") and time.time() - float(data.get("at", 0)) < max_age:
+            return {"manager": "winget", "ok": True, "count": data.get("count", 0),
+                    "items": data.get("items") or []}
+    except (OSError, ValueError):
+        pass
+    return None
+
+def refresh_user_winget():
+    """Icône dans une session alors que le service fait les rapports : relève winget côté
+    utilisateur (applications personnelles comprises) et le transmet au service."""
+    if SERVICE_MODE or _is_windows_server():
+        return
+    hours = 6.0
+    try:
+        hours = float((state.config or configparser.ConfigParser()).get("agent", "update_check_hours", fallback="6"))
+    except ValueError:
+        pass
+    if hours <= 0 or (time.time() - _USER_WINGET_STATE["at"] < hours * 3600 and not _USER_WINGET_STATE["force"]):
+        return
+    _USER_WINGET_STATE.update(at=time.time(), force=False)
+    winget = _find_winget()
+    if winget:
+        wg = _winget_upgrades(winget)
+        if wg.get("ok"):
+            _write_user_winget(wg)
+
+_USER_WINGET_STATE = {"at": 0.0, "force": False}
+
+def _merge_update_checks(checks: list, dedupe: bool = False) -> dict:
     """Cumule plusieurs sources (winget + Windows Update). Réussi si au moins une
     source a répondu ; les échecs partiels sont signalés dans `error`."""
     ok = [c for c in checks if c.get("ok")]
@@ -983,9 +1045,19 @@ def _merge_update_checks(checks: list) -> dict:
     if not ok:
         return {"manager": " + ".join(c.get("manager") or "?" for c in checks), "ok": False,
                 "error": " ; ".join(failed)[:200] or "indisponible", "count": None, "items": []}
-    items = [it for c in ok for it in c.get("items") or []][:_MAX_UPDATE_ITEMS]
-    return {"manager": " + ".join(c["manager"] for c in ok), "ok": True,
-            "count": sum(c.get("count") or 0 for c in ok), "items": items,
+    items = [it for c in ok for it in c.get("items") or []]
+    if dedupe:
+        seen, unique = set(), []
+        for it in items:
+            key = (it.get("id") or it.get("name") or "").lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append(it)
+        items = unique
+    managers = list(dict.fromkeys(c["manager"] for c in ok))
+    return {"manager": " + ".join(managers), "ok": True,
+            "count": len(items) if dedupe else sum(c.get("count") or 0 for c in ok),
+            "items": items[:_MAX_UPDATE_ITEMS],
             "checked_at": datetime.now().isoformat(),
             **({"error": ("partiel — " + " ; ".join(failed))[:200]} if failed else {})}
 
@@ -1047,25 +1119,36 @@ def _windows_update_pending() -> dict:
 def _winget_upgrades(winget: str) -> dict:
     result = {"manager": "winget", "ok": False, "error": "winget indisponible",
               "count": None, "items": []}
+    # --include-unknown : versions non déterminables ; --include-pinned : paquets épinglés
+    # (sans eux, winget les masque) ; --disable-interactivity : pas de barre de progression.
+    # Les winget anciens ne connaissent pas les deux derniers : on retente sans.
+    variants = [
+        ["upgrade", "--include-unknown", "--include-pinned", "--accept-source-agreements",
+         "--disable-interactivity"],
+        ["upgrade", "--include-unknown", "--accept-source-agreements"],
+    ]
     try:
-        r = subprocess.run(
-            [winget, "upgrade", "--include-unknown", "--accept-source-agreements"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=120, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        items = _parse_winget_table(r.stdout or "")
-        # « Aucune mise à jour applicable » (0x8A15002B) et « aucun paquet correspondant »
-        # (0x8A150014) sont des codes de retour ≠ 0 mais signifient : tout est à jour.
-        rc = (r.returncode or 0) & 0xFFFFFFFF
-        if items or rc in (0, 0x8A15002B, 0x8A150014) or re.search(r"-{5,}", r.stdout or ""):
-            result = {"manager": "winget", "ok": True, "count": len(items),
-                      "items": items[:_MAX_UPDATE_ITEMS],
-                      "checked_at": datetime.now().isoformat()}
-        else:
-            result["error"] = ((r.stderr or r.stdout or "").strip().splitlines() or ["sortie vide"])[0][:200]
+        for args in variants:
+            r = subprocess.run(
+                [winget] + args,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                # La première exécution met à jour les sources winget : 120 s ne suffisaient pas
+                timeout=300, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            out = r.stdout or ""
+            items = _parse_winget_table(out)
+            # « Aucune mise à jour applicable » (0x8A15002B) et « aucun paquet correspondant »
+            # (0x8A150014) sont des codes de retour ≠ 0 mais signifient : tout est à jour.
+            rc = (r.returncode or 0) & 0xFFFFFFFF
+            if items or rc in (0, 0x8A15002B, 0x8A150014) or re.search(r"-{5,}", out):
+                return {"manager": "winget", "ok": True, "count": len(items),
+                        "items": items[:_MAX_UPDATE_ITEMS],
+                        "checked_at": datetime.now().isoformat()}
+            result["error"] = ((r.stderr or out).strip().splitlines() or ["sortie vide"])[0][:200]
+            logger.warning(f"winget {' '.join(args[1:])} : {result['error']}")
     except FileNotFoundError:
         pass
     except subprocess.TimeoutExpired:
-        result["error"] = "délai dépassé"
+        result["error"] = "délai dépassé (winget)"
     except Exception as e:
         result["error"] = str(e)[:200]
     return result
@@ -1178,6 +1261,7 @@ def agent_loop():
             send_report()
         else:
             _set_status("Rapports envoyés par le service système", connected=True)
+            refresh_user_winget()
         cfg      = state.config or configparser.ConfigParser()
         try:
             interval = max(1, int(cfg.get("agent", "interval_minutes", fallback="60"))) * 60
