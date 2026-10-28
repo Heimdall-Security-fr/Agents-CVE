@@ -169,6 +169,7 @@
     /* Notifications */
     .notif-row { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; padding:14px 0; border-top:1px solid var(--border); }
     .notif-row.disabled { opacity:.5; }
+    .notif-group { font-size:10px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:var(--accent); padding:18px 0 4px; }
     .notif-check { display:flex; align-items:flex-start; gap:10px; margin:0; text-transform:none; letter-spacing:0; font-weight:400; color:var(--text); font-size:13px; cursor:pointer; flex:1; min-width:240px; }
     .notif-check input { margin-top:3px; }
     .notif-check small { display:block; color:var(--muted); font-size:12px; margin-top:3px; }
@@ -2007,8 +2008,15 @@ function renderResults() {
 /* ── Notifications mail ── */
 var NOTIF_HELP = {
   new_cves: "Une CVE apparaît sur une machine : logiciel ajouté ou mis à jour, ou CVE publiée depuis l'analyse précédente.",
+  high_epss: "Une CVE présente sur le parc dépasse 10 % de probabilité d'exploitation sous 30 jours (EPSS), quelle que soit sa note CVSS. L'EPSS évolue chaque jour : une CVE ancienne peut le devenir.",
+  cve_scan_problem: "Les vulnérabilités ne sont plus analysées : quota épuisé, clé CVE_API_KEY invalide ou API injoignable. Rappel au plus une fois par jour tant que ça dure.",
   new_updates: 'Une nouvelle version devient disponible pour un logiciel installé (winget, Windows Update, apt, dnf…).',
+  software_changes: "Un logiciel est installé, désinstallé ou change de version sur une machine.",
   compliance_report: 'Score de conformité de chaque hôte et contrôles en échec, avec le rapport PDF en pièce jointe.',
+  compliance_drift: "Un contrôle qui passait se met à échouer sur une machine (pare-feu coupé, SSH root autorisé…), sans attendre le rapport.",
+  agent_offline: "Une machine ne contacte plus le serveur (éteinte, agent arrêté ou désinstallé), puis quand elle revient.",
+  new_hosts: "Un agent remonte pour la première fois : une nouvelle machine entre dans le parc.",
+  new_open_ports: "Un port s'ouvre sur une machine (RDP, SSH, base de données…). Nécessite le scan de ports de l'agent.",
   new_local_users: "Un compte jamais vu jusque-là apparaît sur un serveur ou un ordinateur (profil ou session ouverte)."
 };
 var _notifState = null;
@@ -2038,7 +2046,7 @@ function renderNotifPrefs(d, isAdmin) {
   var warn = d.mail_ready ? '' : '<div class="alert alert-warn" style="margin-top:14px">L\'envoi des mails n\'est pas encore configuré : '
     + (isAdmin ? 'renseignez et activez le serveur SMTP ci-dessous.' : 'demandez à un administrateur de configurer le serveur SMTP.')
     + ' Vos choix sont enregistrés et s\'appliqueront dès que ce sera fait.</div>';
-  var reportAllowed = false;
+  var reportAllowed = false, group = null;
   var rows = d.types.map(function(t) {
     var on = p[t.id] && p[t.id].enabled;
     var extra = '';
@@ -2050,11 +2058,16 @@ function renderNotifPrefs(d, isAdmin) {
             return '<option value="'+o[0]+'"'+(o[0]===sev?' selected':'')+'>'+esc(o[1])+'</option>';
           }).join('') + '</select>';
     }
+    if (t.allowed && t.id === 'agent_offline') {
+      extra = 'Après <input type="number" id="np-offline-hours" min="1" max="720" value="'+esc(p.agent_offline.hours)+'"> h sans contact';
+    }
     if (t.allowed && t.id === 'compliance_report') {
       extra = 'Tous les <input type="number" id="np-report-days" min="1" max="90" value="'+esc(p.compliance_report.every_days)+'"> jours'
         + (d.compliance_next_at ? '<span>· prochain envoi vers le '+esc(notifDate(d.compliance_next_at))+'</span>' : '');
     }
-    return '<div class="notif-row'+(t.allowed?'':' disabled')+'">'
+    var head = t.group !== group ? '<div class="notif-group">'+esc(t.group)+'</div>' : '';
+    group = t.group;
+    return head + '<div class="notif-row'+(t.allowed?'':' disabled')+'">'
       + '<label class="notif-check"><input type="checkbox" id="np-'+esc(t.id)+'"'+(on?' checked':'')+(t.allowed?'':' disabled')+'>'
       + '<span><strong>'+esc(t.label)+'</strong><small>'+esc(NOTIF_HELP[t.id] || '')+(t.allowed?'':' — non disponible pour votre rôle.')+'</small></span></label>'
       + (extra ? '<div class="notif-extra">'+extra+'</div>' : '')
@@ -2067,7 +2080,7 @@ function renderNotifPrefs(d, isAdmin) {
     + (reportAllowed ? '<button class="btn btn-ghost btn-sm" onclick="sendComplianceReportNow(this)" title="Envoie le rapport de conformité tout de suite, sans décaler les envois périodiques">Recevoir le rapport maintenant</button>' : '')
     + '<button class="btn btn-primary btn-sm" onclick="saveNotifPrefs(this)">Enregistrer</button></div></div>'
     + warn + '<div style="margin-top:10px">' + rows + '</div>'
-    + '<p class="text-muted" style="font-size:12px;margin-top:12px">Les alertes sont regroupées dans un seul mail toutes les '+esc(d.digest_minutes)+' min. Une nouveauté n\'est signalée qu\'une fois par machine ; les CVE marquées « non affecté » ne sont pas envoyées.</p>'
+    + '<p class="text-muted" style="font-size:12px;margin-top:12px">Les alertes sont regroupées dans un seul mail toutes les '+esc(d.digest_minutes)+' min. Une CVE, un compte, un port ou une mise à jour n\'est signalé qu\'une fois par machine ; les CVE marquées « non affecté » ne sont pas envoyées.</p>'
     + '</div>';
 }
 
@@ -2080,6 +2093,8 @@ async function saveNotifPrefs(btn) {
   if (sev && body.new_cves) body.new_cves.min_severity = sev.value;
   var days = document.getElementById('np-report-days');
   if (days && body.compliance_report) body.compliance_report.every_days = parseInt(days.value, 10);
+  var hours = document.getElementById('np-offline-hours');
+  if (hours && body.agent_offline) body.agent_offline.hours = parseInt(hours.value, 10);
   btn.disabled = true;
   try {
     await api('/api/notifications/preferences', { method: 'PUT', body: JSON.stringify(body) });

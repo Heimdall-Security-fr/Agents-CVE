@@ -1192,6 +1192,13 @@ def _sanitize_update_check(raw):
         "items":           items,
     }
 
+# Services connus des ports remontés par les agents (alertes et notifications)
+PORT_SERVICES = {21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 80: "HTTP",
+                 110: "POP3", 143: "IMAP", 443: "HTTPS", 445: "SMB", 1433: "SQL Server",
+                 1521: "Oracle", 3306: "MySQL", 3389: "RDP", 5432: "PostgreSQL", 5900: "VNC",
+                 6379: "Redis", 8080: "HTTP-Alt", 8443: "HTTPS-Alt", 9200: "Elasticsearch",
+                 27017: "MongoDB"}
+
 # ─── Endpoints agents ─────────────────────────────────────────────────────────
 @app.route('/api/agents/report', methods=['POST'])
 @require_agent_token
@@ -1253,11 +1260,8 @@ def agent_report():
 
     # Calcul de priorité : port ouvert + CVE critique = CRITIQUE
     priority_alerts = []
-    critical_services = {22: "SSH", 80: "HTTP", 443: "HTTPS", 3306: "MySQL",
-                         5432: "PostgreSQL", 6379: "Redis", 27017: "MongoDB",
-                         9200: "Elasticsearch", 8080: "HTTP-Alt"}
     for port in open_ports:
-        service = critical_services.get(port, f"Port {port}")
+        service = PORT_SERVICES.get(port, f"Port {port}")
         priority_alerts.append({"port": port, "service": service,
                                  "exposed": True, "note": "Vérifier l'accès Internet externe"})
 
@@ -1296,7 +1300,12 @@ def agent_report():
     # Nouveautés à notifier par mail (CVE seulement si la corrélation est complète).
     notify_events, notify_fields = _detect_new_items(
         existing_agent, vulns=vulns if cve_complete else None,
-        update_check=update_check, logged_users=logged_users)
+        update_check=update_check, logged_users=logged_users, open_ports=open_ports)
+    notify_events += _detect_state_changes(
+        existing_agent, os_str=report["os"], compliance=compliance, software_list=software_list,
+        host_info={"os": f"{report['os']} {report['release']}".strip(),
+                   "ip": ", ".join(display_ips), "agent_version": agent_version,
+                   "software_count": len(software_list)})
 
     with db_lock:
         # On garde l'historique et on met à jour le "dernier rapport" de ce serveur
@@ -1329,6 +1338,7 @@ def agent_report():
             update_ops["$unset"] = {"cve_scan_error": ""}
         mongo.db.agents.update_one({"hostname": hostname}, update_ops, upsert=True)
     _queue_notifications(hostname, notify_events)
+    _track_cve_scan_health(hostname, cve_complete, scan_status.get("reason"))
 
     report.pop("_id", None)
     shown_count = retained_vuln_count if retained_vuln_count is not None else cves_total
@@ -1380,8 +1390,8 @@ def _manual_cve_rescan(hostname: str | None = None):
         query = {"hostname": hostname} if hostname else {}
         agents = list(mongo.db.agents.find(
             query, {"hostname": 1, "software": 1, "os_build": 1, "cve_last_checked_at": 1,
-                    "notify_known.cves": 1, "vulnerabilities.product": 1,
-                    "vulnerabilities.name": 1, "vulnerabilities.cves.cve_id": 1}))
+                    "notify_known": 1, "vulnerabilities.product": 1, "vulnerabilities.name": 1,
+                    "vulnerabilities.cves.cve_id": 1, "vulnerabilities.cves.epss_score": 1}))
         agents.sort(key=lambda a: (a.get("cve_last_checked_at") is not None,
                                    a.get("cve_last_checked_at") or datetime.min))
         for agent in agents:
@@ -1415,6 +1425,7 @@ def _manual_cve_rescan(hostname: str | None = None):
                           "cve_scan_reason": scan_status.get("reason")}
             mongo.db.agents.update_one({"hostname": agent.get("hostname", "Unknown")}, {"$set": update})
             _queue_notifications(agent.get("hostname", "Unknown"), notify_events)
+            _track_cve_scan_health(agent.get("hostname", "Unknown"), complete, scan_status.get("reason"))
             with _cve_rescan_lock:
                 _cve_rescan_status["processed_hosts"] += 1
                 _cve_rescan_status["completed_hosts" if complete else "deferred_hosts"] += 1
@@ -3394,17 +3405,37 @@ _MAIL_ROWS_MAX      = 200    # lignes par section dans un mail
 _mail_send_lock     = threading.Lock()
 
 # Un type n'est proposé qu'aux rôles qui voient déjà ces données dans le dashboard.
+_CVE_ROLES        = ("admin", "inspection_logs")
+_COMPLIANCE_ROLES = ("admin", "inspection_logs", "codir")
 NOTIFICATION_TYPES = {
-    "new_cves":          {"label": "Nouvelles CVE sur le parc",
-                          "roles": ("admin", "inspection_logs")},
-    "new_updates":       {"label": "Nouvelles mises à jour logicielles disponibles",
-                          "roles": ("admin", "inspection_logs", "codir")},
-    "compliance_report": {"label": "Rapport de conformité périodique",
-                          "roles": ("admin", "inspection_logs", "codir")},
-    "new_local_users":   {"label": "Nouveau compte utilisateur détecté sur une machine",
+    "new_cves":          {"group": "Vulnérabilités", "label": "Nouvelles CVE sur le parc",
+                          "roles": _CVE_ROLES},
+    "high_epss":         {"group": "Vulnérabilités",
+                          "label": "CVE à forte probabilité d'exploitation (EPSS ≥ 10 %)",
+                          "roles": _CVE_ROLES},
+    "cve_scan_problem":  {"group": "Vulnérabilités",
+                          "label": "Analyse CVE interrompue",
+                          "roles": ROLES},
+    "new_updates":       {"group": "Logiciels", "label": "Nouvelles mises à jour logicielles disponibles",
+                          "roles": _COMPLIANCE_ROLES},
+    "software_changes":  {"group": "Logiciels", "label": "Logiciel installé, désinstallé ou mis à jour",
+                          "roles": ROLES},
+    "compliance_report": {"group": "Conformité", "label": "Rapport de conformité périodique",
+                          "roles": _COMPLIANCE_ROLES},
+    "compliance_drift":  {"group": "Conformité",
+                          "label": "Contrôle de conformité qui passe en échec",
+                          "roles": _COMPLIANCE_ROLES},
+    "agent_offline":     {"group": "Parc", "label": "Machine hors ligne (et retour en ligne)",
+                          "roles": ROLES},
+    "new_hosts":         {"group": "Parc", "label": "Nouvelle machine ajoutée au parc",
+                          "roles": ROLES},
+    "new_open_ports":    {"group": "Parc", "label": "Nouveau port ouvert sur une machine",
+                          "roles": ROLES},
+    "new_local_users":   {"group": "Parc", "label": "Nouveau compte utilisateur détecté sur une machine",
                           "roles": ROLES},
 }
 CVE_SEVERITY_MIN = {"critical": 9.0, "high": 7.0, "medium": 4.0}
+EPSS_ALERT_THRESHOLD = 0.10   # seuil « exploitation probable » du dashboard
 _SEVERITY_LABELS = {"critical": "critiques", "high": "élevées et critiques",
                     "medium": "moyennes et plus"}
 
@@ -3577,7 +3608,7 @@ def _user_notify_items(logged_users) -> dict:
             if isinstance(u, dict) and str(u.get("username") or "").strip()}
 
 def _detect_new_items(existing: dict | None, *, vulns=None, update_check=None,
-                      logged_users=None):
+                      logged_users=None, open_ports=None):
     """Compare l'état reçu à la mémoire de l'hôte (`notify_known`, cumulative : un
     élément qui disparaît puis revient n'est pas re-signalé). Sans mémoire, la
     référence est le dernier état stocké ; un hôte inconnu sert de référence pour
@@ -3598,8 +3629,19 @@ def _detect_new_items(existing: dict | None, *, vulns=None, update_check=None,
         fields[f"notify_known.{kind}"] = merged[:_NOTIFY_KNOWN_MAX]
 
     if vulns is not None:
-        baseline = set(_cve_notify_items(existing.get("vulnerabilities"))) if existing else set()
-        track("cves", "new_cves", _cve_notify_items(vulns), baseline)
+        current = _cve_notify_items(vulns)
+        previous = _cve_notify_items(existing.get("vulnerabilities")) if existing else {}
+        track("cves", "new_cves", current, set(previous))
+        # L'EPSS évolue chaque jour : une CVE déjà connue peut franchir le seuil plus tard.
+        def hot(items):
+            return {k: v for k, v in items.items() if _score(v.get("epss_score")) >= EPSS_ALERT_THRESHOLD}
+        track("epss", "high_epss", hot(current), set(hot(previous)))
+    if open_ports:
+        previous = existing.get("open_ports")
+        baseline = {str(p) for p in previous} if previous else None
+        track("ports", "new_open_ports",
+              {str(p): {"port": p, "service": PORT_SERVICES.get(p, f"Port {p}")} for p in open_ports},
+              baseline)
     if update_check and update_check.get("ok"):
         previous = existing.get("update_check") or {}
         baseline = set(_update_notify_items(previous)) if previous.get("ok") else None
@@ -3613,8 +3655,94 @@ def _detect_new_items(existing: dict | None, *, vulns=None, update_check=None,
 # Champs de l'agent nécessaires à _detect_new_items (projection Mongo légère)
 NOTIFY_PROJECTION = {"notify_known": 1, "vulnerabilities.product": 1,
                      "vulnerabilities.name": 1, "vulnerabilities.cves.cve_id": 1,
+                     "vulnerabilities.cves.epss_score": 1,
                      "update_check.ok": 1, "update_check.items": 1,
-                     "logged_users.username": 1}
+                     "logged_users.username": 1, "open_ports": 1, "compliance": 1,
+                     "os": 1, "received_at": 1}
+
+def _detect_state_changes(existing: dict | None, *, os_str: str, compliance: dict,
+                          software_list: list, host_info: dict) -> list:
+    """Changements d'état entre deux rapports (pas de mémoire cumulative : un contrôle
+    réparé puis de nouveau en échec, ou un logiciel réinstallé, est re-signalé)."""
+    try:
+        return _state_changes(existing or {}, os_str, compliance, software_list, host_info)
+    except Exception:
+        logger.exception("[MAIL] Détection des changements échouée")
+        return []
+
+def _state_changes(existing, os_str, compliance, software_list, host_info) -> list:
+    events = []
+    if not existing.get("received_at"):
+        # Premier rapport complet (un heartbeat seul ne crée pas la machine)
+        events.append(("new_hosts", [host_info]))
+        return events
+
+    previous = existing.get("compliance") or {}
+    if previous and compliance:
+        doc = mongo.db.compliance_config.find_one({"_id": "rules"}, {"_id": 0})
+        rules = [r for r in (doc["rules"] if doc else DEFAULT_COMPLIANCE_RULES) if r.get("enabled", True)]
+        drift = []
+        for rule in rules:
+            # Mêmes règles des deux côtés : modifier une règle ne crée pas de fausse dérive.
+            before = _eval_rule(rule, previous, existing.get("os") or os_str)
+            after = _eval_rule(rule, compliance, os_str)
+            if before["status"] == "pass" and after["status"] == "fail":
+                drift.append({"rule_id": rule["id"], "name": rule.get("name"),
+                              "severity": rule.get("severity"),
+                              "actual_value": _clean(after.get("actual_value")),
+                              "expected_value": _clean(after.get("expected_value"))})
+        if drift:
+            events.append(("compliance_drift", drift))
+
+    def versions(items):
+        out = {}
+        for sw in items or []:
+            product = str(sw.get("product") or "").strip()
+            if product:
+                out.setdefault(product.lower(), (product, set()))[1].add(str(sw.get("version") or ""))
+        return out
+    before, after = versions(existing.get("software")), versions(software_list)
+    removed = [k for k in before if k not in after]
+    # Une collecte partielle (winget en échec, délai dépassé) ferait « disparaître » une
+    # grande partie du parc logiciel : ce n'est pas une désinstallation, on s'abstient.
+    if before and after and len(removed) <= max(20, len(before) // 2):
+        changes = [{"change": "installed", "product": after[k][0], "from": None,
+                    "to": ", ".join(sorted(after[k][1]))} for k in after if k not in before]
+        changes += [{"change": "removed", "product": before[k][0],
+                     "from": ", ".join(sorted(before[k][1])), "to": None} for k in removed]
+        changes += [{"change": "updated", "product": after[k][0],
+                     "from": ", ".join(sorted(before[k][1])), "to": ", ".join(sorted(after[k][1]))}
+                    for k in after if k in before and after[k][1] != before[k][1]]
+        if changes:
+            events.append(("software_changes", changes[:500]))
+    return events
+
+def _track_cve_scan_health(hostname: str, complete: bool, reason: str | None):
+    """Alerte quand l'analyse CVE est interrompue : au plus une fois par 24 h tant que
+    le problème dure (un hôte dont tout est en cache peut réussir entre deux échecs).
+    Ne lève jamais : une notification ne doit pas interrompre un rapport ou une analyse."""
+    try:
+        _record_cve_scan_health(hostname, complete, reason)
+    except Exception:
+        logger.exception("[MAIL] Suivi de l'analyse CVE échoué pour %s", hostname)
+
+def _record_cve_scan_health(hostname: str, complete: bool, reason: str | None):
+    if complete:
+        mongo.db.settings.update_one({"_id": "cve_scan_health"},
+                                     {"$set": {"ok": True, "updated_at": datetime.utcnow()}},
+                                     upsert=True)
+        return
+    now = datetime.utcnow()
+    state = mongo.db.settings.find_one({"_id": "cve_scan_health"}) or {}
+    alerted = state.get("alerted_at")
+    update = {"ok": False, "reason": reason, "updated_at": now}
+    due = not isinstance(alerted, datetime) or now - alerted >= timedelta(hours=24)
+    if due:
+        update["alerted_at"] = now
+    mongo.db.settings.update_one({"_id": "cve_scan_health"}, {"$set": update}, upsert=True)
+    if due:
+        _queue_notifications(hostname, [("cve_scan_problem",
+                                         [{"reason": reason or "raison inconnue"}])])
 
 def _queue_notifications(hostname: str, events: list):
     """Met en file les nouveautés d'un hôte (rien si l'envoi n'est pas configuré :
@@ -3645,6 +3773,7 @@ def _allowed_notification_types(role: str) -> list:
     return [t for t, spec in NOTIFICATION_TYPES.items() if role in spec["roles"]]
 
 def _normalized_preferences(user: dict) -> dict:
+    """Préférences complètes et bornées ; un type interdit au rôle est toujours désactivé."""
     raw = user.get("notifications") or {}
     allowed = _allowed_notification_types(user.get("role", ""))
 
@@ -3652,23 +3781,21 @@ def _normalized_preferences(user: dict) -> dict:
         value = raw.get(name)
         return value if isinstance(value, dict) else {}
 
-    cves, report = section("new_cves"), section("compliance_report")
-    severity = cves.get("min_severity")
-    try:
-        every_days = max(1, min(int(report.get("every_days") or 7), 90))
-    except (TypeError, ValueError):
-        every_days = 7
-    return {
-        "new_cves": {"enabled": "new_cves" in allowed and bool(cves.get("enabled")),
-                     "min_severity": severity if severity in CVE_SEVERITY_MIN else "critical"},
-        "new_updates": {"enabled": "new_updates" in allowed
-                        and bool(section("new_updates").get("enabled"))},
-        "compliance_report": {"enabled": "compliance_report" in allowed and bool(report.get("enabled")),
-                              "every_days": every_days,
-                              "last_sent_at": report.get("last_sent_at")},
-        "new_local_users": {"enabled": "new_local_users" in allowed
-                            and bool(section("new_local_users").get("enabled"))},
-    }
+    def bounded(value, default, low, high):
+        try:
+            return max(low, min(int(value if value is not None else default), high))
+        except (TypeError, ValueError):
+            return default
+
+    prefs = {t: {"enabled": t in allowed and bool(section(t).get("enabled"))}
+             for t in NOTIFICATION_TYPES}
+    severity = section("new_cves").get("min_severity")
+    prefs["new_cves"]["min_severity"] = severity if severity in CVE_SEVERITY_MIN else "critical"
+    report = section("compliance_report")
+    prefs["compliance_report"]["every_days"] = bounded(report.get("every_days"), 7, 1, 90)
+    prefs["compliance_report"]["last_sent_at"] = report.get("last_sent_at")
+    prefs["agent_offline"]["hours"] = bounded(section("agent_offline").get("hours"), 24, 1, 720)
+    return prefs
 
 def _compliance_report_due(prefs: dict, now: datetime) -> bool:
     report = prefs["compliance_report"]
@@ -3681,58 +3808,116 @@ def _compliance_report_due(prefs: dict, now: datetime) -> bool:
 
 
 # ── Construction et envoi ────────────────────────────────────────────────────
-def _digest_for_user(prefs: dict, events: list):
-    """(sujet, sections) du résumé destiné à un utilisateur, ou None si rien ne le concerne."""
-    rows = {"new_cves": [], "new_updates": [], "new_local_users": []}
+def _pct(value):
+    return None if value is None else f"{_score(value) * 100:.1f} %"
+
+_CHANGE_LABELS = {"installed": "Installé", "removed": "Désinstallé", "updated": "Mis à jour"}
+
+# Par type : (titre de section, en-têtes, ligne(hôte, élément), clé de dédoublonnage,
+# libellé du sujet où {n} est le nombre d'éléments)
+_DIGEST_SPECS = {
+    "new_cves": (None, ["Hôte", "CVE", "CVSS", "EPSS", "Logiciel", "Description"],
+                 lambda h, i: [h, i.get("cve_id"), f"{_score(i.get('cvss_score')):.1f}", _pct(i.get("epss_score")),
+                               f"{i.get('product')} {i.get('version') or ''}".strip(),
+                               (i.get("description") or "")[:160]],
+                 lambda h, i: (h, i.get("cve_id"), i.get("product")), "{n} nouvelle(s) CVE"),
+    "high_epss": ("CVE à forte probabilité d'exploitation (EPSS ≥ 10 %)",
+                  ["Hôte", "CVE", "EPSS", "CVSS", "Logiciel"],
+                  lambda h, i: [h, i.get("cve_id"), _pct(i.get("epss_score")),
+                                f"{_score(i.get('cvss_score')):.1f}",
+                                f"{i.get('product')} {i.get('version') or ''}".strip()],
+                  lambda h, i: (h, i.get("cve_id"), i.get("product")), "{n} CVE à exploitation probable"),
+    "cve_scan_problem": ("Analyse CVE interrompue", ["Hôte concerné", "Raison"],
+                         lambda h, i: [h, i.get("reason")], lambda h, i: (i.get("reason"),),
+                         "analyse CVE interrompue"),
+    "new_updates": ("Nouvelles mises à jour disponibles",
+                    ["Hôte", "Logiciel", "Version installée", "Disponible"],
+                    lambda h, i: [h, i.get("name"), i.get("installed"), i.get("available")],
+                    lambda h, i: (h, i.get("id") or i.get("name"), i.get("available")), "{n} mise(s) à jour"),
+    "software_changes": ("Changements de logiciels", ["Hôte", "Changement", "Logiciel", "Avant", "Après"],
+                         lambda h, i: [h, _CHANGE_LABELS.get(i.get("change"), i.get("change")),
+                                       i.get("product"), i.get("from"), i.get("to")],
+                         lambda h, i: (h, i.get("change"), i.get("product"), i.get("to")),
+                         "{n} changement(s) de logiciels"),
+    "compliance_drift": ("Contrôles de conformité passés en échec",
+                         ["Hôte", "Contrôle", "Sévérité", "Valeur relevée", "Valeur attendue"],
+                         lambda h, i: [h, i.get("name"), i.get("severity"), i.get("actual_value"),
+                                       i.get("expected_value")],
+                         lambda h, i: (h, i.get("rule_id")), "{n} contrôle(s) en échec"),
+    "new_hosts": ("Nouvelles machines", ["Hôte", "Système", "Adresses IP", "Version agent", "Logiciels"],
+                  lambda h, i: [h, i.get("os"), i.get("ip"), i.get("agent_version"), i.get("software_count")],
+                  lambda h, i: (h,), "{n} nouvelle(s) machine(s)"),
+    "new_open_ports": ("Nouveaux ports ouverts", ["Hôte", "Port", "Service"],
+                       lambda h, i: [h, i.get("port"), i.get("service")],
+                       lambda h, i: (h, i.get("port")), "{n} port(s) ouvert(s)"),
+    "new_local_users": ("Nouveaux comptes utilisateur détectés", ["Hôte", "Compte"],
+                        lambda h, i: [h, i.get("username")],
+                        lambda h, i: (h, (i.get("username") or "").lower()), "{n} nouveau(x) compte(s)"),
+}
+
+def _offline_changes(user: dict, prefs: dict, agents: list, now: datetime):
+    """Machines passées hors ligne (et revenues) pour cet utilisateur, selon SON seuil.
+    Retourne (lignes hors ligne, lignes de retour, nouvel état à mémoriser)."""
+    hours = prefs["agent_offline"]["hours"]
+    alerted = {s.get("hostname"): s.get("seen") for s in (user.get("notify_state") or {}).get("offline") or []}
+    offline, back, state = [], [], []
+    for a in agents:
+        seen = a.get("last_heartbeat") or a.get("last_seen")
+        if not isinstance(seen, datetime):
+            continue
+        host = a.get("hostname", "")
+        if now - seen >= timedelta(hours=hours):
+            # Signalée une seule fois par absence : `seen` change dès que la machine revient.
+            if alerted.get(host) != seen:
+                delay = now - seen
+                offline.append([host, f"{a.get('os', '')} {a.get('release', '')}".strip(),
+                                seen.strftime("%d/%m/%Y %H:%M UTC"),
+                                f"{delay.days} j {delay.seconds // 3600} h"])
+            state.append({"hostname": host, "seen": seen})
+        elif host in alerted:
+            back.append([host, seen.strftime("%d/%m/%Y %H:%M UTC")])
+    return offline, back, state
+
+def _digest_for_user(prefs: dict, events: list, offline=None):
+    """(sujet, sections) du résumé destiné à un utilisateur, ou None si rien ne le concerne.
+    offline : (lignes hors ligne, lignes de retour) déjà calculées pour cet utilisateur."""
+    rows = {t: [] for t in _DIGEST_SPECS}
     seen = set()
     threshold = CVE_SEVERITY_MIN[prefs["new_cves"]["min_severity"]]
     for ev in events:
         notif_type = ev.get("type")
         if notif_type not in rows or not prefs.get(notif_type, {}).get("enabled"):
             continue
+        _, _, row_of, key_of, _ = _DIGEST_SPECS[notif_type]
         host = ev.get("hostname", "")
         for it in ev.get("items") or []:
-            if notif_type == "new_cves":
-                if _score(it.get("cvss_score")) < threshold:
-                    continue
-                key = (host, it.get("cve_id"), it.get("product"))
-                row = [host, it.get("cve_id"), f"{_score(it.get('cvss_score')):.1f}",
-                       f"{_score(it.get('epss_score')) * 100:.1f} %" if it.get("epss_score") is not None else None,
-                       f"{it.get('product')} {it.get('version') or ''}".strip(),
-                       (it.get("description") or "")[:160]]
-            elif notif_type == "new_updates":
-                key = (host, it.get("id") or it.get("name"), it.get("available"))
-                row = [host, it.get("name"), it.get("installed"), it.get("available")]
-            else:
-                key = (host, (it.get("username") or "").lower())
-                row = [host, it.get("username")]
+            if notif_type == "new_cves" and _score(it.get("cvss_score")) < threshold:
+                continue
+            key = (notif_type,) + key_of(host, it)
             if key not in seen:
                 seen.add(key)
-                rows[notif_type].append(row)
+                rows[notif_type].append(row_of(host, it))
     rows["new_cves"].sort(key=lambda r: -_score(r[2]))
+    rows["high_epss"].sort(key=lambda r: -_score((r[2] or "0").rstrip(" %")))
 
     def note(count):
         return f"… et {count - _MAIL_ROWS_MAX} autre(s), visibles dans le dashboard." \
             if count > _MAIL_ROWS_MAX else None
 
     sections, subject_parts = [], []
-    if rows["new_cves"]:
-        n = len(rows["new_cves"])
-        sections.append((f"Nouvelles CVE {_SEVERITY_LABELS[prefs['new_cves']['min_severity']]} ({n})",
-                         ["Hôte", "CVE", "CVSS", "EPSS", "Logiciel", "Description"],
-                         rows["new_cves"][:_MAIL_ROWS_MAX], note(n)))
-        subject_parts.append(f"{n} nouvelle(s) CVE")
-    if rows["new_updates"]:
-        n = len(rows["new_updates"])
-        sections.append((f"Nouvelles mises à jour disponibles ({n})",
-                         ["Hôte", "Logiciel", "Version installée", "Disponible"],
-                         rows["new_updates"][:_MAIL_ROWS_MAX], note(n)))
-        subject_parts.append(f"{n} mise(s) à jour")
-    if rows["new_local_users"]:
-        n = len(rows["new_local_users"])
-        sections.append((f"Nouveaux comptes utilisateur détectés ({n})", ["Hôte", "Compte"],
-                         rows["new_local_users"][:_MAIL_ROWS_MAX], note(n)))
-        subject_parts.append(f"{n} nouveau(x) compte(s)")
+    def add(heading, headers, items, subject_label):
+        if items:
+            sections.append((f"{heading} ({len(items)})", headers, items[:_MAIL_ROWS_MAX], note(len(items))))
+            subject_parts.append(subject_label.format(n=len(items)))
+
+    offline_rows, back_rows = offline or ([], [])
+    add("Machines hors ligne", ["Hôte", "Système", "Dernier contact", "Hors ligne depuis"],
+        offline_rows, "{n} machine(s) hors ligne")
+    for notif_type, (heading, headers, _, _, subject_label) in _DIGEST_SPECS.items():
+        if notif_type == "new_cves":
+            heading = f"Nouvelles CVE {_SEVERITY_LABELS[prefs['new_cves']['min_severity']]}"
+        add(heading, headers, rows[notif_type], subject_label)
+    add("Machines de retour en ligne", ["Hôte", "Dernier contact"], back_rows, "{n} retour(s) en ligne")
     if not sections:
         return None
     return "[Heimdall] " + ", ".join(subject_parts), sections
@@ -3772,24 +3957,38 @@ def _send_compliance_report(cfg: dict, user: dict):
     return _deliver_mail(cfg, user["email"], subject, text, html_body, attachments)
 
 def _dispatch_notifications():
-    """Un passage du planificateur : résumés des nouveautés, rapports dus, purge."""
+    """Un passage du planificateur : résumés des nouveautés (et machines hors ligne),
+    rapports de conformité dus, purge."""
     cfg = _mail_config()
     now = datetime.utcnow()
     events = list(mongo.db.notification_events.find({"dispatched": False})
                   .sort("created_at", 1).limit(5000))
-    users = list(mongo.db.dashboard_users.find({"notifications": {"$exists": True}},
-                                               {"email": 1, "role": 1, "notifications": 1}))
-    if events and cfg["ready"]:
+    users = list(mongo.db.dashboard_users.find(
+        {"notifications": {"$exists": True}},
+        {"email": 1, "role": 1, "notifications": 1, "notify_state": 1}))
+    if cfg["ready"]:
+        agents = None
         for user in users:
-            digest = _digest_for_user(_normalized_preferences(user), events)
+            prefs = _normalized_preferences(user)
+            offline = state = None
+            if prefs["agent_offline"]["enabled"]:
+                if agents is None:
+                    agents = list(mongo.db.agents.find({}, {"hostname": 1, "os": 1, "release": 1,
+                                                            "last_seen": 1, "last_heartbeat": 1}))
+                offline_rows, back_rows, state = _offline_changes(user, prefs, agents, now)
+                offline = (offline_rows, back_rows)
+            digest = _digest_for_user(prefs, events, offline)
+            delivered = True
             if digest:
                 subject, sections = digest
-                hosts = len({ev.get("hostname") for ev in events})
                 text, html_body = _mail_render(
                     "Nouveautés détectées sur le parc",
-                    f"Changements relevés depuis le dernier envoi ({hosts} hôte(s) concerné(s)).",
-                    sections, cfg["dashboard_url"])
-                _deliver_mail(cfg, user["email"], subject, text, html_body)
+                    "Changements relevés depuis le dernier envoi.", sections, cfg["dashboard_url"])
+                delivered, _ = _deliver_mail(cfg, user["email"], subject, text, html_body)
+            # Échec d'envoi : l'état n'avance pas, les machines hors ligne seront re-tentées.
+            if state is not None and delivered:
+                mongo.db.dashboard_users.update_one({"_id": user["_id"]},
+                                                    {"$set": {"notify_state.offline": state}})
     if events:
         # Envoyés ou non (SMTP désactivé entre-temps) : jamais d'arriéré renvoyé en rafale.
         mongo.db.notification_events.update_many(
@@ -3836,7 +4035,7 @@ def get_notification_preferences():
         "email": user.get("email"),
         "mail_ready": _mail_config()["ready"],
         "digest_minutes": MAIL_DIGEST_MINUTES,
-        "types": [{"id": t, "label": spec["label"], "allowed": t in allowed}
+        "types": [{"id": t, "label": spec["label"], "group": spec["group"], "allowed": t in allowed}
                   for t, spec in NOTIFICATION_TYPES.items()],
         "preferences": prefs,
         "compliance_next_at": next_report,
@@ -3875,6 +4074,15 @@ def set_notification_preferences():
         if not 1 <= every_days <= 90:
             return jsonify({"error": "La fréquence du rapport doit être comprise entre 1 et 90 jours"}), 400
         patch["notifications.compliance_report.every_days"] = every_days
+    offline = data.get("agent_offline") if isinstance(data.get("agent_offline"), dict) else {}
+    if "hours" in offline:
+        try:
+            hours = int(offline["hours"])
+        except (TypeError, ValueError):
+            hours = 0
+        if not 1 <= hours <= 720:
+            return jsonify({"error": "Le délai hors ligne doit être compris entre 1 et 720 heures"}), 400
+        patch["notifications.agent_offline.hours"] = hours
     if not patch:
         return jsonify({"error": "Rien à modifier"}), 400
     mongo.db.dashboard_users.update_one({"_id": user["_id"]}, {"$set": patch})

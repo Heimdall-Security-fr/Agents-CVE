@@ -381,16 +381,30 @@ de son compte :
 
 | Notification | Contenu | Rôles |
 |--------------|---------|-------|
+| **Vulnérabilités** | | |
 | Nouvelles CVE sur le parc | CVE apparues sur une machine (logiciel ajouté ou mis à jour, ou CVE publiée depuis l'analyse précédente), à partir d'une **sévérité minimale** choisie : critique (CVSS ≥ 9, par défaut), élevée (≥ 7) ou moyenne (≥ 4) | admin, inspection_logs |
+| CVE à forte probabilité d'exploitation | CVE du parc dont l'EPSS atteint 10 %, quelle que soit sa note CVSS — y compris une CVE déjà connue dont l'EPSS monte | admin, inspection_logs |
+| Analyse CVE interrompue | Quota épuisé, clé `CVE_API_KEY` invalide ou API injoignable (rappel au plus une fois par 24 h) | tous |
+| **Logiciels** | | |
 | Nouvelles mises à jour | Nouvelle version disponible pour un logiciel installé (winget, Windows Update, apt…) | admin, inspection_logs, codir |
+| Logiciel installé, désinstallé ou mis à jour | Changements d'inventaire d'une machine entre deux rapports | tous |
+| **Conformité** | | |
 | Rapport de conformité | Score par hôte et contrôles en échec, PDF joint, **tous les X jours** (1 à 90, au choix) | admin, inspection_logs, codir |
+| Contrôle qui passe en échec | Un contrôle conforme au rapport précédent échoue (pare-feu coupé…), sans attendre le rapport | admin, inspection_logs, codir |
+| **Parc** | | |
+| Machine hors ligne | Aucun contact depuis **X heures** (1 à 720, 24 par défaut, au choix), puis retour en ligne | tous |
+| Nouvelle machine | Premier rapport d'un agent | tous |
+| Nouveau port ouvert | Port qui s'ouvre sur une machine (nécessite le scan de ports de l'agent) | tous |
 | Nouveau compte utilisateur | Compte jamais vu sur un serveur ou un ordinateur (profil ou session ouverte) | tous |
 
 Les alertes sont **regroupées** : un seul mail toutes les `MAIL_DIGEST_MINUTES` (5 min),
-même si tout le parc remonte en même temps. Chaque nouveauté n'est signalée **qu'une fois
-par machine** (un compte qui disparaît puis revient n'est pas re-signalé). Les CVE marquées
-« non affecté » ne sont pas envoyées. Une machine ajoutée au parc signale ses CVE ; ses
-comptes et mises à jour déjà présents servent de référence. Le premier rapport de
+même si tout le parc remonte en même temps. Une CVE, un compte, un port ou une mise à jour
+n'est signalé **qu'une fois par machine** (un compte qui disparaît puis revient n'est pas
+re-signalé) ; une dérive de conformité ou un changement de logiciel l'est à chaque fois.
+Les CVE marquées « non affecté » ne sont pas envoyées. Une machine ajoutée au parc est
+signalée avec ses CVE ; ses comptes, ports et mises à jour déjà présents servent de
+référence. Si l'inventaire d'une machine perd brusquement plus de la moitié de ses
+logiciels (collecte partielle), aucune désinstallation n'est signalée. Le premier rapport de
 conformité part dans les minutes qui suivent son activation, puis tous les X jours ;
 le bouton *Recevoir le rapport maintenant* l'envoie à la demande.
 
