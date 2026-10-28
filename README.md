@@ -45,7 +45,7 @@ Elle embarque le dashboard, l'API d'ingestion et l'agent Windows précompilé
 | Tag                                  | Contenu                                            |
 | ------------------------------------ | -------------------------------------------------- |
 | `latest`                             | Dernière version publiée                           |
-| `1.0.<n>` (ex. `1.0.57`)             | Version numérotée (voir [Versioning](#-versioning)) — recommandé en production |
+| `1.1.<n>` (ex. `1.1.46`)             | Version numérotée (voir [Versioning](#-versioning)) — recommandé en production |
 | `<sha-du-commit>`                    | Version figée sur un commit précis                 |
 
 ### Option A — Docker Compose (recommandé)
@@ -451,15 +451,23 @@ publique, contrairement à certains autres endpoints `/api/agents*` de ce serveu
 
 Agents et serveur partagent la même version, écrite dans les agents au moment du build.
 
-- **À chaque push** sur la branche `agents`, la CI construit l'image en `1.0.<numéro de run>`
-  (ex. `1.0.57`) : la version augmente toujours. L'image est aussi publiée sous ce tag
-  (`heimdallsecurity/agent-cve:1.0.57`), en plus de `latest` et du SHA du commit.
+- **Source : GitHub `main`.** On y pousse, ou on y fusionne les PR. Toutes les 10 minutes,
+  le workflow Gitea `sync-from-github` aligne la branche `agents` dessus, puis construit
+  et publie l'image si celle de ce commit n'est pas encore sur Docker Hub (un build
+  manqué est donc rattrapé). Le fichier doit être présent sur la branche par défaut de
+  Gitea (`site-cve`) : Gitea n'y planifie que les workflows de cette branche.
+- **Numérotation** : `1.1.<nombre de commits de main>` (ex. `1.1.46`), qui augmente à chaque
+  commit ; reconstruire le même commit redonne la même version. L'image est publiée sous ce
+  tag (`heimdallsecurity/agent-cve:1.1.46`), en plus de `latest` et du SHA du commit.
+  `.gitea/workflows/main.yaml` reconstruit à la main (« Run workflow »).
+- **Ne poussez plus directement sur `agents` (Gitea)** : la synchro refuse de l'écraser et
+  s'arrête en erreur tant que ces commits ne sont pas aussi sur GitHub.
 - **Mise à jour des agents** : un agent compare sa version à celle du serveur
   (`/api/agent/version`) au démarrage puis toutes les 24 h, et se met à jour automatiquement
   s'il est en retard (sous Windows, `auto_update = false` redemande confirmation). Il suffit
   donc de **mettre à jour le serveur** (`docker compose pull && docker compose up -d`).
 - **Changement mineur/majeur** : modifiez `VERSION` et `AGENT_VERSION_BASE` dans
-  `.gitea/workflows/main.yaml` (ex. `1.1`).
+  `.gitea/workflows/sync-from-github.yaml` et `.gitea/workflows/main.yaml` (ex. `1.2`).
 - Un build local (`docker compose up --build`) utilise la version du fichier `VERSION`.
 
 ---
