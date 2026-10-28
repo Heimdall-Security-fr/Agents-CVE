@@ -708,6 +708,194 @@ def _installed_versions(software_list) -> dict:
             if s.get("product")}
 
 
+# ─── Mises à jour Windows (winget + Windows Update) ──────────────────────────
+# Windows 10 / 11 : `winget upgrade` (applications) ET Windows Update (système),
+# cumulés. Windows Server : Windows Update seulement (winget rarement présent).
+# L'agent ne fait que lire : il n'installe rien.
+def _win_is_server() -> bool:
+    """True sur Windows Server. Lit InstallationType (« Client » / « Server »)
+    dans le registre, avec ProductName en repli (anciens Server sans ce champ)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as key:
+            try:
+                itype = str(winreg.QueryValueEx(key, "InstallationType")[0] or "")
+                if itype:
+                    return itype.lower().startswith("server")
+            except FileNotFoundError:
+                pass
+            try:
+                return "server" in str(winreg.QueryValueEx(key, "ProductName")[0] or "").lower()
+            except FileNotFoundError:
+                pass
+    except Exception:
+        pass
+    return False
+
+
+def _parse_winget_table(text: str) -> list:
+    """Analyse TOUTES les tables de `winget upgrade` (mises à jour classiques, versions
+    inconnues, paquets épinglés). Indépendant de la langue : les colonnes sont repérées
+    d'après la ligne d'en-tête située au-dessus des tirets. Tolère les fins de ligne
+    Windows et les barres de progression (retours chariot)."""
+    lines = [l.split("\r")[-1].rstrip() for l in text.replace("\r\n", "\n").split("\n")]
+    items, seen = [], set()
+    for sep, line in enumerate(lines):
+        if not re.fullmatch(r"-{5,}", line.strip()):
+            continue
+        header = next((lines[j] for j in range(sep - 1, -1, -1) if lines[j].strip()), "")
+        starts = [m.start() for m in re.finditer(r"\S+(?: \S+)*", header)]
+        if len(starts) < 4:            # Nom, Id, Version, Disponible (Source facultative)
+            continue
+        for row in lines[sep + 1:]:
+            if not row.strip() or re.fullmatch(r"-{5,}", row.strip()):
+                break                  # fin de cette table (une autre peut suivre)
+            if len(re.findall(r"\s{2,}", row.strip())) < 2:
+                break                  # phrase (« 12 mises à niveau disponibles. ») et non ligne de tableau
+            cells = [row[st:(starts[i + 1] if i + 1 < len(starts) else None)].strip()
+                     for i, st in enumerate(starts)]
+            if len(cells) >= 4 and cells[0] and cells[3]:
+                key = (cells[1] or cells[0]).lower()
+                if key not in seen:
+                    seen.add(key)
+                    items.append({"name": cells[0], "id": cells[1],
+                                  "installed": cells[2], "available": cells[3]})
+    return items
+
+
+def _find_winget():
+    """winget.exe : PATH, sinon les emplacements d'App Installer (absents du PATH sous
+    certains comptes)."""
+    import glob
+    found = shutil.which("winget")
+    if found:
+        return found
+    local = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps", "winget.exe")
+    if os.path.isfile(local):
+        return local
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    cands = glob.glob(os.path.join(pf, "WindowsApps", "Microsoft.DesktopAppInstaller_*__8wekyb3d8bbwe", "winget.exe"))
+    return sorted(cands)[-1] if cands else None
+
+
+def _winget_upgrades(winget: str) -> dict:
+    result = {"manager": "winget", "ok": False, "error": "winget indisponible",
+              "count": None, "items": []}
+    # --include-unknown : versions non déterminables ; --include-pinned : paquets épinglés
+    # (sans eux, winget les masque) ; --disable-interactivity : pas de barre de progression.
+    # Les winget anciens ne connaissent pas les deux derniers : on retente sans.
+    variants = [
+        ["upgrade", "--include-unknown", "--include-pinned", "--accept-source-agreements",
+         "--disable-interactivity"],
+        ["upgrade", "--include-unknown", "--accept-source-agreements"],
+    ]
+    try:
+        for args in variants:
+            r = subprocess.run(
+                [winget] + args,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                # La première exécution met à jour les sources winget : 120 s ne suffisaient pas
+                timeout=300, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            out = r.stdout or ""
+            items = _parse_winget_table(out)
+            # « Aucune mise à jour applicable » (0x8A15002B) et « aucun paquet correspondant »
+            # (0x8A150014) sont des codes de retour ≠ 0 mais signifient : tout est à jour.
+            rc = (r.returncode or 0) & 0xFFFFFFFF
+            if items or rc in (0, 0x8A15002B, 0x8A150014) or re.search(r"-{5,}", out):
+                return {"manager": "winget", "ok": True, "count": len(items),
+                        "items": items[:_MAX_UPDATE_ITEMS],
+                        "checked_at": datetime.now().isoformat()}
+            result["error"] = ((r.stderr or out).strip().splitlines() or ["sortie vide"])[0][:200]
+            logger.warning(f"winget {' '.join(args[1:])} : {result['error']}")
+    except FileNotFoundError:
+        pass
+    except subprocess.TimeoutExpired:
+        result["error"] = "délai dépassé (winget)"
+    except Exception as e:
+        result["error"] = str(e)[:200]
+    return result
+
+
+# Mises à jour Windows en attente via l'API COM Windows Update Agent (présente sur toutes
+# les éditions, Server compris ; respecte un WSUS configuré). Lecture seule.
+_WU_PS = (
+    "$s=New-Object -ComObject Microsoft.Update.Session;"
+    "$r=$s.CreateUpdateSearcher().Search(\"IsInstalled=0 and IsHidden=0 and Type='Software'\");"
+    "$o=@(foreach($u in $r.Updates){[pscustomobject]@{t=$u.Title;"
+    "kb=(@($u.KBArticleIDs)|%{'KB'+$_}) -join ','}});"
+    "$j=ConvertTo-Json -InputObject $o -Compress;"
+    # base64 : indépendant de l'encodage de la console (accents des titres en français)
+    "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($j))"
+)
+
+
+def _windows_update_pending() -> dict:
+    import json as _json, base64
+    result = {"manager": "windows_update", "ok": False, "error": "Windows Update indisponible",
+              "count": None, "items": []}
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", _WU_PS],
+            capture_output=True, text=True, errors="replace",
+            timeout=300, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = (r.stdout or "").strip()
+        if r.returncode == 0 and out:
+            data = _json.loads(base64.b64decode(out).decode("utf-8"))
+            if isinstance(data, dict):
+                data = [data]
+            items = [{"name": str(u.get("t") or "")[:200], "id": u.get("kb") or None,
+                      "installed": None, "available": u.get("kb") or "disponible"}
+                     for u in data if isinstance(u, dict) and u.get("t")]
+            result = {"manager": "windows_update", "ok": True, "count": len(items),
+                      "items": items[:_MAX_UPDATE_ITEMS],
+                      "checked_at": datetime.now().isoformat()}
+        else:
+            result["error"] = ((r.stderr or out).strip().splitlines() or ["sortie vide"])[0][:200]
+    except subprocess.TimeoutExpired:
+        result["error"] = "délai dépassé (Windows Update)"
+    except Exception as e:
+        result["error"] = str(e)[:200]
+    return result
+
+
+def _merge_update_checks(checks: list, dedupe: bool = False) -> dict:
+    """Cumule plusieurs sources (winget + Windows Update). Réussi si au moins une
+    source a répondu ; les échecs partiels sont signalés dans `error`."""
+    ok = [c for c in checks if c.get("ok")]
+    failed = [f"{c.get('manager')} : {c.get('error')}" for c in checks if not c.get("ok")]
+    if not ok:
+        return {"manager": " + ".join(c.get("manager") or "?" for c in checks), "ok": False,
+                "error": " ; ".join(failed)[:200] or "indisponible", "count": None, "items": []}
+    items = [it for c in ok for it in c.get("items") or []]
+    if dedupe:
+        seen, unique = set(), []
+        for it in items:
+            key = (it.get("id") or it.get("name") or "").lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append(it)
+        items = unique
+    managers = list(dict.fromkeys(c["manager"] for c in ok))
+    return {"manager": " + ".join(managers), "ok": True,
+            "count": len(items) if dedupe else sum(c.get("count") or 0 for c in ok),
+            "items": items[:_MAX_UPDATE_ITEMS],
+            "checked_at": datetime.now().isoformat(),
+            **({"error": ("partiel — " + " ; ".join(failed))[:200]} if failed else {})}
+
+
+def _outdated_windows(_installed) -> dict:
+    """Windows 10 / 11 : winget (applications) ET Windows Update (système), cumulés et
+    dédoublonnés. Windows Server : Windows Update seulement. Lecture seule."""
+    wu = _windows_update_pending()
+    if _win_is_server():
+        return wu
+    winget = _find_winget()
+    wg = _winget_upgrades(winget) if winget else {
+        "manager": "winget", "ok": False, "error": "winget introuvable", "count": None, "items": []}
+    return _merge_update_checks([wg, wu], dedupe=True)
+
+
 def collect_outdated_software(software_list, config=None) -> dict:
     """Résultat : {manager, ok, count, items[], checked_at, cache_age_hours?, error?}.
     Réutilise le dernier résultat pendant `update_check_hours` (défaut 6 h,
@@ -724,6 +912,11 @@ def collect_outdated_software(software_list, config=None) -> dict:
         return _UPDATE_CACHE["data"]
 
     system = platform.system()
+    if system == "Windows":
+        # Windows 10/11 : winget + Windows Update ; Windows Server : Windows Update seul.
+        result = _outdated_windows(_installed_versions(software_list))
+        _UPDATE_CACHE.update(at=time.time(), data=result)
+        return result
     if system == "Darwin":
         candidates = [("brew", "brew", _outdated_brew)]
     else:
