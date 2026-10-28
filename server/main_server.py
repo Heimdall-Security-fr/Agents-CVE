@@ -1562,7 +1562,7 @@ def list_agents():
     # log_tail exclu : peut contenir des chemins/IP internes, servi séparément
     # (endpoint authentifié dédié) — cette route n'est pas protégée par un rôle.
     with db_lock:
-        agents = list(mongo.db.agents.find({}, {"_id": 0, "log_tail": 0}))
+        agents = list(mongo.db.agents.find({}, {"_id": 0, "log_tail": 0, "notify_known": 0}))
     for a in agents:
         totals = _vulnerability_totals(a.get("vulnerabilities"))
         a.update(totals)
@@ -1576,7 +1576,7 @@ def list_agents():
 @app.route('/api/agents/<hostname>', methods=['GET'])
 def get_agent(hostname):
     with db_lock:
-        agent = mongo.db.agents.find_one({"hostname": hostname}, {"_id": 0, "log_tail": 0})
+        agent = mongo.db.agents.find_one({"hostname": hostname}, {"_id": 0, "log_tail": 0, "notify_known": 0})
     if not agent:
         return {"error": "Agent not found"}, 404
     totals = _vulnerability_totals(agent.get("vulnerabilities"))
@@ -1615,7 +1615,7 @@ def agent_history(hostname):
 @require_role("admin", "deployment", "inspection_logs", "codir")
 def agent_inventory(hostname):
     """Fiche complète : inventaire courant et sauvegardes/écarts récents."""
-    agent = mongo.db.agents.find_one({"hostname": hostname}, {"_id": 0, "log_tail": 0})
+    agent = mongo.db.agents.find_one({"hostname": hostname}, {"_id": 0, "log_tail": 0, "notify_known": 0})
     if not agent:
         return {"error": "Agent not found"}, 404
     history = list(mongo.db.agent_reports.find(
@@ -1669,7 +1669,7 @@ def remove_suppression(hostname):
 def agent_software(hostname):
     """Retourne la liste enrichie des logiciels de l'agent avec les CVE associées."""
     with db_lock:
-        agent = mongo.db.agents.find_one({"hostname": hostname}, {"_id": 0})
+        agent = mongo.db.agents.find_one({"hostname": hostname}, {"_id": 0, "notify_known": 0})
     if not agent:
         return {"error": "Agent not found"}, 404
 
@@ -2430,7 +2430,7 @@ def list_servers():
     """List all agents with IPs, OS, online status and subnet grouping.
     Docker IPs (172.16-31.x.x) are already filtered when agents report in."""
     with db_lock:
-        agents = list(mongo.db.agents.find({}, {"_id": 0, "software": 0, "log_tail": 0}))
+        agents = list(mongo.db.agents.find({}, {"_id": 0, "software": 0, "log_tail": 0, "notify_known": 0}))
         disabled_links = {d.get("key") for d in mongo.db.network_link_overrides.find(
             {"disabled": True}, {"_id": 0, "key": 1})}
 
@@ -3652,7 +3652,9 @@ def _detect_new_items(existing: dict | None, *, vulns=None, update_check=None,
         track("users", "new_local_users", _user_notify_items(logged_users), baseline)
     return events, fields
 
-# Champs de l'agent nécessaires à _detect_new_items (projection Mongo légère)
+# Champs de l'agent nécessaires à _detect_new_items (projection Mongo légère).
+# `notify_known` (mémoire des notifications, jusqu'à des milliers de clés par hôte) est
+# exclu de toutes les lectures servies au dashboard.
 NOTIFY_PROJECTION = {"notify_known": 1, "vulnerabilities.product": 1,
                      "vulnerabilities.name": 1, "vulnerabilities.cves.cve_id": 1,
                      "vulnerabilities.cves.epss_score": 1,
