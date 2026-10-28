@@ -470,6 +470,22 @@ def _cve_api_get(path: str, **kwargs):
     return _cve_api_request("GET", path, **kwargs)
 
 def _cve_api_request(method: str, path: str, **kwargs):
+    """Appel à l'API CVE. Les appels authentifiés passent par le coupe-circuit : tant
+    qu'un refus définitif (clé inconnue, quota épuisé) est en cours, aucune requête
+    ne part — une réponse locale équivalente est renvoyée à la place."""
+    api_key = (kwargs.get("headers") or {}).get("x-api-key")
+    if api_key:
+        block = _cve_block_active(api_key)
+        # Le solde reste consultable pendant un blocage « quota » : il ne consomme rien
+        # et c'est lui qui révèle des crédits rachetés.
+        if block and not (block["status"] == 429 and path == "/account/quota"):
+            return _cve_blocked_response(block)
+    response = _cve_api_send(method, path, **kwargs)
+    if api_key:
+        _cve_block_observe(api_key, path, response)
+    return response
+
+def _cve_api_send(method: str, path: str, **kwargs):
     global _cve_public_prefix
     base = HEIMDALL_CVE_API.rstrip("/")
     with _cve_public_prefix_lock:
@@ -488,6 +504,116 @@ def _cve_api_request(method: str, path: str, **kwargs):
         with _cve_public_prefix_lock:
             _cve_public_prefix = ""
     return response
+
+# ─── Coupe-circuit de l'API CVE ──────────────────────────────────────────────
+# Sans lui, un quota épuisé ou une clé inconnue n'arrêtait rien : chaque logiciel de
+# chaque rapport refaisait une requête refusée (des centaines par minute sur l'API).
+# Le blocage est lié à la clé (une nouvelle clé le lève aussitôt) et conservé en
+# base pour survivre à un redémarrage. Une analyse lancée à la main le lève aussi.
+CVE_INVALID_KEY_RETRY = timedelta(hours=6)     # clé refusée : nouvel essai après 6 h
+CVE_RATE_LIMIT_RETRY  = timedelta(minutes=15)  # 429 qui n'est pas un quota journalier
+_cve_block_lock = threading.Lock()
+_cve_block_state = {"loaded": False, "doc": None}
+
+def _cve_key_fingerprint(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode()).hexdigest()[:16]
+
+def _cve_block_active(api_key: str) -> dict | None:
+    """Blocage en cours pour cette clé, ou None."""
+    with _cve_block_lock:
+        if not _cve_block_state["loaded"]:
+            try:
+                _cve_block_state["doc"] = mongo.db.settings.find_one({"_id": "cve_api_block"})
+            except Exception:
+                _cve_block_state["doc"] = None
+            _cve_block_state["loaded"] = True
+        doc = _cve_block_state["doc"]
+    if (not doc or doc.get("fingerprint") != _cve_key_fingerprint(api_key)
+            or not isinstance(doc.get("until"), datetime) or doc["until"] <= datetime.utcnow()):
+        return None
+    return doc
+
+def _cve_block_set(api_key: str, status: int, reason: str, until: datetime):
+    doc = {"_id": "cve_api_block", "fingerprint": _cve_key_fingerprint(api_key), "status": status,
+           "reason": reason, "until": until, "since": datetime.utcnow()}
+    with _cve_block_lock:
+        already = _cve_block_state["doc"] and _cve_block_state["doc"].get("until") == until
+        _cve_block_state.update(loaded=True, doc=doc)
+    try:
+        mongo.db.settings.replace_one({"_id": "cve_api_block"}, doc, upsert=True)
+    except Exception:
+        logger.exception("[CVE API] Blocage non enregistré en base")
+    if not already:
+        logger.warning("[CVE API] %s — plus aucune requête vers l'API CVE avant le %s UTC.",
+                       reason, until.strftime("%d/%m/%Y %H:%M"))
+
+def cve_block_clear(reason: str = ""):
+    with _cve_block_lock:
+        had = _cve_block_state["doc"] is not None
+        _cve_block_state.update(loaded=True, doc=None)
+    try:
+        mongo.db.settings.delete_one({"_id": "cve_api_block"})
+    except Exception:
+        pass
+    if had:
+        logger.info("[CVE API] Requêtes réautorisées%s.", f" ({reason})" if reason else "")
+
+def _next_quota_reset(now: datetime) -> datetime:
+    """Les quotas journaliers repartent à minuit UTC (cf. _daily_cve_scheduler)."""
+    return (now + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
+
+def _retry_after(response, now: datetime) -> datetime | None:
+    """En-tête Retry-After (secondes ou date HTTP), s'il est fourni par l'API."""
+    value = (getattr(response, "headers", None) or {}).get("Retry-After")
+    if not value:
+        return None
+    try:
+        return now + timedelta(seconds=max(1, int(value)))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        from datetime import timezone
+        when = parsedate_to_datetime(value)
+        return when.astimezone(timezone.utc).replace(tzinfo=None) if when.tzinfo else when
+    except (TypeError, ValueError):
+        return None
+
+def _cve_block_observe(api_key: str, path: str, response):
+    """Pose ou lève le blocage d'après la réponse réelle de l'API."""
+    status = getattr(response, "status_code", 0)
+    now = datetime.utcnow()
+    if status == 401:
+        _cve_block_set(api_key, 401, "Clé API CVE inconnue ou expirée (CVE_API_KEY)",
+                       _retry_after(response, now) or now + CVE_INVALID_KEY_RETRY)
+    elif status == 429:
+        text = (getattr(response, "text", "") or "").lower()
+        daily = any(w in text for w in ("quota", "crédit", "credit", "daily", "journalier"))
+        _cve_block_set(api_key, 429,
+                       "Quota journalier et crédits CVE épuisés" if daily else "Trop de requêtes vers l'API CVE",
+                       _retry_after(response, now) or (_next_quota_reset(now) if daily else now + CVE_RATE_LIMIT_RETRY))
+    elif 200 <= status < 300 and _cve_block_active(api_key):
+        if path == "/account/quota":
+            try:
+                data = response.json() or {}
+            except ValueError:
+                data = {}
+            remaining = data.get("daily_remaining")
+            if _cve_block_active(api_key)["status"] == 429 and not (
+                    remaining is None or remaining > 0 or (data.get("credits") or 0) > 0):
+                return
+        cve_block_clear("l'API accepte de nouveau les requêtes")
+
+def _cve_blocked_response(block: dict):
+    """Réponse locale tenant lieu de la requête bloquée (même code que le refus d'origine)."""
+    response = requests.Response()
+    response.status_code = block["status"]
+    response._content = json.dumps({"error": block["reason"], "blocked_until": block["until"].isoformat(),
+                                    "local_block": True}).encode()
+    response.headers["Content-Type"] = "application/json"
+    response.headers["Retry-After"] = str(max(1, int((block["until"] - datetime.utcnow()).total_seconds())))
+    return response
+
 def _read_agent_version() -> str:
     """Version des agents publiée par ce serveur : variable d'environnement si définie,
     sinon le fichier .agent_version écrit au build de l'image, sinon la valeur par défaut."""
@@ -909,6 +1035,10 @@ def _is_online(agent) -> bool:
 # ─── Mise à jour CVE depuis le flux RSS ───────────────────────────────────────
 def refresh_cve_from_rss():
     """Consomme le flux RSS de l'API CVE et met à jour la base locale."""
+    block = _cve_block_active(SERVER_CVE_API_KEY) if SERVER_CVE_API_KEY else None
+    if block:
+        logger.info("[RSS] Ignoré : %s.", block["reason"])
+        return
     try:
         logger.info("[RSS] Récupération du flux RSS…")
         r = requests.get(HEIMDALL_RSS_URL + "?limit=200", headers={"x-api-key": SERVER_CVE_API_KEY}, timeout=15)
@@ -958,6 +1088,8 @@ def _endpoint_checkin(hostname: str, cve_api_key: str):
     """Enregistre le poste auprès du compte (limite de postes du plan, sans crédit).
     Identifiant = HMAC du hostname avec la clé : l'API ne reçoit jamais le nom.
     Returns (allowed, message)."""
+    if _cve_block_active(cve_api_key):
+        return True, "API CVE en pause (coupe-circuit)"
     endpoint_id = hmac.new(cve_api_key.encode(), hostname.strip().lower().encode(),
                            hashlib.sha256).hexdigest()[:32]
     try:
@@ -1050,6 +1182,14 @@ def correlate_vulnerabilities(software_list, cve_api_key: str = "", os_build: st
         if cached is not None:
             cves_raw = cached.get("cves") or []
         else:
+            # Refus définitif en cours (quota épuisé, clé inconnue) : on n'interroge plus
+            # l'API pour les logiciels restants ; ceux en cache restent analysés.
+            block = _cve_block_active(cve_api_key)
+            if block:
+                complete = False
+                _defer(status, f"{block['reason']} — aucune requête avant le "
+                               f"{block['until'].strftime('%d/%m/%Y %H:%M')} UTC")
+                continue
             if not _claim_cve_query():
                 complete = False
                 _defer(status, f"Plafond local CVE_DAILY_QUERY_BUDGET atteint ({CVE_DAILY_QUERY_BUDGET} requêtes/jour)")
@@ -1445,35 +1585,64 @@ def _manual_cve_rescan(hostname: str | None = None):
 @app.route('/api/cve-quota', methods=['GET'])
 @require_role("admin", "deployment", "inspection_logs", "codir")
 def cve_quota():
-    """Proxy du solde : la clé CVE ne quitte jamais le serveur agent."""
+    """Proxy du solde : la clé CVE ne quitte jamais le serveur agent. Résultat partagé
+    2 minutes entre tous les utilisateurs du dashboard ; `?fresh=1` (bouton
+    « Vérifier ») interroge l'API même pendant un blocage, pour constater une clé
+    corrigée ou des crédits rachetés."""
     if not SERVER_CVE_API_KEY:
         return jsonify({"configured": False})
+    fresh = request.args.get("fresh") == "1"
+    now = datetime.utcnow()
+    if not fresh and _CVE_QUOTA_CACHE["data"] is not None and now - _CVE_QUOTA_CACHE["at"] < CVE_QUOTA_CACHE_TTL:
+        return jsonify(_CVE_QUOTA_CACHE["data"])
+    block = _cve_block_active(SERVER_CVE_API_KEY)
+    if block and block["status"] == 401 and not fresh:
+        payload = {"configured": True, "available": False,
+                   "message": f"{block['reason']} — aucune requête avant le "
+                              f"{block['until'].strftime('%d/%m/%Y %H:%M')} UTC "
+                              f"(« Vérifier » pour réessayer maintenant)"}
+    else:
+        payload = _fetch_cve_quota()
+    block = _cve_block_active(SERVER_CVE_API_KEY)
+    if block:
+        payload["paused_until"] = block["until"].isoformat()
+        payload["paused_reason"] = block["reason"]
+    _CVE_QUOTA_CACHE.update(at=now, data=payload)
+    return jsonify(payload)
+
+_CVE_QUOTA_CACHE = {"at": datetime.min, "data": None}
+CVE_QUOTA_CACHE_TTL = timedelta(minutes=2)
+
+def _fetch_cve_quota() -> dict:
     try:
-        response = _cve_api_get("/account/quota",
-                                headers={"x-api-key": SERVER_CVE_API_KEY}, timeout=10)
+        # Appel direct (hors coupe-circuit) : il ne consomme pas de quota ; sa réponse
+        # met à jour le coupe-circuit.
+        response = _cve_api_send("GET", "/account/quota",
+                                 headers={"x-api-key": SERVER_CVE_API_KEY}, timeout=10)
+        _cve_block_observe(SERVER_CVE_API_KEY, "/account/quota", response)
         if response.status_code != 200:
             logger.warning("[CVE API] Vérification de configuration: HTTP %s", response.status_code)
             detail = {401: "clé API CVE invalide", 403: "clé refusée (IP verrouillée ou compte suspendu)",
                       404: "route introuvable (URL HEIMDALL_CVE_API ?)",
                       429: "quota du jour et crédits épuisés (ou site CVE pas encore mis à jour)"}.get(
                           response.status_code, "API en erreur")
-            return jsonify({"configured": True, "available": False,
-                            "message": f"HTTP {response.status_code} : {detail}"})
+            return {"configured": True, "available": False,
+                    "message": f"HTTP {response.status_code} : {detail}"}
         data = response.json()
-        return jsonify({"configured": True, "available": True,
-                        "daily_limit": data.get("daily_limit"),
-                        "plan": data.get("plan"), "plan_label": data.get("plan_label"),
-                        "requests_used": data.get("requests_used", 0),
-                        "daily_remaining": data.get("daily_remaining"),
-                        "credits": data.get("credits", 0),
-                        "max_endpoints": data.get("max_endpoints"),
-                        "endpoints_active": data.get("endpoints_active"),
-                        "reset_date": data.get("reset_date"),
-                        "usage_history": data.get("usage_history", [])})
+        return {"configured": True, "available": True,
+                "daily_limit": data.get("daily_limit"),
+                "plan": data.get("plan"), "plan_label": data.get("plan_label"),
+                "requests_used": data.get("requests_used", 0),
+                "daily_remaining": data.get("daily_remaining"),
+                "credits": data.get("credits", 0),
+                "max_endpoints": data.get("max_endpoints"),
+                "endpoints_active": data.get("endpoints_active"),
+                "reset_date": data.get("reset_date"),
+                "usage_history": data.get("usage_history", [])}
     except requests.RequestException as exc:
         logger.warning("[CVE API] Solde indisponible: %s", exc)
-        return jsonify({"configured": True, "available": False,
-                        "message": "Impossible de joindre l’API CVE."})
+        return {"configured": True, "available": False,
+                "message": "Impossible de joindre l’API CVE."}
 
 @app.route('/api/cve-rescan', methods=['GET', 'POST'])
 @require_role("admin")
@@ -1484,6 +1653,9 @@ def cve_rescan():
             return jsonify(_clean(dict(_cve_rescan_status)))
     if not SERVER_CVE_API_KEY:
         return {"error": "CVE_API_KEY non configurée : analyse manuelle impossible."}, 400
+    # Demande explicite : nouvel essai autorisé (crédits rachetés, clé corrigée…). Si
+    # l'API refuse encore, le blocage revient dès la première réponse.
+    cve_block_clear("analyse lancée à la main")
     with _cve_rescan_lock:
         if _cve_rescan_status["running"]:
             return jsonify(_clean(dict(_cve_rescan_status))), 409
@@ -1510,6 +1682,9 @@ def agent_cve_rescan(hostname):
     global _cve_rescan_status
     if not SERVER_CVE_API_KEY:
         return {"error": "CVE_API_KEY non configurée : analyse manuelle impossible."}, 400
+    # Demande explicite : nouvel essai autorisé (crédits rachetés, clé corrigée…). Si
+    # l'API refuse encore, le blocage revient dès la première réponse.
+    cve_block_clear("analyse lancée à la main")
     with _cve_rescan_lock:
         if _cve_rescan_status.get("running"):
             current = _cve_rescan_status.get("current_host") or _cve_rescan_status.get("target_hostname")

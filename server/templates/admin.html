@@ -1380,7 +1380,7 @@ async function checkCveConfiguration() {
   var btn = document.getElementById('btn-cve-check');
   btn.disabled = true;
   try {
-    var q = await api('/api/cve-quota');
+    var q = await api('/api/cve-quota?fresh=1');
     if (!q.configured) throw new Error('CVE_API_KEY non configurée sur le serveur agent.');
     if (!q.available) throw new Error(q.message || 'API CVE indisponible.');
     var remaining = q.daily_remaining === null ? 'quota illimité' : q.daily_remaining + ' requête(s) aujourd’hui';
@@ -1399,7 +1399,8 @@ async function loadCveQuota() {
     if (!q.available) { el.textContent = 'Solde CVE indisponible' + (q.message ? ' — ' + q.message : ''); return; }
     var daily = q.daily_remaining === null ? 'illimité' : q.daily_remaining + ' / ' + q.daily_limit + ' aujourd’hui';
     var endpoints = q.max_endpoints == null ? '' : ' · Postes : ' + (q.endpoints_active || 0) + ' / ' + q.max_endpoints;
-    el.textContent = 'Quota : ' + daily + ' · Crédits : ' + (q.credits || 0) + endpoints;
+    el.textContent = 'Quota : ' + daily + ' · Crédits : ' + (q.credits || 0) + endpoints
+      + (q.paused_until ? ' · Analyses en pause jusqu’au ' + new Date(q.paused_until + 'Z').toLocaleString('fr-FR') : '');
   } catch (err) { el.textContent = 'Solde CVE indisponible — ' + err.message; }
 }
 
