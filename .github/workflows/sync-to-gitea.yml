@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Sync GitHub → Gitea.
+#
+#  Quand un commit arrive sur `main` ici (fusion d'une PR approuvée par le
+#  propriétaire — protégez la branche : Settings → Branches → main
+#  "Require a pull request before merging" + "Require approvals : 1"),
+#  on le pousse sur la branche `agents` du dépôt Gitea. Le workflow Gitea
+#  (build + miroir + publication Docker Hub) se déclenche alors tout seul.
+#
+#  Secrets GitHub requis (Repo → Settings → Secrets and variables → Actions) :
+#    GITEA_USER    nom du compte Gitea propriétaire du token
+#    GITEA_TOKEN   Personal Access Token Gitea, scope "write:repository"
+#
+#  Le push est SANS --force : si `agents` sur Gitea a divergé (commits locaux
+#  pas encore répliqués ici), le job échoue au lieu d'écraser du travail.
+#  Résolvez la divergence, puis relancez ce workflow (onglet Actions).
+# ─────────────────────────────────────────────────────────────────────────────
+name: sync-to-gitea
+
+concurrency:
+  group: sync-to-gitea
+  cancel-in-progress: false
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+jobs:
+  push-to-gitea:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Push vers Gitea (branche agents)
+        env:
+          GITEA_USER: ${{ secrets.GITEA_USER }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          git remote add gitea "https://${GITEA_USER}:${GITEA_TOKEN}@gitea.heimdall-security.com:3001/Heimdall-security/cve.git"
+          git push gitea HEAD:agents
