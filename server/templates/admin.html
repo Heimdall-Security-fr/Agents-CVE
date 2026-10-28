@@ -205,7 +205,7 @@
     .network-toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:10px; }
     .network-toolbar .hint { color:var(--muted); font-size:11px; margin-right:auto; }
     .network-layout { display:grid; grid-template-columns:minmax(0,1fr) 270px; gap:12px; }
-    .network-viewport { height:min(680px,70vh); min-height:430px; overflow:hidden; position:relative; border:1px solid var(--border-strong); border-radius:14px; background:radial-gradient(circle at center,rgba(77,108,240,.1),transparent 65%),#0b142a; cursor:grab; touch-action:none; }
+    .network-viewport { height:calc(100vh - 170px); min-height:430px; overflow:hidden; position:relative; border:1px solid var(--border-strong); border-radius:14px; background:radial-gradient(circle at center,rgba(77,108,240,.1),transparent 65%),#0b142a; cursor:grab; touch-action:none; }
     .network-viewport.dragging { cursor:grabbing; }
     .network-world { position:absolute; left:0; top:0; width:1600px; height:1100px; transform-origin:0 0; background-image:radial-gradient(rgba(141,160,192,.19) 1px,transparent 1px); background-size:26px 26px; }
     .network-lines { position:absolute; inset:0; width:100%; height:100%; overflow:visible; pointer-events:none; }
@@ -219,11 +219,13 @@
     .network-node .node-ip { color:#b9c8e4; font-family:monospace; font-size:11px; margin-top:7px; overflow-wrap:anywhere; }
     .network-node .node-ports { display:flex; flex-wrap:wrap; gap:4px; margin-top:9px; }
     .network-node .node-ports span { color:#c7d7ff; background:rgba(77,108,240,.2); border-radius:6px; padding:2px 5px; font-size:10px; }
-    .network-inspector { padding:16px; background:var(--surface); border:1px solid var(--border); border-radius:12px; align-self:start; min-width:0; overflow-wrap:anywhere; }
+    .network-inspector { max-height:calc(100vh - 170px); overflow-y:auto; padding:16px; background:var(--surface); border:1px solid var(--border); border-radius:12px; align-self:start; min-width:0; overflow-wrap:anywhere; }
     .network-inspector h3 { margin-bottom:12px; font-size:14px; }
     .network-inspector .field { margin-top:12px; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
     .network-inspector .value { margin-top:4px; font-size:12px; color:var(--text); }
-    @media(max-width:900px) { .network-layout { grid-template-columns:1fr; } .network-viewport { height:540px; } }
+    .network-ip { display:flex; align-items:center; justify-content:space-between; gap:6px; margin:3px 0; }
+    .network-ip.internal .code { opacity:.55; text-decoration:line-through; }
+    @media(max-width:900px) { .network-layout { grid-template-columns:1fr; } .network-viewport { height:540px; } .network-inspector { max-height:none; } }
 
     /* Compliance */
     .plat-filter { display:flex; gap:6px; margin-bottom:16px; flex-wrap:wrap; }
@@ -1026,7 +1028,10 @@ var _networkZoom = 1;
 var _networkOffset = { x: 24, y: 24 };
 var _networkNodes = [];
 var _networkSelected = null;
+var _networkSelectedHost = null;
 var _networkPositions = {};
+var _networkWorld = { width: 650, height: 500 };
+var _networkFitted = false;   // cadrage automatique au premier affichage seulement
 try { _networkPositions = JSON.parse(localStorage.getItem('heimdall-network-positions') || '{}') || {}; } catch(e) {}
 
 function setServersView(v) {
@@ -1060,7 +1065,9 @@ function renderServers() {
   if (_serversView === 'table') {
     var paged = paginate(servers, _paging, 'servers');
     const rows = paged.slice.map(function(s) {
-      const ips   = (s.ip_addresses||[]).map(function(ip){ return '<span class="code">'+esc(ip)+'</span>'; }).join(' ') || '<span class="text-muted">—</span>';
+      const ips   = (s.ip_addresses||[]).map(function(ip){ return (s.internal_ips||[]).indexOf(ip) !== -1
+          ? '<span class="code" style="opacity:.55" title="IP interne, masquée de la carte réseau">'+esc(ip)+' · interne</span>'
+          : '<span class="code">'+esc(ip)+'</span>'; }).join(' ') || '<span class="text-muted">—</span>';
       const ports = (s.open_ports||[]).length
         ? (s.open_ports||[]).slice(0,6).map(function(p){ return '<span class="badge badge-blue" style="margin:2px">:'+esc(p)+'</span>'; }).join('')
           + ((s.open_ports||[]).length>6 ? '<span class="text-muted">+'+((s.open_ports||[]).length-6)+'</span>' : '')
@@ -1161,7 +1168,7 @@ function renderNetwork(servers, subnetMap) {
   }).join('');
   const width = Math.max(650, 28 + cols * 620);
   const nodesHtml = _networkNodes.map(function(n, i) {
-    const ips = (n.host.ip_addresses || []).filter(function(ip){ return n.subnet === 'Adresse inconnue' || ip.startsWith(n.subnet.split('/')[0].split('.').slice(0,3).join('.')+'.'); });
+    const ips = (n.host.ip_addresses || []).filter(function(ip){ return (n.host.internal_ips || []).indexOf(ip) === -1 && (n.subnet === 'Adresse inconnue' || ip.startsWith(n.subnet.split('/')[0].split('.').slice(0,3).join('.')+'.')); });
     const ports = (n.host.open_ports || []).filter(function(p){ return Number.isInteger(Number(p)); });
     const total = n.host.cve_count != null ? n.host.cve_count : (n.host.vulnerable_count || 0);
     return '<div class="network-node '+(n.host.online?'online':'offline')+(_networkSelected===n.key?' selected':'')+'" data-node="'+i+'" tabindex="0" role="button" aria-label="'+esc(n.host.hostname)+' : détails réseau" style="left:'+n.x+'px;top:'+n.y+'px">'
@@ -1170,17 +1177,31 @@ function renderNetwork(servers, subnetMap) {
       +'<div class="node-ports">'+(ports.length ? ports.slice(0,5).map(function(p){ return '<span>:'+esc(p)+'</span>'; }).join('')+(ports.length>5?'<span>+'+(ports.length-5)+'</span>':'') : '<span>Ports non analysés</span>')+'</div>'
       +(total ? '<span class="badge badge-orange" style="margin-top:8px">'+total+' CVE</span>' : '')+'</div>';
   }).join('');
-  el.innerHTML = '<div class="network-toolbar"><span class="hint">Déplacez la carte ou les bulles · Molette pour zoomer · Pointillés = sous-réseau partagé · Trait continu = même hôte multi réseau</span>'
+  _networkWorld = { width: width, height: maxBottom };
+  el.innerHTML = '<div class="network-toolbar"><span class="hint">Glissez pour déplacer · Molette pour zoomer · <span style="color:#ff9b56">Orange</span> = même sous-réseau · Gris = même machine'+(isAdmin()?' · Cliquez une machine pour masquer une IP interne':'')+'</span>'
     +'<button class="btn btn-ghost btn-sm" type="button" onclick="networkZoom(-0.15)">−</button>'
     +'<button class="btn btn-ghost btn-sm" type="button" onclick="networkZoom(0.15)">+</button>'
     +'<button class="btn btn-ghost btn-sm" type="button" onclick="resetNetworkView()">Recentrer</button></div>'
     +'<div class="network-layout"><div class="network-viewport" id="network-viewport"><div class="network-world" id="network-world" style="width:'+width+'px;height:'+maxBottom+'px">'
     +regions+'<svg class="network-lines" id="network-lines" viewBox="0 0 '+width+' '+maxBottom+'" aria-hidden="true"></svg>'+nodesHtml+'</div></div>'
     +'<aside class="network-inspector" id="network-inspector" aria-live="polite"></aside></div>';
-  updateNetworkTransform();
+  if (!_networkFitted) { _networkFitted = true; fitNetworkView(); } else updateNetworkTransform();
   drawNetworkLinks();
   showNetworkInspector();
   bindNetworkInteractions();
+}
+
+function isAdmin() { var u = usr(); return !!(u && u.role === 'admin'); }
+
+// Cadre toute la carte dans la zone visible, centrée (zoom maximal 1).
+function fitNetworkView() {
+  const vp = document.getElementById('network-viewport');
+  if (!vp) return;
+  const w = _networkWorld.width, h = _networkWorld.height;
+  _networkZoom = Math.max(.45, Math.min(1, (vp.clientWidth - 48) / w, (vp.clientHeight - 48) / h));
+  _networkOffset = { x: Math.max(24, (vp.clientWidth - w * _networkZoom) / 2),
+                     y: Math.max(24, (vp.clientHeight - h * _networkZoom) / 2) };
+  updateNetworkTransform();
 }
 
 function updateNetworkTransform() {
@@ -1191,9 +1212,7 @@ function networkZoom(delta) {
   _networkZoom = Math.max(.45, Math.min(1.8, Math.round((_networkZoom+delta)*100)/100));
   updateNetworkTransform();
 }
-function resetNetworkView() {
-  _networkZoom = 1; _networkOffset = {x:24,y:24}; updateNetworkTransform();
-}
+function resetNetworkView() { fitNetworkView(); }
 function drawNetworkLinks() {
   const svg = document.getElementById('network-lines');
   if (!svg) return;
@@ -1203,7 +1222,7 @@ function drawNetworkLinks() {
       if (j <= i) return;
       const sameHost = a.host.hostname === b.host.hostname;
       if (!sameHost && (a.subnet !== b.subnet || !(a.host.subnet_peers || []).includes(b.host.hostname))) return;
-      links.push('<line x1="'+(a.x+87)+'" y1="'+(a.y+75)+'" x2="'+(b.x+87)+'" y2="'+(b.y+75)+'" stroke="'+(sameHost?'#ff9b56':'#7191cc')+'" stroke-opacity="'+(sameHost?'.7':'.43')+'" stroke-width="2" '+(sameHost?'':'stroke-dasharray="6 6"')+'/>');
+      links.push('<line x1="'+(a.x+87)+'" y1="'+(a.y+75)+'" x2="'+(b.x+87)+'" y2="'+(b.y+75)+'" stroke="'+(sameHost?'#8d9ab3':'#ff9b56')+'" stroke-opacity="'+(sameHost?'.5':'.75')+'" stroke-width="2" '+(sameHost?'':'stroke-dasharray="6 6"')+'/>');
     });
   });
   svg.innerHTML = links.join('');
@@ -1211,18 +1230,46 @@ function drawNetworkLinks() {
 function showNetworkInspector() {
   const panel = document.getElementById('network-inspector');
   if (!panel) return;
-  const n = _networkNodes.find(function(item){ return item.key === _networkSelected; });
+  let n = _networkNodes.find(function(item){ return item.key === _networkSelected; });
+  if (!n && _networkSelectedHost) {
+    n = _networkNodes.find(function(item){ return item.host.hostname === _networkSelectedHost; });
+    if (n) {
+      _networkSelected = n.key;
+      const nodeEl = document.querySelector('.network-node[data-node="'+_networkNodes.indexOf(n)+'"]');
+      if (nodeEl) nodeEl.classList.add('selected');
+    }
+  }
   if (!n) { panel.innerHTML = '<h3>Explorer le réseau</h3><p class="text-muted" style="font-size:12px;line-height:1.5">Sélectionnez une bulle pour voir toutes les adresses, les ports analysés et les machines du même sous-réseau.</p>'; return; }
   const h = n.host;
   const peers = (h.subnet_peers || []).filter(function(name){ return _networkNodes.some(function(x){ return x.subnet===n.subnet && x.host.hostname===name; }); });
   panel.innerHTML = '<h3>'+esc(h.hostname)+'</h3><span class="badge '+(h.online?'badge-green':'badge-gray')+'">'+(h.online?'En ligne':'Hors ligne')+'</span>'
     +'<div class="field">Sous-réseau</div><div class="value code">'+esc(n.subnet)+'</div>'
-    +'<div class="field">Adresses IP</div><div class="value">'+((h.ip_addresses||[]).map(function(ip){return '<div class="code" style="margin:3px 0">'+esc(ip)+'</div>';}).join('')||'Non remontées')+'</div>'
+    +'<div class="field">Adresses IP</div><div class="value">'+((h.ip_addresses||[]).map(function(ip){
+        var internal = (h.internal_ips || []).indexOf(ip) !== -1;
+        var btn = !isAdmin() ? (internal ? '<span class="badge badge-gray" style="font-size:10px">interne</span>' : '')
+          : '<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:2px 7px" data-ip="'+esc(ip)+'" data-internal="'+(internal?'0':'1')+'" title="'
+            +(internal ? 'Réafficher cette IP sur la carte' : 'IP interne (Docker, virtualisation…) : ne plus l’afficher sur la carte')+'">'+(internal?'Réafficher':'Interne')+'</button>';
+        return '<div class="network-ip'+(internal?' internal':'')+'"><span class="code">'+esc(ip)+'</span>'+btn+'</div>';
+      }).join('')||'Non remontées')+'</div>'
+    +((h.internal_ips||[]).length ? '<p class="text-muted" style="font-size:11px;margin-top:4px">IP barrée = interne, masquée de la carte.</p>' : '')
     +'<div class="field">Ports observés</div><div class="value">'+((h.open_ports||[]).length ? (h.open_ports||[]).map(function(p){return '<span class="badge badge-blue" style="margin:2px">:'+esc(p)+'</span>';}).join('') : 'Scan de ports non effectué ou aucun port détecté')+'</div>'
     +'<div class="field">Machines du même réseau</div><div class="value">'+(peers.length ? peers.map(esc).join(' · ') : 'Aucune autre machine détectée')+'</div>'
-    +'<p class="text-muted" style="font-size:11px;line-height:1.45;margin-top:12px">Les liens pointillés représentent une appartenance au même sous-réseau ; ils ne prouvent pas un échange de trafic.</p>'
+    +'<p class="text-muted" style="font-size:11px;line-height:1.45;margin-top:12px">Les liens orange représentent une appartenance au même sous-réseau ; ils ne prouvent pas un échange de trafic.</p>'
     +'<button class="btn btn-ghost btn-sm" type="button" id="network-inventory" style="margin-top:14px">Voir l’inventaire →</button>';
   document.getElementById('network-inventory').addEventListener('click', function(){ openInventory(h.hostname); });
+  panel.querySelectorAll('button[data-ip]').forEach(function(b) {
+    b.addEventListener('click', function(){ setInternalIp(h.hostname, b.dataset.ip, b.dataset.internal === '1', b); });
+  });
+}
+
+async function setInternalIp(hostname, ip, internal, btn) {
+  btn.disabled = true;
+  try {
+    await api('/api/network-ips/internal', { method: internal ? 'POST' : 'DELETE',
+                                             body: JSON.stringify({ hostname: hostname, ip: ip }) });
+    toast(internal ? ip + ' masquée de la carte (IP interne)' : ip + ' réaffichée sur la carte', 'ok');
+    loadServers();
+  } catch(err) { toast(err.message, 'err'); btn.disabled = false; }
 }
 function bindNetworkInteractions() {
   const viewport = document.getElementById('network-viewport');
@@ -1232,7 +1279,7 @@ function bindNetworkInteractions() {
     const nodeEl = e.target.closest('.network-node');
     if (nodeEl) {
       const n = _networkNodes[Number(nodeEl.dataset.node)];
-      _networkSelected = n.key;
+      _networkSelected = n.key; _networkSelectedHost = n.host.hostname;
       viewport.querySelectorAll('.network-node').forEach(function(el){el.classList.toggle('selected', el===nodeEl);});
       showNetworkInspector();
       drag = {node:n, el:nodeEl, x:e.clientX, y:e.clientY, startX:n.x, startY:n.y};
@@ -1266,6 +1313,7 @@ function bindNetworkInteractions() {
     const nodeEl=e.target.closest('.network-node');
     if (nodeEl && (e.key==='Enter' || e.key===' ')) {
       e.preventDefault(); _networkSelected=_networkNodes[Number(nodeEl.dataset.node)].key;
+      _networkSelectedHost=_networkNodes[Number(nodeEl.dataset.node)].host.hostname;
       viewport.querySelectorAll('.network-node').forEach(function(el){el.classList.toggle('selected',el===nodeEl);});
       showNetworkInspector();
     }

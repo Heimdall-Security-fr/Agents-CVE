@@ -2433,6 +2433,9 @@ def list_servers():
         agents = list(mongo.db.agents.find({}, {"_id": 0, "software": 0, "log_tail": 0, "notify_known": 0}))
         disabled_links = {d.get("key") for d in mongo.db.network_link_overrides.find(
             {"disabled": True}, {"_id": 0, "key": 1})}
+        internal_ips: dict = {}   # hostname -> IP déclarées internes (Docker, virtualisation…)
+        for d in mongo.db.network_ip_overrides.find({"internal": True}, {"_id": 0, "hostname": 1, "ip": 1}):
+            internal_ips.setdefault(d.get("hostname"), set()).add(d.get("ip"))
 
     servers = []
     subnet_map: dict = {}  # subnet -> [hostname, ...]
@@ -2448,7 +2451,10 @@ def list_servers():
                                     else "complete" if totals["cve_count"] else "unknown")
         a["online"] = _is_online(a)
         a["agent_up_to_date"] = _agent_is_up_to_date(a.get("agent_version", ""))
-        ips = a.get("ip_addresses", [])
+        hidden = internal_ips.get(a["hostname"], set())
+        a["internal_ips"] = sorted(ip for ip in a.get("ip_addresses", []) if ip in hidden)
+        # Les IP internes restent listées, mais ne forment ni sous-réseau ni lien.
+        ips = [ip for ip in a.get("ip_addresses", []) if ip not in hidden]
         # Build subnet groups
         for ip in ips:
             sn = _subnet_24(ip)
@@ -2463,7 +2469,7 @@ def list_servers():
     # Enrich with subnet peers
     for srv in servers:
         peers = set()
-        ips = srv.get("ip_addresses", [])
+        ips = [ip for ip in srv.get("ip_addresses", []) if ip not in srv["internal_ips"]]
         for ip in ips:
             sn = _subnet_24(ip)
             if sn:
@@ -2490,6 +2496,30 @@ def disable_network_link(source, target):
         "key": key, "disabled": True, "disabled_at": datetime.utcnow(),
         "disabled_by": request.dashboard_user.get("email", "")}}, upsert=True)
     return jsonify({"status": "ok"})
+
+@app.route('/api/network-ips/internal', methods=['POST', 'DELETE'])
+@require_role("admin")
+def set_internal_ip():
+    """Déclare (POST) ou retire (DELETE) une IP d'un serveur comme interne : réseau
+    Docker, pont de virtualisation… Elle n'apparaît plus sur la carte réseau."""
+    data = request.get_json(silent=True) or {}
+    hostname = str(data.get("hostname") or "").strip()
+    ip = str(data.get("ip") or "").strip()
+    if not hostname or not ip:
+        return jsonify({"error": "hostname et ip sont requis"}), 400
+    query = {"hostname": hostname, "ip": ip}
+    if request.method == "DELETE":
+        mongo.db.network_ip_overrides.delete_one(query)
+        return jsonify({"status": "ok", "internal": False})
+    agent = mongo.db.agents.find_one({"hostname": hostname}, {"ip_addresses": 1})
+    if not agent:
+        return jsonify({"error": "Serveur introuvable"}), 404
+    if ip not in (agent.get("ip_addresses") or []):
+        return jsonify({"error": "Cette IP n'appartient pas à ce serveur"}), 400
+    mongo.db.network_ip_overrides.update_one(query, {"$set": {
+        **query, "internal": True, "updated_at": datetime.utcnow(),
+        "updated_by": request.dashboard_user.get("email", "")}}, upsert=True)
+    return jsonify({"status": "ok", "internal": True})
 
 # ─── All vulnerabilities across all agents ───────────────────────────────────
 @app.route('/api/vulnerabilities', methods=['GET'])
