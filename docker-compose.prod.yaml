@@ -31,6 +31,9 @@
 #    SERVER_PUBLIC_PORT      port publié sur l'hôte (défaut 4000)
 #    CVE_DAILY_QUERY_BUDGET  plafond local de requêtes CVE/jour (défaut 0 = désactivé)
 #    BIND_ADDR               interface d'écoute (défaut 0.0.0.0 ; 127.0.0.1 derrière un reverse proxy)
+#    SMTP_HOST, SMTP_PORT, SMTP_SECURITY, SMTP_USER, SMTP_PASSWORD, SMTP_FROM
+#                            serveur d'envoi des notifications mail (aussi réglable depuis le dashboard)
+#    DASHBOARD_PUBLIC_URL    URL du dashboard dans les liens des mails
 #
 #  ⚠️  MONGO_USER / MONGO_PASSWORD ne sont pris en compte qu'à la CRÉATION de la
 #      base (dossier de données vide). Changez-les ensuite depuis mongosh.
@@ -69,6 +72,14 @@ services:
       AI_BASE_URL: "${AI_BASE_URL:-}"
       AI_API_KEY: "${AI_API_KEY:-}"
       AI_MODEL: "${AI_MODEL:-}"
+      # Notifications mail (facultatif — se configure aussi depuis la page Notifications)
+      SMTP_HOST: "${SMTP_HOST:-}"
+      SMTP_PORT: "${SMTP_PORT:-587}"
+      SMTP_SECURITY: "${SMTP_SECURITY:-starttls}"
+      SMTP_USER: "${SMTP_USER:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      SMTP_FROM: "${SMTP_FROM:-}"
+      DASHBOARD_PUBLIC_URL: "${DASHBOARD_PUBLIC_URL:-}"
     security_opt:
       - no-new-privileges:true
     cap_drop:

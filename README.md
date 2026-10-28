@@ -147,6 +147,14 @@ s'auto-mettent à jour sur la version exposée par le serveur.
 | `AI_BASE_URL`            | selon le fournisseur       | URL de l'API ou passerelle IA (Ollama : `http://ollama:11434`) |
 | `AI_API_KEY`             | _(vide)_                   | Clé IA, gardée uniquement dans le conteneur serveur |
 | `AI_MODEL`               | _(vide)_                   | Modèle à utiliser (requis pour activer le chat) |
+| `SMTP_HOST`              | _(vide)_                   | Serveur SMTP des notifications mail (défini : envoi activé par défaut). Tout se règle aussi depuis la page *Notifications* (section 4) |
+| `SMTP_PORT`              | `587`                      | Port SMTP |
+| `SMTP_SECURITY`          | `starttls`                 | `starttls`, `ssl` (TLS implicite, port 465) ou `none` |
+| `SMTP_USER` / `SMTP_PASSWORD` | _(vide)_              | Identifiants SMTP (facultatifs pour un relais interne) |
+| `SMTP_FROM`              | `SMTP_USER`                | Adresse d'expéditeur des mails |
+| `SMTP_VERIFY_TLS`        | `true`                     | `false` pour accepter le certificat auto-signé d'un relais interne |
+| `DASHBOARD_PUBLIC_URL`   | _(vide)_                   | URL du dashboard dans les liens des mails (ex. `https://agents.exemple.com/admin`) |
+| `MAIL_DIGEST_MINUTES`    | `5`                        | Intervalle de regroupement des alertes mail (minutes) |
 
 ---
 
@@ -363,6 +371,39 @@ sur la dernière version publiée par ce serveur), et chaque agent porte un badg
 jour** / **en retard** sur la page *Serveurs*. Les agents se mettent à jour tout seuls
 (section 2), ce badge sert surtout à repérer ceux restés éteints trop longtemps pour
 recevoir la mise à jour automatique.
+
+---
+
+## ✉️ 4. Notifications mail
+
+Page *Notifications* du dashboard. Chaque utilisateur choisit ce qu'il reçoit à l'adresse
+de son compte :
+
+| Notification | Contenu | Rôles |
+|--------------|---------|-------|
+| Nouvelles CVE sur le parc | CVE apparues sur une machine (logiciel ajouté ou mis à jour, ou CVE publiée depuis l'analyse précédente), à partir d'une **sévérité minimale** choisie : critique (CVSS ≥ 9, par défaut), élevée (≥ 7) ou moyenne (≥ 4) | admin, inspection_logs |
+| Nouvelles mises à jour | Nouvelle version disponible pour un logiciel installé (winget, Windows Update, apt…) | admin, inspection_logs, codir |
+| Rapport de conformité | Score par hôte et contrôles en échec, PDF joint, **tous les X jours** (1 à 90, au choix) | admin, inspection_logs, codir |
+| Nouveau compte utilisateur | Compte jamais vu sur un serveur ou un ordinateur (profil ou session ouverte) | tous |
+
+Les alertes sont **regroupées** : un seul mail toutes les `MAIL_DIGEST_MINUTES` (5 min),
+même si tout le parc remonte en même temps. Chaque nouveauté n'est signalée **qu'une fois
+par machine** (un compte qui disparaît puis revient n'est pas re-signalé). Les CVE marquées
+« non affecté » ne sont pas envoyées. Une machine ajoutée au parc signale ses CVE ; ses
+comptes et mises à jour déjà présents servent de référence. Le premier rapport de
+conformité part dans les minutes qui suivent son activation, puis tous les X jours ;
+le bouton *Recevoir le rapport maintenant* l'envoie à la demande.
+
+**Serveur d'envoi (SMTP)** — réservé à l'admin, sur la même page : serveur, port, sécurité
+(STARTTLS, SSL/TLS ou aucune), identifiants, expéditeur et URL du dashboard utilisée dans
+les liens des mails. Le bouton *Envoyer un mail de test* vérifie la configuration ; la
+dernière erreur d'envoi s'affiche sur la page. Les mêmes réglages peuvent venir des
+variables `SMTP_*` (tableau ci-dessous) : une valeur saisie dans le dashboard est prioritaire.
+Le mot de passe saisi dans le dashboard est stocké dans MongoDB et n'est jamais renvoyé
+au navigateur ; pour qu'il ne soit pas en base, passez-le par `SMTP_PASSWORD`.
+
+Tant que l'envoi n'est pas activé, rien n'est mis en file : l'activer plus tard n'envoie
+pas d'arriéré.
 
 ---
 

@@ -1233,7 +1233,8 @@ def agent_report():
                                                      status=scan_status)
     # Chaque rapport est déjà une sauvegarde complète dans agent_reports. On
     # calcule aussi l'écart avec le dernier inventaire pour signaler tout ajout.
-    existing_agent = mongo.db.agents.find_one({"hostname": hostname}, {"software": 1}) or {}
+    existing_agent = mongo.db.agents.find_one({"hostname": hostname},
+                                              {"software": 1, **NOTIFY_PROJECTION}) or {}
     def _software_keys(items):
         return {f"{s.get('vendor', '')}|{s.get('product', '')}|{s.get('version', '')}"
                 for s in items if s.get("product")}
@@ -1292,6 +1293,10 @@ def agent_report():
     # Absent (ancien agent) → on ne l'écrit pas, pour ne pas effacer le dernier résultat connu.
     if update_check is not None:
         report["update_check"] = update_check
+    # Nouveautés à notifier par mail (CVE seulement si la corrélation est complète).
+    notify_events, notify_fields = _detect_new_items(
+        existing_agent, vulns=vulns if cve_complete else None,
+        update_check=update_check, logged_users=logged_users)
 
     with db_lock:
         # On garde l'historique et on met à jour le "dernier rapport" de ce serveur
@@ -1299,7 +1304,7 @@ def agent_report():
 
         # Si la corrélation n'a rien retourné (ex: rate limit côté API), on conserve
         # les vulnérabilités précédemment connues plutôt que de les écraser par []
-        update_fields = {**report, "last_seen": datetime.utcnow()}
+        update_fields = {**report, **notify_fields, "last_seen": datetime.utcnow()}
         # log_tail n'entre PAS dans `report`/agent_reports (historique) : à ~8 ko par
         # rapport, ça gonflerait Mongo inutilement pour une donnée qui n'a d'intérêt
         # que « fraîche ». Seul le dernier snapshot (mongo.db.agents) le garde.
@@ -1323,6 +1328,7 @@ def agent_report():
         if cve_complete:
             update_ops["$unset"] = {"cve_scan_error": ""}
         mongo.db.agents.update_one({"hostname": hostname}, update_ops, upsert=True)
+    _queue_notifications(hostname, notify_events)
 
     report.pop("_id", None)
     shown_count = retained_vuln_count if retained_vuln_count is not None else cves_total
@@ -1373,7 +1379,9 @@ def _manual_cve_rescan(hostname: str | None = None):
     try:
         query = {"hostname": hostname} if hostname else {}
         agents = list(mongo.db.agents.find(
-            query, {"hostname": 1, "software": 1, "os_build": 1, "cve_last_checked_at": 1}))
+            query, {"hostname": 1, "software": 1, "os_build": 1, "cve_last_checked_at": 1,
+                    "notify_known.cves": 1, "vulnerabilities.product": 1,
+                    "vulnerabilities.name": 1, "vulnerabilities.cves.cve_id": 1}))
         agents.sort(key=lambda a: (a.get("cve_last_checked_at") is not None,
                                    a.get("cve_last_checked_at") or datetime.min))
         for agent in agents:
@@ -1393,14 +1401,20 @@ def _manual_cve_rescan(hostname: str | None = None):
                 "cve_scan_deferred": False,
                 "cve_scan_reason": None,
             }
+            notify_events = []
+            if complete:
+                # Nouvelles CVE publiées depuis la dernière analyse (logiciels inchangés)
+                notify_events, notify_fields = _detect_new_items(agent, vulns=vulns)
+                update.update(notify_fields)
             # Si le budget s'est arrêté au milieu de l'hôte, conserver le
             # dernier résultat plutôt que de le remplacer par un faux « sain ».
-            if not complete:
+            else:
                 update = {"cve_last_manual_scan": datetime.utcnow(),
                           "cve_scan_status": "deferred",
                           "cve_scan_deferred": True,
                           "cve_scan_reason": scan_status.get("reason")}
             mongo.db.agents.update_one({"hostname": agent.get("hostname", "Unknown")}, {"$set": update})
+            _queue_notifications(agent.get("hostname", "Unknown"), notify_events)
             with _cve_rescan_lock:
                 _cve_rescan_status["processed_hosts"] += 1
                 _cve_rescan_status["completed_hosts" if complete else "deferred_hosts"] += 1
@@ -2564,6 +2578,13 @@ def compliance_results():
     if cached_at and (now - cached_at).total_seconds() < COMPLIANCE_CACHE_TTL_S and _COMPLIANCE_CACHE["data"] is not None:
         return jsonify(_COMPLIANCE_CACHE["data"]), 200
 
+    results = _compute_compliance_results()
+    _COMPLIANCE_CACHE["data"]        = results
+    _COMPLIANCE_CACHE["computed_at"] = now
+    return jsonify(results), 200
+
+def _compute_compliance_results() -> list:
+    """Score et détail de conformité par hôte (page Conformité et rapport mail)."""
     rules_doc = mongo.db.compliance_config.find_one({"_id": "rules"}, {"_id": 0})
     agents    = list(mongo.db.agents.find(
         {}, {"_id": 0, "hostname": 1, "os": 1, "compliance": 1, "ip_addresses": 1}
@@ -2594,9 +2615,7 @@ def compliance_results():
         })
 
     results.sort(key=lambda x: (x["score"] is None, x.get("score", 0)))
-    _COMPLIANCE_CACHE["data"]        = results
-    _COMPLIANCE_CACHE["computed_at"] = now
-    return jsonify(results), 200
+    return results
 
 # ─── Exports partageables ────────────────────────────────────────────────────
 def _csv_response(filename: str, headers: list, rows: list):
@@ -2970,6 +2989,10 @@ def export_compliance_csv():
 @require_role("admin", "inspection_logs", "codir")
 def export_compliance_pdf():
     """Rapport PDF des contrôles de conformité applicables au parc."""
+    return _compliance_pdf_response()
+
+def _compliance_pdf_response():
+    """PDF de conformité (export du dashboard et pièce jointe du rapport mail)."""
     doc = mongo.db.compliance_config.find_one({"_id": "rules"}, {"_id": 0})
     agents = list(mongo.db.agents.find({}, {
         "_id": 0, "hostname": 1, "os": 1, "ip_addresses": 1, "compliance": 1,
@@ -3359,6 +3382,598 @@ def updates_overview():
         "agents": rows,
     }), 200
 
+# ─── Notifications mail ──────────────────────────────────────────────────────
+# L'admin configure le serveur SMTP ; chaque utilisateur du dashboard choisit ce
+# qu'il reçoit. Les nouveautés détectées à la réception des rapports (et lors des
+# analyses CVE planifiées) sont mises en file, puis envoyées en un résumé groupé
+# toutes les MAIL_DIGEST_MINUTES : un parc qui remonte d'un coup donne un seul mail.
+MAIL_DIGEST_MINUTES = max(1, int(os.getenv("MAIL_DIGEST_MINUTES", "5") or 5))
+MAIL_SECURITY_MODES = ("starttls", "ssl", "none")
+_NOTIFY_KNOWN_MAX   = 5000   # clés mémorisées par hôte et par type (borne la taille du document)
+_MAIL_ROWS_MAX      = 200    # lignes par section dans un mail
+_mail_send_lock     = threading.Lock()
+
+# Un type n'est proposé qu'aux rôles qui voient déjà ces données dans le dashboard.
+NOTIFICATION_TYPES = {
+    "new_cves":          {"label": "Nouvelles CVE sur le parc",
+                          "roles": ("admin", "inspection_logs")},
+    "new_updates":       {"label": "Nouvelles mises à jour logicielles disponibles",
+                          "roles": ("admin", "inspection_logs", "codir")},
+    "compliance_report": {"label": "Rapport de conformité périodique",
+                          "roles": ("admin", "inspection_logs", "codir")},
+    "new_local_users":   {"label": "Nouveau compte utilisateur détecté sur une machine",
+                          "roles": ROLES},
+}
+CVE_SEVERITY_MIN = {"critical": 9.0, "high": 7.0, "medium": 4.0}
+_SEVERITY_LABELS = {"critical": "critiques", "high": "élevées et critiques",
+                    "medium": "moyennes et plus"}
+
+
+def _mail_config() -> dict:
+    """Configuration SMTP : valeurs du dashboard (Mongo) en priorité, sinon variables
+    d'environnement SMTP_*. Le mot de passe n'est jamais renvoyé au navigateur."""
+    doc = mongo.db.settings.find_one({"_id": "mail"}) or {}
+
+    def pick(key, env, default=""):
+        value = doc.get(key)
+        return value if value not in (None, "") else os.getenv(env, default)
+
+    try:
+        port = int(pick("port", "SMTP_PORT", "587"))
+    except (TypeError, ValueError):
+        port = 587
+    security = str(pick("security", "SMTP_SECURITY", "starttls")).strip().lower()
+    if security not in MAIL_SECURITY_MODES:
+        security = "starttls"
+    verify = doc.get("verify_tls")
+    if verify is None:
+        verify = os.getenv("SMTP_VERIFY_TLS", "true").strip().lower() not in ("0", "false", "no")
+    username = str(pick("username", "SMTP_USER")).strip()
+    cfg = {
+        "enabled":       bool(doc["enabled"]) if "enabled" in doc else bool(os.getenv("SMTP_HOST")),
+        "host":          str(pick("host", "SMTP_HOST")).strip(),
+        "port":          port,
+        "security":      security,
+        "username":      username,
+        "password":      str(pick("password", "SMTP_PASSWORD")),
+        "from_addr":     str(pick("from_addr", "SMTP_FROM")).strip() or username,
+        "verify_tls":    bool(verify),
+        "dashboard_url": str(pick("dashboard_url", "DASHBOARD_PUBLIC_URL")).strip().rstrip("/"),
+        "last_sent_at":  doc.get("last_sent_at"),
+        "last_error":    doc.get("last_error"),
+        "last_error_at": doc.get("last_error_at"),
+    }
+    cfg["ready"] = bool(cfg["enabled"] and cfg["host"] and "@" in cfg["from_addr"])
+    return cfg
+
+
+def _send_mail(cfg: dict, to_addr: str, subject: str, text: str, html_body: str,
+               attachments=()):
+    """Envoie un mail (texte + HTML, pièces jointes facultatives). Lève en cas d'échec."""
+    import smtplib, ssl
+    from email.message import EmailMessage
+    from email.utils import formatdate, make_msgid
+    msg = EmailMessage()
+    msg["From"] = cfg["from_addr"]
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=cfg["from_addr"].rsplit("@", 1)[-1] or None)
+    msg.set_content(text)
+    msg.add_alternative(html_body, subtype="html")
+    for filename, data, mime in attachments:
+        maintype, subtype = mime.split("/", 1)
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
+    context = ssl.create_default_context()
+    if not cfg["verify_tls"]:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    if cfg["security"] == "ssl":
+        smtp = smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=30, context=context)
+    else:
+        smtp = smtplib.SMTP(cfg["host"], cfg["port"], timeout=30)
+    with smtp:
+        if cfg["security"] == "starttls":
+            smtp.starttls(context=context)
+        if cfg["username"]:
+            smtp.login(cfg["username"], cfg["password"])
+        smtp.send_message(msg)
+
+
+def _deliver_mail(cfg: dict, to_addr: str, subject: str, text: str, html_body: str,
+                  attachments=()):
+    """_send_mail + suivi de l'état affiché au dashboard. Retourne (ok, erreur)."""
+    try:
+        with _mail_send_lock:
+            _send_mail(cfg, to_addr, subject, text, html_body, attachments)
+        mongo.db.settings.update_one({"_id": "mail"}, {"$set": {"last_sent_at": datetime.utcnow()}},
+                                     upsert=True)
+        return True, None
+    except Exception as exc:
+        error = f"{type(exc).__name__} : {exc}"[:300]
+        logger.warning("[MAIL] Envoi à %s échoué : %s", to_addr, error)
+        mongo.db.settings.update_one({"_id": "mail"}, {"$set": {
+            "last_error": error, "last_error_at": datetime.utcnow()}}, upsert=True)
+        return False, error
+
+
+def _mail_render(title: str, intro: str, sections: list, dashboard_url: str = ""):
+    """Corps texte et HTML. sections : [(titre, en-têtes, lignes, note | None)]."""
+    def cell(value):
+        return "—" if value in (None, "") else str(value)
+
+    text = [title, "", intro, ""]
+    parts = [
+        '<div style="font-family:Segoe UI,Arial,sans-serif;color:#172033;max-width:860px">',
+        '<div style="background:#0b1328;padding:14px 20px;border-radius:8px 8px 0 0">'
+        '<span style="color:#ff7a2f;font-weight:700;letter-spacing:.08em">HEIMDALL</span>'
+        '<span style="color:#ffffff;font-weight:600"> SECURITY</span></div>',
+        '<div style="border:1px solid #d9e1ec;border-top:none;padding:20px;border-radius:0 0 8px 8px">',
+        f'<h2 style="margin:0 0 8px;font-size:18px;color:#0b1328">{html.escape(title)}</h2>',
+        f'<p style="margin:0 0 16px;color:#475569;font-size:13px">{html.escape(intro)}</p>',
+    ]
+    for heading, headers, rows, note in sections:
+        text += [heading, "-" * len(heading)]
+        text += [" | ".join(cell(v) for v in row) for row in rows]
+        parts.append(f'<h3 style="margin:18px 0 8px;font-size:14px;color:#0b1328">{html.escape(heading)}</h3>')
+        parts.append('<table style="border-collapse:collapse;width:100%;font-size:12px">'
+                     '<tr>' + "".join(
+                         f'<th style="background:#17223d;color:#fff;text-align:left;padding:6px 8px">'
+                         f'{html.escape(h)}</th>' for h in headers) + '</tr>')
+        for i, row in enumerate(rows):
+            background = "#ffffff" if i % 2 == 0 else "#f4f7fb"
+            parts.append(f'<tr style="background:{background}">' + "".join(
+                f'<td style="border-bottom:1px solid #e5eaf2;padding:6px 8px;vertical-align:top">'
+                f'{html.escape(cell(v))}</td>' for v in row) + '</tr>')
+        parts.append('</table>')
+        if note:
+            text.append(note)
+            parts.append(f'<p style="color:#64748b;font-size:12px;margin:6px 0 0">{html.escape(note)}</p>')
+        text.append("")
+    footer = "Vous recevez ce mail car vous l'avez activé dans Notifications du dashboard Heimdall."
+    if dashboard_url:
+        parts.append(f'<p style="margin-top:20px"><a href="{html.escape(dashboard_url, quote=True)}" '
+                     'style="background:#ff7a2f;color:#fff;padding:8px 14px;border-radius:6px;'
+                     'text-decoration:none;font-size:13px">Ouvrir le dashboard</a></p>')
+        text.append(f"Dashboard : {dashboard_url}")
+    parts.append(f'<p style="color:#94a3b8;font-size:11px;margin-top:20px">{html.escape(footer)}</p></div></div>')
+    text += ["", footer]
+    return "\n".join(text), "".join(parts)
+
+
+# ── Détection des nouveautés par hôte ────────────────────────────────────────
+def _score(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+def _cve_notify_items(vulns) -> dict:
+    out = {}
+    for v in vulns or []:
+        if not isinstance(v, dict):
+            continue
+        product = str(v.get("product") or v.get("name") or "")
+        for c in v.get("cves") or []:
+            if isinstance(c, dict) and c.get("cve_id"):
+                out[f"{c['cve_id']}|{product}".lower()] = {
+                    "cve_id": str(c["cve_id"]), "product": product, "version": v.get("version"),
+                    "cvss_score": _score(c.get("cvss_score")), "epss_score": c.get("epss_score"),
+                    "description": str(c.get("description") or "")[:300]}
+    return out
+
+def _update_notify_items(update_check) -> dict:
+    out = {}
+    for it in (update_check or {}).get("items") or []:
+        if isinstance(it, dict) and it.get("name"):
+            key = f"{it.get('id') or it.get('name')}|{it.get('available') or ''}".lower()
+            out[key] = {"name": it.get("name"), "id": it.get("id"),
+                        "installed": it.get("installed"), "available": it.get("available")}
+    return out
+
+def _user_notify_items(logged_users) -> dict:
+    return {str(u.get("username")).strip().lower(): {"username": str(u.get("username")).strip()}
+            for u in logged_users or []
+            if isinstance(u, dict) and str(u.get("username") or "").strip()}
+
+def _detect_new_items(existing: dict | None, *, vulns=None, update_check=None,
+                      logged_users=None):
+    """Compare l'état reçu à la mémoire de l'hôte (`notify_known`, cumulative : un
+    élément qui disparaît puis revient n'est pas re-signalé). Sans mémoire, la
+    référence est le dernier état stocké ; un hôte inconnu sert de référence pour
+    les comptes et les mises à jour, mais ses CVE sont signalées (machine ajoutée).
+    Retourne ([(type, éléments)], champs $set à écrire sur l'agent)."""
+    existing = existing or {}
+    known = existing.get("notify_known") or {}
+    events, fields = [], {}
+
+    def track(kind, notif_type, current, baseline):
+        previous = known.get(kind)
+        reference = set(previous) if isinstance(previous, list) else baseline
+        if reference is not None:
+            new = [item for key, item in current.items() if key not in reference]
+            if new:
+                events.append((notif_type, new))
+        merged = list(dict.fromkeys(list(current) + sorted(reference or ())))
+        fields[f"notify_known.{kind}"] = merged[:_NOTIFY_KNOWN_MAX]
+
+    if vulns is not None:
+        baseline = set(_cve_notify_items(existing.get("vulnerabilities"))) if existing else set()
+        track("cves", "new_cves", _cve_notify_items(vulns), baseline)
+    if update_check and update_check.get("ok"):
+        previous = existing.get("update_check") or {}
+        baseline = set(_update_notify_items(previous)) if previous.get("ok") else None
+        track("updates", "new_updates", _update_notify_items(update_check), baseline)
+    if logged_users:
+        previous = existing.get("logged_users")
+        baseline = set(_user_notify_items(previous)) if previous else None
+        track("users", "new_local_users", _user_notify_items(logged_users), baseline)
+    return events, fields
+
+# Champs de l'agent nécessaires à _detect_new_items (projection Mongo légère)
+NOTIFY_PROJECTION = {"notify_known": 1, "vulnerabilities.product": 1,
+                     "vulnerabilities.name": 1, "vulnerabilities.cves.cve_id": 1,
+                     "update_check.ok": 1, "update_check.items": 1,
+                     "logged_users.username": 1}
+
+def _queue_notifications(hostname: str, events: list):
+    """Met en file les nouveautés d'un hôte (rien si l'envoi n'est pas configuré :
+    la mémoire de l'hôte étant à jour, l'activer plus tard n'envoie pas d'arriéré)."""
+    if not events:
+        return
+    try:
+        if not _mail_config()["ready"]:
+            return
+        suppressed = {(d.get("cve_id", "").lower(), d.get("product", "").lower())
+                      for d in mongo.db.suppressed_cves.find({"hostname": hostname},
+                                                             {"cve_id": 1, "product": 1})}
+        now = datetime.utcnow()
+        for notif_type, items in events:
+            if notif_type == "new_cves":
+                items = [i for i in items
+                         if (i["cve_id"].lower(), i["product"].lower()) not in suppressed]
+            if items:
+                mongo.db.notification_events.insert_one({
+                    "type": notif_type, "hostname": hostname, "items": items[:500],
+                    "created_at": now, "dispatched": False})
+    except Exception:
+        logger.exception("[MAIL] Mise en file des notifications échouée pour %s", hostname)
+
+
+# ── Préférences utilisateur ──────────────────────────────────────────────────
+def _allowed_notification_types(role: str) -> list:
+    return [t for t, spec in NOTIFICATION_TYPES.items() if role in spec["roles"]]
+
+def _normalized_preferences(user: dict) -> dict:
+    raw = user.get("notifications") or {}
+    allowed = _allowed_notification_types(user.get("role", ""))
+
+    def section(name):
+        value = raw.get(name)
+        return value if isinstance(value, dict) else {}
+
+    cves, report = section("new_cves"), section("compliance_report")
+    severity = cves.get("min_severity")
+    try:
+        every_days = max(1, min(int(report.get("every_days") or 7), 90))
+    except (TypeError, ValueError):
+        every_days = 7
+    return {
+        "new_cves": {"enabled": "new_cves" in allowed and bool(cves.get("enabled")),
+                     "min_severity": severity if severity in CVE_SEVERITY_MIN else "critical"},
+        "new_updates": {"enabled": "new_updates" in allowed
+                        and bool(section("new_updates").get("enabled"))},
+        "compliance_report": {"enabled": "compliance_report" in allowed and bool(report.get("enabled")),
+                              "every_days": every_days,
+                              "last_sent_at": report.get("last_sent_at")},
+        "new_local_users": {"enabled": "new_local_users" in allowed
+                            and bool(section("new_local_users").get("enabled"))},
+    }
+
+def _compliance_report_due(prefs: dict, now: datetime) -> bool:
+    report = prefs["compliance_report"]
+    if not report["enabled"]:
+        return False
+    last = report.get("last_sent_at")
+    # 10 min de marge : le passage du planificateur ne tombe pas pile à l'heure.
+    return not isinstance(last, datetime) or now - last >= timedelta(days=report["every_days"],
+                                                                      minutes=-10)
+
+
+# ── Construction et envoi ────────────────────────────────────────────────────
+def _digest_for_user(prefs: dict, events: list):
+    """(sujet, sections) du résumé destiné à un utilisateur, ou None si rien ne le concerne."""
+    rows = {"new_cves": [], "new_updates": [], "new_local_users": []}
+    seen = set()
+    threshold = CVE_SEVERITY_MIN[prefs["new_cves"]["min_severity"]]
+    for ev in events:
+        notif_type = ev.get("type")
+        if notif_type not in rows or not prefs.get(notif_type, {}).get("enabled"):
+            continue
+        host = ev.get("hostname", "")
+        for it in ev.get("items") or []:
+            if notif_type == "new_cves":
+                if _score(it.get("cvss_score")) < threshold:
+                    continue
+                key = (host, it.get("cve_id"), it.get("product"))
+                row = [host, it.get("cve_id"), f"{_score(it.get('cvss_score')):.1f}",
+                       f"{_score(it.get('epss_score')) * 100:.1f} %" if it.get("epss_score") is not None else None,
+                       f"{it.get('product')} {it.get('version') or ''}".strip(),
+                       (it.get("description") or "")[:160]]
+            elif notif_type == "new_updates":
+                key = (host, it.get("id") or it.get("name"), it.get("available"))
+                row = [host, it.get("name"), it.get("installed"), it.get("available")]
+            else:
+                key = (host, (it.get("username") or "").lower())
+                row = [host, it.get("username")]
+            if key not in seen:
+                seen.add(key)
+                rows[notif_type].append(row)
+    rows["new_cves"].sort(key=lambda r: -_score(r[2]))
+
+    def note(count):
+        return f"… et {count - _MAIL_ROWS_MAX} autre(s), visibles dans le dashboard." \
+            if count > _MAIL_ROWS_MAX else None
+
+    sections, subject_parts = [], []
+    if rows["new_cves"]:
+        n = len(rows["new_cves"])
+        sections.append((f"Nouvelles CVE {_SEVERITY_LABELS[prefs['new_cves']['min_severity']]} ({n})",
+                         ["Hôte", "CVE", "CVSS", "EPSS", "Logiciel", "Description"],
+                         rows["new_cves"][:_MAIL_ROWS_MAX], note(n)))
+        subject_parts.append(f"{n} nouvelle(s) CVE")
+    if rows["new_updates"]:
+        n = len(rows["new_updates"])
+        sections.append((f"Nouvelles mises à jour disponibles ({n})",
+                         ["Hôte", "Logiciel", "Version installée", "Disponible"],
+                         rows["new_updates"][:_MAIL_ROWS_MAX], note(n)))
+        subject_parts.append(f"{n} mise(s) à jour")
+    if rows["new_local_users"]:
+        n = len(rows["new_local_users"])
+        sections.append((f"Nouveaux comptes utilisateur détectés ({n})", ["Hôte", "Compte"],
+                         rows["new_local_users"][:_MAIL_ROWS_MAX], note(n)))
+        subject_parts.append(f"{n} nouveau(x) compte(s)")
+    if not sections:
+        return None
+    return "[Heimdall] " + ", ".join(subject_parts), sections
+
+def _send_compliance_report(cfg: dict, user: dict):
+    """Rapport de conformité du parc (résumé dans le mail, détail en PDF joint)."""
+    results = _compute_compliance_results()
+    scored = [r["score"] for r in results if r["score"] is not None]
+    average = round(sum(scored) / len(scored)) if scored else None
+    failed = sum(r["failed"] for r in results)
+    host_rows = [[r["hostname"], r["os"], "—" if r["score"] is None else f"{r['score']} %",
+                  r["failed"], r["unknown"], r["total"]] for r in results]
+    fail_rows = [[r["hostname"], d.get("name"), d.get("actual_value"), d.get("expected_value")]
+                 for r in results for d in r["details"] if d.get("status") == "fail"]
+    sections = [("Score par hôte", ["Hôte", "OS", "Score", "Échecs", "Inconnus", "Contrôles"],
+                 host_rows[:_MAIL_ROWS_MAX], None)]
+    if fail_rows:
+        sections.append((f"Contrôles en échec ({len(fail_rows)})",
+                         ["Hôte", "Contrôle", "Valeur relevée", "Valeur attendue"],
+                         fail_rows[:_MAIL_ROWS_MAX],
+                         f"… et {len(fail_rows) - _MAIL_ROWS_MAX} autre(s) dans le PDF joint."
+                         if len(fail_rows) > _MAIL_ROWS_MAX else None))
+    intro = (f"{len(results)} hôte(s) évalué(s) — score moyen "
+             f"{'—' if average is None else str(average) + ' %'}, {failed} contrôle(s) en échec.")
+    text, html_body = _mail_render("Rapport de conformité", intro, sections, cfg["dashboard_url"])
+    attachments = []
+    try:
+        with app.app_context():
+            pdf = _compliance_pdf_response()
+        if getattr(pdf, "mimetype", "") == "application/pdf":
+            stamp = datetime.utcnow().strftime("%Y-%m-%d")
+            attachments.append((f"heimdall-conformite-{stamp}.pdf", pdf.get_data(), "application/pdf"))
+    except Exception:
+        logger.exception("[MAIL] PDF de conformité non généré")
+    subject = (f"[Heimdall] Rapport de conformité — score moyen "
+               f"{'—' if average is None else str(average) + ' %'}")
+    return _deliver_mail(cfg, user["email"], subject, text, html_body, attachments)
+
+def _dispatch_notifications():
+    """Un passage du planificateur : résumés des nouveautés, rapports dus, purge."""
+    cfg = _mail_config()
+    now = datetime.utcnow()
+    events = list(mongo.db.notification_events.find({"dispatched": False})
+                  .sort("created_at", 1).limit(5000))
+    users = list(mongo.db.dashboard_users.find({"notifications": {"$exists": True}},
+                                               {"email": 1, "role": 1, "notifications": 1}))
+    if events and cfg["ready"]:
+        for user in users:
+            digest = _digest_for_user(_normalized_preferences(user), events)
+            if digest:
+                subject, sections = digest
+                hosts = len({ev.get("hostname") for ev in events})
+                text, html_body = _mail_render(
+                    "Nouveautés détectées sur le parc",
+                    f"Changements relevés depuis le dernier envoi ({hosts} hôte(s) concerné(s)).",
+                    sections, cfg["dashboard_url"])
+                _deliver_mail(cfg, user["email"], subject, text, html_body)
+    if events:
+        # Envoyés ou non (SMTP désactivé entre-temps) : jamais d'arriéré renvoyé en rafale.
+        mongo.db.notification_events.update_many(
+            {"_id": {"$in": [ev["_id"] for ev in events]}}, {"$set": {"dispatched": True}})
+    if cfg["ready"]:
+        for user in users:
+            if _compliance_report_due(_normalized_preferences(user), now):
+                ok, _ = _send_compliance_report(cfg, user)
+                if ok:
+                    mongo.db.dashboard_users.update_one(
+                        {"_id": user["_id"]},
+                        {"$set": {"notifications.compliance_report.last_sent_at": now}})
+    mongo.db.notification_events.delete_many({"dispatched": True,
+                                              "created_at": {"$lt": now - timedelta(days=30)}})
+
+def _mail_scheduler():
+    while True:
+        time.sleep(MAIL_DIGEST_MINUTES * 60)
+        try:
+            _dispatch_notifications()
+        except Exception:
+            logger.exception("[MAIL] Passage du planificateur échoué")
+
+
+# ── API ──────────────────────────────────────────────────────────────────────
+def _current_user_doc():
+    return mongo.db.dashboard_users.find_one({"_id": request.dashboard_user["id"]}) or {}
+
+@app.route('/api/notifications/preferences', methods=['GET'])
+@require_dashboard_auth
+def get_notification_preferences():
+    user = _current_user_doc()
+    if not user:
+        return jsonify({"error": "Utilisateur introuvable"}), 404
+    prefs = _normalized_preferences(user)
+    allowed = _allowed_notification_types(user.get("role", ""))
+    report = prefs["compliance_report"]
+    next_report = None
+    if report["enabled"]:
+        last = report.get("last_sent_at")
+        next_report = (last + timedelta(days=report["every_days"])) if isinstance(last, datetime) \
+            else datetime.utcnow() + timedelta(minutes=MAIL_DIGEST_MINUTES)
+    return jsonify(_clean({
+        "email": user.get("email"),
+        "mail_ready": _mail_config()["ready"],
+        "digest_minutes": MAIL_DIGEST_MINUTES,
+        "types": [{"id": t, "label": spec["label"], "allowed": t in allowed}
+                  for t, spec in NOTIFICATION_TYPES.items()],
+        "preferences": prefs,
+        "compliance_next_at": next_report,
+    })), 200
+
+@app.route('/api/notifications/preferences', methods=['PUT'])
+@require_dashboard_auth
+def set_notification_preferences():
+    user = _current_user_doc()
+    if not user:
+        return jsonify({"error": "Utilisateur introuvable"}), 404
+    data = request.get_json(silent=True) or {}
+    allowed = _allowed_notification_types(user.get("role", ""))
+    patch = {}
+    for notif_type in NOTIFICATION_TYPES:
+        section = data.get(notif_type)
+        if not isinstance(section, dict):
+            continue
+        if "enabled" in section:
+            enabled = bool(section["enabled"])
+            if enabled and notif_type not in allowed:
+                return jsonify({"error": f"« {NOTIFICATION_TYPES[notif_type]['label']} » "
+                                         f"n'est pas disponible pour votre rôle"}), 403
+            patch[f"notifications.{notif_type}.enabled"] = enabled
+    severity = (data.get("new_cves") or {}).get("min_severity") if isinstance(data.get("new_cves"), dict) else None
+    if severity is not None:
+        if severity not in CVE_SEVERITY_MIN:
+            return jsonify({"error": "Sévérité minimale invalide (critical, high, medium)"}), 400
+        patch["notifications.new_cves.min_severity"] = severity
+    report = data.get("compliance_report") if isinstance(data.get("compliance_report"), dict) else {}
+    if "every_days" in report:
+        try:
+            every_days = int(report["every_days"])
+        except (TypeError, ValueError):
+            every_days = 0
+        if not 1 <= every_days <= 90:
+            return jsonify({"error": "La fréquence du rapport doit être comprise entre 1 et 90 jours"}), 400
+        patch["notifications.compliance_report.every_days"] = every_days
+    if not patch:
+        return jsonify({"error": "Rien à modifier"}), 400
+    mongo.db.dashboard_users.update_one({"_id": user["_id"]}, {"$set": patch})
+    return get_notification_preferences()
+
+@app.route('/api/notifications/compliance-report/send', methods=['POST'])
+@require_role(*NOTIFICATION_TYPES["compliance_report"]["roles"])
+def send_compliance_report_now():
+    """Envoie tout de suite le rapport à l'utilisateur connecté (sans décaler la périodicité)."""
+    cfg = _mail_config()
+    if not cfg["ready"]:
+        return jsonify({"error": "L'envoi des mails n'est pas configuré (serveur SMTP)"}), 409
+    ok, error = _send_compliance_report(cfg, _current_user_doc())
+    if not ok:
+        return jsonify({"error": f"Envoi échoué : {error}"}), 502
+    return jsonify({"status": "ok"}), 200
+
+@app.route('/api/settings/mail', methods=['GET'])
+@require_role("admin")
+def get_mail_settings():
+    cfg = _mail_config()
+    cfg["password_set"] = bool(cfg.pop("password"))
+    cfg["pending_events"] = mongo.db.notification_events.count_documents({"dispatched": False})
+    cfg["subscribers"] = sum(
+        1 for u in mongo.db.dashboard_users.find({"notifications": {"$exists": True}},
+                                                 {"role": 1, "notifications": 1})
+        if any(p.get("enabled") for p in _normalized_preferences(u).values()))
+    cfg["digest_minutes"] = MAIL_DIGEST_MINUTES
+    return jsonify(_clean(cfg)), 200
+
+@app.route('/api/settings/mail', methods=['PUT'])
+@require_role("admin")
+def set_mail_settings():
+    data = request.get_json(silent=True) or {}
+    patch, unset = {}, {}
+    for key in ("host", "username", "from_addr", "dashboard_url"):
+        if key in data:
+            value = str(data.get(key) or "").strip()
+            if "\r" in value or "\n" in value or len(value) > 300:
+                return jsonify({"error": f"Valeur invalide pour {key}"}), 400
+            patch[key] = value.rstrip("/") if key == "dashboard_url" else value
+    if patch.get("from_addr") and "@" not in patch["from_addr"]:
+        return jsonify({"error": "Adresse d'expéditeur invalide"}), 400
+    if patch.get("dashboard_url") and not re.match(r"^https?://", patch["dashboard_url"]):
+        return jsonify({"error": "L'URL du dashboard doit commencer par http:// ou https://"}), 400
+    if "port" in data:
+        try:
+            port = int(data["port"])
+        except (TypeError, ValueError):
+            port = 0
+        if not 1 <= port <= 65535:
+            return jsonify({"error": "Port SMTP invalide"}), 400
+        patch["port"] = port
+    if "security" in data:
+        if data["security"] not in MAIL_SECURITY_MODES:
+            return jsonify({"error": "Sécurité invalide (starttls, ssl, none)"}), 400
+        patch["security"] = data["security"]
+    for key in ("enabled", "verify_tls"):
+        if key in data:
+            patch[key] = bool(data[key])
+    if data.get("clear_password"):
+        unset["password"] = ""
+    elif data.get("password"):
+        patch["password"] = str(data["password"])
+    if not patch and not unset:
+        return jsonify({"error": "Rien à modifier"}), 400
+    current = _mail_config()
+    enabled = patch.get("enabled", current["enabled"])
+    host = patch.get("host", current["host"])
+    sender = patch.get("from_addr", current["from_addr"]) or patch.get("username", current["username"])
+    if enabled and not (host and "@" in sender):
+        return jsonify({"error": "Pour activer l'envoi, renseignez le serveur SMTP et une "
+                                 "adresse d'expéditeur"}), 400
+    patch["updated_at"] = datetime.utcnow()
+    update = {"$set": patch}
+    if unset:
+        update["$unset"] = unset
+    mongo.db.settings.update_one({"_id": "mail"}, update, upsert=True)
+    return get_mail_settings()
+
+@app.route('/api/settings/mail/test', methods=['POST'])
+@require_role("admin")
+def test_mail_settings():
+    """Envoie un mail de test à l'administrateur connecté."""
+    cfg = _mail_config()
+    if not (cfg["host"] and "@" in cfg["from_addr"]):
+        return jsonify({"error": "Renseignez d'abord le serveur SMTP et l'adresse d'expéditeur"}), 400
+    to_addr = request.dashboard_user["email"]
+    text, html_body = _mail_render(
+        "Mail de test", "La configuration SMTP du serveur Heimdall fonctionne.",
+        [("Paramètres utilisés", ["Serveur", "Port", "Sécurité", "Expéditeur"],
+          [[cfg["host"], cfg["port"], cfg["security"], cfg["from_addr"]]], None)],
+        cfg["dashboard_url"])
+    ok, error = _deliver_mail(cfg, to_addr, "[Heimdall] Mail de test", text, html_body)
+    if not ok:
+        return jsonify({"error": f"Envoi échoué : {error}"}), 502
+    mongo.db.settings.update_one({"_id": "mail"}, {"$unset": {"last_error": "", "last_error_at": ""}})
+    return jsonify({"status": "ok", "to": to_addr}), 200
+
 # ─── Admin dashboard ────────────────────────────────────────────────────────────────────
 @app.route('/admin')
 @app.route('/admin/')
@@ -3409,5 +4024,6 @@ if __name__ == "__main__":
             refresh_cve_from_rss()
     threading.Thread(target=rss_scheduler, daemon=True).start()
     threading.Thread(target=_daily_cve_scheduler, daemon=True).start()
+    threading.Thread(target=_mail_scheduler, name="MailScheduler", daemon=True).start()
 
     app.run(host="0.0.0.0", port=SERVER_PUBLIC_PORT, debug=False)

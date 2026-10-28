@@ -40,7 +40,7 @@
 
     /* Inputs */
     label { display:block; color:var(--muted); font-size:11px; margin-bottom:4px; margin-top:14px; text-transform:uppercase; letter-spacing:.05em; font-weight:600; }
-    input[type=text],input[type=email],input[type=password],select {
+    input[type=text],input[type=email],input[type=password],input[type=number],select {
       width:100%; padding:10px 12px; background:rgba(10, 18, 36, 0.55); border:1px solid var(--border);
       border-radius:7px; color:var(--text); font-size:13px; transition:border-color .15s, box-shadow .15s; }
     input:focus,select:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(var(--accent-rgb),.18); }
@@ -164,6 +164,18 @@
     .alert { padding:10px 14px; border-radius:7px; font-size:13px; margin-bottom:16px; }
     .alert-err { background:rgba(248,113,113,.1); color:var(--red);   border:1px solid rgba(248,113,113,.25); }
     .alert-ok  { background:rgba(74,222,128,.1);  color:var(--green); border:1px solid rgba(74,222,128,.25); }
+    .alert-warn { background:rgba(250,204,21,.1); color:var(--yellow); border:1px solid rgba(250,204,21,.25); }
+
+    /* Notifications */
+    .notif-row { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; padding:14px 0; border-top:1px solid var(--border); }
+    .notif-row.disabled { opacity:.5; }
+    .notif-check { display:flex; align-items:flex-start; gap:10px; margin:0; text-transform:none; letter-spacing:0; font-weight:400; color:var(--text); font-size:13px; cursor:pointer; flex:1; min-width:240px; }
+    .notif-check input { margin-top:3px; }
+    .notif-check small { display:block; color:var(--muted); font-size:12px; margin-top:3px; }
+    .notif-extra { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12px; color:var(--muted); }
+    .notif-extra select, .notif-extra input { width:auto; padding:6px 10px; }
+    .notif-extra input[type=number] { width:76px; }
+    .form-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:0 16px; }
 
     /* Misc */
     .flex-between { display:flex; align-items:center; justify-content:space-between; }
@@ -418,6 +430,7 @@
     <div class="nav-item" data-page="compliance"><span class="icon">✅</span> Conformité</div>
     <div class="nav-item" data-page="updates"><span class="icon">🔄</span> Mises à jour</div>
     <div class="nav-item" data-page="deploy"><span class="icon">📦</span> Déploiement</div>
+    <div class="nav-item" data-page="notifications"><span class="icon">✉️</span> Notifications</div>
     <div class="nav-item" data-page="users" id="nav-users" style="display:none"><span class="icon">👤</span> Utilisateurs</div>
     <div class="sidebar-footer">
       <div class="user-info mb-4">
@@ -534,6 +547,15 @@
     <div class="page" id="page-deploy">
       <div class="header-row"><div><h1>Déploiement</h1><p>Téléchargement et installation des agents</p></div></div>
       <div id="deploy-content"><div class="loading-center"><div class="spinner"></div></div></div>
+    </div>
+
+    <!-- Notifications mail -->
+    <div class="page" id="page-notifications">
+      <div class="header-row">
+        <div><h1>Notifications</h1><p>Choisissez les alertes que vous recevez par e-mail</p></div>
+        <button class="btn btn-ghost btn-sm" onclick="loadNotifications()">↻</button>
+      </div>
+      <div id="notifications-content"><div class="loading-center"><div class="spinner"></div></div></div>
     </div>
 
     <!-- Utilisateurs -->
@@ -795,7 +817,7 @@ function logout() {
 }
 
 /* ── Router ── */
-var LOADERS = { servers: loadServers, vulns: loadVulns, ai: loadAi, compliance: loadCompliance, updates: loadUpdates, deploy: loadDeploy, users: loadUsers, dashboard: loadDashboard };
+var LOADERS = { servers: loadServers, vulns: loadVulns, ai: loadAi, compliance: loadCompliance, updates: loadUpdates, deploy: loadDeploy, notifications: loadNotifications, users: loadUsers, dashboard: loadDashboard };
 
 function navigate(page) {
   document.querySelectorAll('.page').forEach(function(p){ p.classList.remove('active'); });
@@ -1982,6 +2004,171 @@ function renderResults() {
     }).join('')+'</div>'+paginationBar(paged, 'goCompliancePage');
 }
 
+/* ── Notifications mail ── */
+var NOTIF_HELP = {
+  new_cves: "Une CVE apparaît sur une machine : logiciel ajouté ou mis à jour, ou CVE publiée depuis l'analyse précédente.",
+  new_updates: 'Une nouvelle version devient disponible pour un logiciel installé (winget, Windows Update, apt, dnf…).',
+  compliance_report: 'Score de conformité de chaque hôte et contrôles en échec, avec le rapport PDF en pièce jointe.',
+  new_local_users: "Un compte jamais vu jusque-là apparaît sur un serveur ou un ordinateur (profil ou session ouverte)."
+};
+var _notifState = null;
+
+// Les dates du serveur sont en UTC sans fuseau explicite.
+function notifDate(s) {
+  if (!s) return '—';
+  return new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(s) ? s : s + 'Z').toLocaleString('fr-FR');
+}
+
+async function loadNotifications() {
+  var el = document.getElementById('notifications-content');
+  el.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+  try {
+    var me = usr() || {};
+    var prefs = await api('/api/notifications/preferences');
+    var mail = me.role === 'admin' ? await api('/api/settings/mail') : null;
+    _notifState = { prefs: prefs, mail: mail };
+    el.innerHTML = renderNotifPrefs(prefs, !!mail) + (mail ? renderMailSettings(mail) : '');
+  } catch(err) {
+    el.innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>';
+  }
+}
+
+function renderNotifPrefs(d, isAdmin) {
+  var p = d.preferences;
+  var warn = d.mail_ready ? '' : '<div class="alert alert-warn" style="margin-top:14px">L\'envoi des mails n\'est pas encore configuré : '
+    + (isAdmin ? 'renseignez et activez le serveur SMTP ci-dessous.' : 'demandez à un administrateur de configurer le serveur SMTP.')
+    + ' Vos choix sont enregistrés et s\'appliqueront dès que ce sera fait.</div>';
+  var reportAllowed = false;
+  var rows = d.types.map(function(t) {
+    var on = p[t.id] && p[t.id].enabled;
+    var extra = '';
+    if (t.id === 'compliance_report') reportAllowed = t.allowed;
+    if (t.allowed && t.id === 'new_cves') {
+      var sev = p.new_cves.min_severity;
+      extra = 'Sévérité minimale <select id="np-cve-sev">'
+        + [['critical','Critique (CVSS ≥ 9)'],['high','Élevée (CVSS ≥ 7)'],['medium','Moyenne (CVSS ≥ 4)']].map(function(o){
+            return '<option value="'+o[0]+'"'+(o[0]===sev?' selected':'')+'>'+esc(o[1])+'</option>';
+          }).join('') + '</select>';
+    }
+    if (t.allowed && t.id === 'compliance_report') {
+      extra = 'Tous les <input type="number" id="np-report-days" min="1" max="90" value="'+esc(p.compliance_report.every_days)+'"> jours'
+        + (d.compliance_next_at ? '<span>· prochain envoi vers le '+esc(notifDate(d.compliance_next_at))+'</span>' : '');
+    }
+    return '<div class="notif-row'+(t.allowed?'':' disabled')+'">'
+      + '<label class="notif-check"><input type="checkbox" id="np-'+esc(t.id)+'"'+(on?' checked':'')+(t.allowed?'':' disabled')+'>'
+      + '<span><strong>'+esc(t.label)+'</strong><small>'+esc(NOTIF_HELP[t.id] || '')+(t.allowed?'':' — non disponible pour votre rôle.')+'</small></span></label>'
+      + (extra ? '<div class="notif-extra">'+extra+'</div>' : '')
+      + '</div>';
+  }).join('');
+  return '<div class="card mb-6">'
+    + '<div class="flex-between" style="flex-wrap:wrap;gap:10px"><div><div class="card-label">Mes notifications</div>'
+    + '<div style="font-size:13px;margin-top:6px">Envoyées à <strong>'+esc(d.email)+'</strong></div></div>'
+    + '<div class="flex gap-2">'
+    + (reportAllowed ? '<button class="btn btn-ghost btn-sm" onclick="sendComplianceReportNow(this)" title="Envoie le rapport de conformité tout de suite, sans décaler les envois périodiques">Recevoir le rapport maintenant</button>' : '')
+    + '<button class="btn btn-primary btn-sm" onclick="saveNotifPrefs(this)">Enregistrer</button></div></div>'
+    + warn + '<div style="margin-top:10px">' + rows + '</div>'
+    + '<p class="text-muted" style="font-size:12px;margin-top:12px">Les alertes sont regroupées dans un seul mail toutes les '+esc(d.digest_minutes)+' min. Une nouveauté n\'est signalée qu\'une fois par machine ; les CVE marquées « non affecté » ne sont pas envoyées.</p>'
+    + '</div>';
+}
+
+async function saveNotifPrefs(btn) {
+  var body = {};
+  _notifState.prefs.types.forEach(function(t) {
+    if (t.allowed) body[t.id] = { enabled: document.getElementById('np-'+t.id).checked };
+  });
+  var sev = document.getElementById('np-cve-sev');
+  if (sev && body.new_cves) body.new_cves.min_severity = sev.value;
+  var days = document.getElementById('np-report-days');
+  if (days && body.compliance_report) body.compliance_report.every_days = parseInt(days.value, 10);
+  btn.disabled = true;
+  try {
+    await api('/api/notifications/preferences', { method: 'PUT', body: JSON.stringify(body) });
+    toast('Préférences de notification enregistrées', 'ok');
+    loadNotifications();
+  } catch(err) { toast(err.message, 'err'); }
+  finally { btn.disabled = false; }
+}
+
+async function sendComplianceReportNow(btn) {
+  btn.disabled = true;
+  try {
+    await api('/api/notifications/compliance-report/send', { method: 'POST' });
+    toast('Rapport de conformité envoyé à ' + _notifState.prefs.email, 'ok');
+  } catch(err) { toast(err.message, 'err'); }
+  finally { btn.disabled = false; }
+}
+
+function renderMailSettings(m) {
+  function field(label, input) { return '<div><label>'+esc(label)+'</label>'+input+'</div>'; }
+  function opt(v, l, cur) { return '<option value="'+v+'"'+(v===cur?' selected':'')+'>'+esc(l)+'</option>'; }
+  var status = [esc(m.subscribers)+' utilisateur(s) abonné(s)'];
+  if (m.pending_events) status.push(esc(m.pending_events)+' alerte(s) en attente du prochain envoi');
+  status.push(m.last_sent_at ? 'dernier envoi le '+esc(notifDate(m.last_sent_at)) : 'aucun mail envoyé pour le moment');
+  return '<div class="card">'
+    + '<div class="flex-between" style="flex-wrap:wrap;gap:10px"><div><div class="card-label">Serveur d\'envoi (SMTP) — administrateur</div>'
+    + '<div class="text-muted" style="font-size:12px;margin-top:6px">'+status.join(' · ')+'</div></div>'
+    + '<div class="flex gap-2"><button class="btn btn-ghost btn-sm" onclick="testMailSettings(this)" title="Enregistre puis envoie un mail de test à votre adresse">Envoyer un mail de test</button>'
+    + '<button class="btn btn-primary btn-sm" onclick="saveMailSettings(this)">Enregistrer</button></div></div>'
+    + (m.last_error ? '<div class="alert alert-err" style="margin-top:14px">Dernière erreur d\'envoi ('+esc(notifDate(m.last_error_at))+') : '+esc(m.last_error)+'</div>' : '')
+    + '<label class="notif-check" style="margin-top:16px"><input type="checkbox" id="ms-enabled"'+(m.enabled?' checked':'')+'>'
+    + '<span><strong>Activer l\'envoi des mails</strong><small>Désactivé, aucune alerte n\'est mise en file ni envoyée.</small></span></label>'
+    + '<div class="form-grid">'
+    + field('Serveur SMTP', '<input type="text" id="ms-host" placeholder="smtp.exemple.com" value="'+esc(m.host)+'">')
+    + field('Port', '<input type="number" id="ms-port" min="1" max="65535" value="'+esc(m.port)+'">')
+    + field('Sécurité', '<select id="ms-security" onchange="_mailSecurityChanged()">'
+        + opt('starttls','STARTTLS (587)',m.security) + opt('ssl','SSL/TLS (465)',m.security) + opt('none','Aucune (25, relais interne)',m.security) + '</select>')
+    + field('Utilisateur', '<input type="text" id="ms-username" autocomplete="off" placeholder="(facultatif)" value="'+esc(m.username)+'">')
+    + field('Mot de passe', '<input type="password" id="ms-password" autocomplete="new-password" placeholder="'+(m.password_set?'•••••••• (inchangé)':'(facultatif)')+'">'
+        + (m.password_set ? '<label class="notif-check" style="margin-top:6px;font-size:12px"><input type="checkbox" id="ms-clear-password"> <span>Effacer le mot de passe enregistré</span></label>' : ''))
+    + field('Adresse d\'expéditeur', '<input type="email" id="ms-from" placeholder="heimdall@exemple.com" value="'+esc(m.from_addr)+'">')
+    + field('URL du dashboard (liens des mails)', '<input type="text" id="ms-dashboard" value="'+esc(m.dashboard_url || (location.origin + '/admin'))+'">')
+    + '</div>'
+    + '<label class="notif-check" style="margin-top:16px"><input type="checkbox" id="ms-verify"'+(m.verify_tls?' checked':'')+'>'
+    + '<span><strong>Vérifier le certificat du serveur SMTP</strong><small>À ne décocher que pour un relais interne au certificat auto-signé.</small></span></label>'
+    + '</div>';
+}
+
+// Port usuel du mode choisi, sauf si l'admin a saisi un port personnalisé.
+function _mailSecurityChanged() {
+  var ports = { starttls: '587', ssl: '465', none: '25' };
+  var port = document.getElementById('ms-port');
+  if (['587', '465', '25', ''].indexOf(port.value) !== -1) port.value = ports[document.getElementById('ms-security').value];
+}
+
+async function saveMailSettings(btn, quiet) {
+  var body = {
+    enabled: document.getElementById('ms-enabled').checked,
+    host: document.getElementById('ms-host').value.trim(),
+    port: parseInt(document.getElementById('ms-port').value, 10),
+    security: document.getElementById('ms-security').value,
+    username: document.getElementById('ms-username').value.trim(),
+    from_addr: document.getElementById('ms-from').value.trim(),
+    dashboard_url: document.getElementById('ms-dashboard').value.trim(),
+    verify_tls: document.getElementById('ms-verify').checked
+  };
+  var pw = document.getElementById('ms-password').value;
+  var clear = document.getElementById('ms-clear-password');
+  if (clear && clear.checked) body.clear_password = true;
+  else if (pw) body.password = pw;
+  if (btn) btn.disabled = true;
+  try {
+    await api('/api/settings/mail', { method: 'PUT', body: JSON.stringify(body) });
+    if (!quiet) { toast('Configuration SMTP enregistrée', 'ok'); loadNotifications(); }
+    return true;
+  } catch(err) { toast(err.message, 'err'); return false; }
+  finally { if (btn) btn.disabled = false; }
+}
+
+async function testMailSettings(btn) {
+  btn.disabled = true;
+  try {
+    if (!(await saveMailSettings(null, true))) return;
+    var res = await api('/api/settings/mail/test', { method: 'POST' });
+    toast('Mail de test envoyé à ' + res.to, 'ok');
+  } catch(err) { toast(err.message, 'err'); }
+  finally { btn.disabled = false; loadNotifications(); }
+}
+
 /* ── Mises à jour logicielles ── */
 async function loadUpdates() {
   var el = document.getElementById('updates-content');
@@ -2340,7 +2527,7 @@ function startAutoRefresh(page) {
   if (_refreshTimer) clearInterval(_refreshTimer);
   // Une conversation ou un formulaire ne doit jamais être remplacé par une
   // actualisation. Les données IA sont demandées explicitement à l'envoi.
-  if (page === 'ai') return;
+  if (page === 'ai' || page === 'notifications') return;
   _refreshTimer = setInterval(function(){
     if (document.hidden) return; // pas de refresh si onglet en arrière-plan
     if (document.querySelector('.modal-backdrop.open')) return; // pas pendant l'édition
