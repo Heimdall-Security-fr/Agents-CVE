@@ -764,19 +764,59 @@ def _parse_winget_table(text: str) -> list:
     return items
 
 
+def _appx_dirs(package: str) -> list:
+    """Dossiers d'un paquet MSIX dans Program Files\\WindowsApps, du plus récent au plus
+    ancien (tri par numéro de version : « 1.22 » est plus récent que « 1.9 »). Les
+    versions remplacées y restent tant que Windows ne les a pas nettoyées."""
+    import glob
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    arch = (os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get("PROCESSOR_ARCHITECTURE") or "").lower()
+    arch = "arm64" if arch == "arm64" else "x64"
+    dirs = (glob.glob(os.path.join(pf, "WindowsApps", f"{package}_*_{arch}__8wekyb3d8bbwe"))
+            or glob.glob(os.path.join(pf, "WindowsApps", f"{package}_*__8wekyb3d8bbwe")))
+
+    def version(path):
+        m = re.match(r"[^_]+_(\d+(?:\.\d+)*)_", os.path.basename(path))
+        return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+    return sorted(dirs, key=version, reverse=True)
+
 def _find_winget():
     """winget.exe : PATH, sinon les emplacements d'App Installer (absents du PATH sous
-    certains comptes)."""
-    import glob
+    SYSTEM — mode service —, sous certains comptes, ou sur Windows Server où il a été
+    installé à la main)."""
+    import shutil
     found = shutil.which("winget")
     if found:
         return found
     local = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps", "winget.exe")
     if os.path.isfile(local):
         return local
-    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
-    cands = glob.glob(os.path.join(pf, "WindowsApps", "Microsoft.DesktopAppInstaller_*__8wekyb3d8bbwe", "winget.exe"))
-    return sorted(cands)[-1] if cands else None
+    for d in _appx_dirs("Microsoft.DesktopAppInstaller"):
+        exe = os.path.join(d, "winget.exe")
+        if os.path.isfile(exe):
+            return exe
+    logger.warning("winget introuvable (ni dans le PATH, ni dans Program Files\\WindowsApps).")
+    return None
+
+def _winget_env(winget: str):
+    """Environnement d'exécution de winget.exe lancé directement depuis WindowsApps.
+    Hors session utilisateur (SYSTEM), le paquet n'est pas « enregistré » : Windows ne
+    trouve pas sa dépendance Microsoft.VCLibs (VCRUNTIME140_APP.dll) et winget s'arrête
+    aussitôt (0xC0000135). On ajoute ces dossiers au PATH du sous-processus."""
+    if "WindowsApps" not in winget or os.path.basename(os.path.dirname(winget)).lower() == "windowsapps":
+        return None     # alias d'exécution utilisateur : Windows résout lui-même les dépendances
+    extra = [os.path.dirname(winget)]
+    for package in ("Microsoft.VCLibs.140.00.UWPDesktop", "Microsoft.VCLibs.140.00"):
+        extra += _appx_dirs(package)[:1]
+    return {**os.environ, "PATH": os.pathsep.join(extra + [os.environ.get("PATH", "")])}
+
+# Codes de sortie de winget fréquents sous SYSTEM, traduits pour le dashboard
+_WINGET_EXIT_CODES = {
+    0xC0000135: "DLL manquante (Microsoft.VCLibs) — winget ne peut pas démarrer sous ce compte",
+    0xC0000005: "plantage de winget au démarrage",
+    0x8A15000F: "sources winget indisponibles (réseau ou proxy)",
+    0x8A150044: "sources winget à réinitialiser (winget source reset --force)",
+}
 
 
 def _winget_upgrades(winget: str) -> dict:
@@ -795,6 +835,7 @@ def _winget_upgrades(winget: str) -> dict:
             r = subprocess.run(
                 [winget] + args,
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
+                env=_winget_env(winget), cwd=os.path.dirname(winget) or None,
                 # La première exécution met à jour les sources winget : 120 s ne suffisaient pas
                 timeout=300, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             out = r.stdout or ""
@@ -806,7 +847,10 @@ def _winget_upgrades(winget: str) -> dict:
                 return {"manager": "winget", "ok": True, "count": len(items),
                         "items": items[:_MAX_UPDATE_ITEMS],
                         "checked_at": datetime.now().isoformat()}
-            result["error"] = ((r.stderr or out).strip().splitlines() or ["sortie vide"])[0][:200]
+            lines = [l.split("\r")[-1].strip() for l in (r.stderr or out).splitlines()]
+            message = next((l for l in reversed(lines) if l and not re.fullmatch(r"[-\\|/ █▒]*", l)), "")
+            known = _WINGET_EXIT_CODES.get(rc)
+            result["error"] = (f"{known or message or 'aucune sortie'} (code {rc:#010x})")[:200]
             logger.warning(f"winget {' '.join(args[1:])} : {result['error']}")
     except FileNotFoundError:
         pass

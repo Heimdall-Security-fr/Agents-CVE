@@ -2210,6 +2210,10 @@ async function loadUpdates() {
       var st = STATUS[r.status];
       var note = r.status === 'unavailable' ? ' <span class="text-muted" style="font-size:11px">'+esc(r.error||'')+'</span>'
                : r.status === 'unknown' ? ' <span class="text-muted" style="font-size:11px">version d\'agent trop ancienne</span>' : '';
+      // Une source a répondu mais l'autre a échoué (ex. Windows Update OK, winget en erreur) :
+      // sans ce message, on ne voit que la source restante, sans savoir pourquoi.
+      var partial = (r.status === 'outdated' || r.status === 'up_to_date') && r.error
+        ? ' <span class="badge badge-yellow" title="'+esc(r.error)+'">source en échec</span><div class="text-muted" style="font-size:11px;margin-top:4px;max-width:420px">'+esc(r.error)+'</div>' : '';
       var stale = r.stale_cache ? ' <span class="badge badge-yellow" title="Le cache du gestionnaire de paquets n\'a pas été rafraîchi depuis '+esc(String(r.cache_age_hours))+' h : lancez « apt update » sur ce serveur">cache ancien</span>' : '';
       var detail = (r.items||[]).length
         ? '<tr id="upd-'+i+'" style="display:none"><td colspan="5" style="padding:0"><table style="width:100%"><thead><tr><th>Logiciel</th><th>Installée</th><th>Disponible</th></tr></thead><tbody>'
@@ -2220,7 +2224,7 @@ async function loadUpdates() {
         ? ' <button class="btn btn-sm" title="Relance la vérification winget / Windows Update sur ce poste (transmis sous 60 s si l\'agent est en ligne)" onclick="event.stopPropagation();refreshHostUpdates(\''+esc(r.hostname).replace(/'/g,"\\'")+'\',this)">🔄 Revérifier</button>' : '';
       return '<tr'+((r.items||[]).length?' style="cursor:pointer" onclick="var e=document.getElementById(\'upd-'+i+'\');e.style.display=e.style.display===\'none\'?\'table-row\':\'none\'"':'')+'>'
         +'<td><strong>'+esc(r.hostname)+'</strong>'+checked+'</td><td>'+esc(r.os)+' '+esc(r.release||'')+'</td>'
-        +'<td><span class="badge '+st[0]+'">'+st[1]+'</span>'+note+stale+'</td>'
+        +'<td><span class="badge '+st[0]+'">'+st[1]+'</span>'+note+stale+partial+'</td>'
         +'<td>'+(r.count===null||r.count===undefined?'—':r.count)+'</td>'
         +'<td class="text-muted">'+esc(r.manager||'—')+refresh+'</td></tr>'+detail;
     }).join('');
