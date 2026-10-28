@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Sync GitHub → Gitea (100 % côté Gitea — aucun workflow sur GitHub).
+#
+#  Surveille la branche `main` du miroir GitHub (Heimdall-Security-fr/Agents-CVE).
+#  Si elle contient des commits absents de la branche `agents` ici (PR fusionnée
+#  sur GitHub après ton approbation), on les récupère et on avance `agents` en
+#  fast-forward. L'événement push déclenche alors automatiquement le workflow
+#  `agentscve` (build + publication Docker Hub + miroir retour vers GitHub).
+#
+#  Périodicité : toutes les 10 minutes (schedule), ou à la demande via le
+#  bouton "Run workflow" (workflow_dispatch) pour une synchro immédiate après
+#  une fusion de PR.
+#
+#  ⚠️ Gitea ne planifie les workflows `schedule` que depuis la branche PAR
+#  DÉFAUT du dépôt : ce fichier doit donc aussi exister sur `site-cve`.
+#  ⚠️ Pas de force-push : si `agents` et GitHub `main` divergent réellement,
+#  le job échoue et il faut résoudre la divergence manuellement.
+#
+#  Secret Gitea requis (déjà présent pour le miroir) : GH_MIRROR_TOKEN.
+# ─────────────────────────────────────────────────────────────────────────────
+name: sync-from-github
+
+concurrency:
+  group: sync-from-github
+  cancel-in-progress: false
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: agents
+      - name: Récupérer les commits validés de GitHub main
+        env:
+          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+        run: |
+          git remote add github "https://x-access-token:${GH_TOKEN}@github.com/Heimdall-Security-fr/Agents-CVE.git"
+          git fetch github +refs/heads/main:refs/remotes/github/main
+          NEW=$(git rev-list --count HEAD..github/main)
+          if [ "$NEW" = "0" ]; then
+            echo "GitHub main est à jour, rien à récupérer."
+            exit 0
+          fi
+          echo "$NEW nouveau(x) commit(s) validés sur GitHub main."
+          if ! git merge-base --is-ancestor HEAD github/main; then
+            echo "::error::agents et GitHub main ont divergé — fusion manuelle requise (pas de force-push)."
+            exit 1
+          fi
+          git push origin github/main:agents
+          echo "agents avancé en fast-forward vers $(git rev-parse --short github/main)."
