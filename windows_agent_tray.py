@@ -1078,21 +1078,52 @@ def _appx_dirs(package: str) -> list:
     return sorted(dirs, key=version, reverse=True)
 
 def _find_winget():
-    """winget.exe : PATH, sinon les emplacements d'App Installer (absents du PATH sous
-    SYSTEM — mode service —, sous certains comptes, ou sur Windows Server où il a été
-    installé à la main)."""
+    """Chemin de winget.exe, ou None. Plusieurs méthodes, car aucune ne marche partout :
+    - session utilisateur : winget est un « alias d'exécution d'application », un point
+      d'analyse que Windows sait lancer mais que les tests de fichier de Python
+      (isfile, shutil.which) ne reconnaissent pas toujours ;
+    - service (SYSTEM) : pas d'alias du tout, il faut le dossier d'App Installer."""
     import shutil
+    tried = []
     found = shutil.which("winget")
     if found:
         return found
     local = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps", "winget.exe")
-    if os.path.isfile(local):
+    if os.path.lexists(local):      # lexists : vrai aussi pour l'alias (point d'analyse)
         return local
+    tried.append("PATH et alias utilisateur")
+    # Nom nu : CreateProcess résout l'alias même quand Python ne le « voit » pas.
+    try:
+        r = subprocess.run(["winget", "--version"], capture_output=True, text=True, timeout=60,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode == 0:
+            return "winget"
+        tried.append(f"« winget --version » (code {(r.returncode or 0) & 0xFFFFFFFF:#x})")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        tried.append(f"« winget --version » ({type(e).__name__})")
     for d in _appx_dirs("Microsoft.DesktopAppInstaller"):
         exe = os.path.join(d, "winget.exe")
         if os.path.isfile(exe):
             return exe
-    logger.warning("winget introuvable (ni dans le PATH, ni dans Program Files\\WindowsApps).")
+    tried.append("Program Files\\WindowsApps")
+    # Dernier recours : demander à Windows où App Installer est installé (pour tous
+    # les utilisateurs — fonctionne sous SYSTEM, qui ne peut pas toujours lister le dossier).
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+             "(Get-AppxPackage -AllUsers -Name Microsoft.DesktopAppInstaller | Sort-Object Version "
+             "-Descending | Select-Object -First 1).InstallLocation"],
+            capture_output=True, text=True, errors="replace", timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        location = (r.stdout or "").strip()
+        exe = os.path.join(location, "winget.exe") if location else ""
+        if exe and os.path.isfile(exe):
+            return exe
+        tried.append("Get-AppxPackage" + (f" ({location} sans winget.exe)" if location else
+                                          f" ({((r.stderr or '').strip().splitlines() or ['aucun paquet'])[-1][:80]})"))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        tried.append(f"Get-AppxPackage ({type(e).__name__})")
+    logger.warning("winget introuvable — essais : " + " ; ".join(tried))
     return None
 
 def _winget_env(winget: str):
