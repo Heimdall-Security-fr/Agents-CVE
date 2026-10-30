@@ -40,6 +40,18 @@ update_check_hours = 6
 ; avant chaque mise à jour au lieu de l'appliquer directement.
 auto_update = true
 
+[monitoring]
+; Surveillance du poste : analyse locale continue, seuls les déclencheurs sont envoyés
+; (page « Surveillance » du dashboard). Windows : agent avec icône ou service.
+; Linux : mode démon (service). Un admin peut aussi la suspendre pour tout le parc
+; depuis le dashboard.
+enabled = true
+; Intervalle d'examen des NOUVEAUX processus (10 à 600 s)
+process_interval_seconds = 30
+; Intervalle des contrôles système : tâches planifiées, démarrage automatique,
+; services, comptes, clés SSH… (1 à 120 min)
+system_interval_minutes = 5
+
 [ui]
 ; Windows uniquement — apparence de l'agent : dark | light | auto (suit le thème Windows)
 theme = dark

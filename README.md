@@ -421,6 +421,52 @@ pas d'arriéré.
 
 ---
 
+## 🛡️ 5. Surveillance des postes
+
+Chaque agent analyse sa machine **en continu et localement**, et n'envoie au serveur que
+les **déclencheurs**. Les alertes s'affichent sur la page *Surveillance* (rôles `admin` et
+`inspection_logs`) et peuvent partir par mail (type « Alerte de surveillance », avec une
+gravité minimale choisie par chaque utilisateur).
+
+| Ce qui est surveillé | Windows | Linux |
+|---|---|---|
+| **Tâches automatiques** | Tâches planifiées (`System32\Tasks`) | cron (système et utilisateurs), unités systemd ajoutées dans `/etc/systemd` |
+| **Démarrage automatique** | Clés Run/RunOnce (machine et chaque utilisateur), dossiers Démarrage, Winlogon, débogueurs IFEO (porte dérobée des touches rémanentes), nouveaux services et pilotes | — |
+| **Logiciels** | Nouveau logiciel installé | Nouveau paquet (dpkg / rpm) |
+| **Comptes et droits** | Ajout aux administrateurs locaux, nouveau compte local | Nouveau compte, compte UID 0, ajout à `sudo`/`wheel`, nouvelle règle sudo, nouvelle clé SSH autorisée |
+| **Processus suspects** | PowerShell encodé ou qui télécharge et exécute, outils détournés (certutil, mshta, regsvr32, rundll32…), suppression des sauvegardes (rançongiciel), dump de LSASS, effacement des journaux, document Office qui lance un shell, imitation d'un binaire système, outils offensifs (mimikatz…), exécution depuis un dossier temporaire ou public, double extension | Shell inversé (`/dev/tcp`, netcat, socat, scripts), téléchargement exécuté dans un shell, mineur de cryptomonnaie, exécution depuis `/tmp` ou `/dev/shm`, exécution en mémoire (memfd), serveur web qui lance un shell (webshell), outils offensifs |
+| **Autres** | Exclusions Microsoft Defender, fichier hosts | `/etc/ld.so.preload` (rootkit), `/etc/hosts` |
+
+**Appui sur les CVE récentes.** Toutes les 30 min, l'agent reçoit sa *liste de
+surveillance* : les logiciels de **sa** machine concernés par une CVE publiée depuis moins de
+60 jours (CVSS ≥ 7), critique (CVSS ≥ 9) ou probablement exploitée (EPSS ≥ 10 %). Si l'un
+d'eux lance un shell (`cmd`, PowerShell, `sh`…), l'alerte est **critique** : exploitation
+possible, avec la CVE en cause. Côté serveur, toute alerte qui touche un logiciel vulnérable
+de la machine (chemin, ligne de commande) est rattachée à ses CVE et sa gravité est relevée.
+
+**Performances.** Seuls les **nouveaux** processus sont examinés (toutes les 30 s) ; la ligne
+de commande n'est lue que pour une courte liste de programmes à risque. Tâches, démarrage,
+services et comptes sont relevés toutes les 5 min par différence avec l'instantané précédent
+(un fichier de tâche n'est relu que s'il a changé), les logiciels toutes les 15 min. Le fil de
+surveillance tourne en priorité minimale (mode « arrière-plan » de Windows, `nice 19` sous
+Linux). Mesuré sous Linux : **~2 ms de CPU par passage** (80 processus). Rien n'est envoyé
+tant qu'aucune règle ne se déclenche.
+
+**Bruit.** Au premier démarrage, l'état existant sert de référence : seuls les changements
+ultérieurs sont signalés (sauf un processus déjà lancé qui déclenche une règle moyenne ou
+plus). Une même alerte n'est envoyée qu'une fois (dédoublonnage conservé entre les
+redémarrages). Le serveur accepte au plus 500 alertes par machine et par heure, et les
+conserve 90 jours.
+
+Réglages côté agent : section `[monitoring]` de `agent.conf` (voir `agent.conf.example`).
+Le bouton *Suspendre la surveillance* (admin) l'arrête sur tout le parc sous 30 min.
+
+> Limite : c'est une surveillance par relevés réguliers, pas un EDR temps réel. Un processus
+> qui démarre et se termine entre deux relevés (30 s) peut échapper à l'analyse ; les
+> persistances qu'il installe (tâche, service, clé de démarrage…) sont, elles, détectées.
+
+---
+
 ## 📋 Logs
 
 Les logs du serveur agent lui-même sont consultables via `docker logs heimdall_agent_server`.

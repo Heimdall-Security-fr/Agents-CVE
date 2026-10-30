@@ -3598,6 +3598,221 @@ def updates_overview():
         "agents": rows,
     }), 200
 
+# ─── Surveillance des postes ─────────────────────────────────────────────────
+# Les agents analysent localement (tâches planifiées, démarrage automatique,
+# services, logiciels, processus, comptes…) et n'envoient que les déclencheurs.
+# Le serveur les stocke, les affine avec les CVE récentes de la machine et fournit
+# à chaque agent sa « liste de surveillance » : les logiciels installés dont une CVE
+# est récente, critique ou probablement exploitée. Un shell lancé par l'un d'eux est
+# alors traité comme une exploitation possible.
+SECURITY_SEVERITIES = ("info", "low", "medium", "high", "critical")
+SECURITY_SEVERITY_LABELS = {"info": "Info", "low": "Faible", "medium": "Moyenne",
+                            "high": "Élevée", "critical": "Critique"}
+_SECURITY_RULE_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+SECURITY_EVENTS_PER_REPORT = 100        # par envoi d'agent
+SECURITY_EVENTS_PER_HOUR   = 500        # par machine : au-delà, ignorés (machine compromise ou bruyante)
+SECURITY_RETENTION_DAYS    = 90
+CVE_RECENT_DAYS            = 60
+# Mots trop génériques pour rattacher un processus à un logiciel vulnérable
+_WATCH_STOPWORDS = {"microsoft", "windows", "update", "runtime", "version", "server", "client",
+                    "edition", "service", "services", "system", "driver", "drivers", "library",
+                    "framework", "redistributable", "visual", "corporation", "software", "tools",
+                    "plugin", "package", "python", "java", "core", "community", "professional",
+                    "enterprise", "standard", "x64", "x86", "amd64", "bits"}
+
+def _watch_tokens(product: str) -> list:
+    """Mots distinctifs d'un nom de logiciel, comparés aux chemins des exécutables."""
+    words = re.findall(r"[a-z0-9+]+", (product or "").lower())
+    return [w for w in dict.fromkeys(words)
+            if len(w) >= 4 and w not in _WATCH_STOPWORDS and not w.isdigit()][:4]
+
+def _cve_is_hot(cve: dict, now: datetime) -> bool:
+    """CVE à surveiller : publiée récemment, critique, ou probablement exploitée."""
+    if _score(cve.get("cvss_score")) >= 9.0 or _score(cve.get("epss_score")) >= EPSS_ALERT_THRESHOLD:
+        return True
+    try:
+        published = datetime.fromisoformat(str(cve.get("date_published") or "")[:10])
+    except ValueError:
+        return False
+    return now - published <= timedelta(days=CVE_RECENT_DAYS) and _score(cve.get("cvss_score")) >= 7.0
+
+def _hot_products(vulnerabilities, now: datetime) -> list:
+    """[{name, match, cves, max_cvss, max_epss}] des logiciels de la machine à surveiller."""
+    out = []
+    for v in vulnerabilities or []:
+        if not isinstance(v, dict):
+            continue
+        hot = [c for c in v.get("cves") or [] if isinstance(c, dict) and _cve_is_hot(c, now)]
+        tokens = _watch_tokens(v.get("product") or v.get("name"))
+        if hot and tokens:
+            hot.sort(key=lambda c: (-_score(c.get("cvss_score")), -_score(c.get("epss_score"))))
+            out.append({"name": v.get("product") or v.get("name"), "version": v.get("version"),
+                        "match": tokens, "cves": [c.get("cve_id") for c in hot[:5]],
+                        "max_cvss": max(_score(c.get("cvss_score")) for c in hot),
+                        "max_epss": max(_score(c.get("epss_score")) for c in hot)})
+    return out[:200]
+
+def _monitoring_enabled() -> bool:
+    doc = mongo.db.settings.find_one({"_id": "monitoring"}) or {}
+    return bool(doc.get("enabled", True))
+
+def _bump_severity(severity: str) -> str:
+    i = SECURITY_SEVERITIES.index(severity)
+    return SECURITY_SEVERITIES[min(i + 1, len(SECURITY_SEVERITIES) - 1)]
+
+def _sanitize_security_event(raw, now: datetime) -> dict | None:
+    """Valide un événement envoyé par l'agent (entrée non fiable)."""
+    if not isinstance(raw, dict):
+        return None
+    rule = str(raw.get("rule") or "")
+    severity = str(raw.get("severity") or "")
+    if not _SECURITY_RULE_RE.match(rule) or severity not in SECURITY_SEVERITIES:
+        return None
+    details = {}
+    for k, v in list((raw.get("details") or {}).items())[:20] if isinstance(raw.get("details"), dict) else []:
+        key = re.sub(r"[^a-zA-Z0-9_]", "_", str(k))[:40]
+        details[key] = (v if isinstance(v, (int, float, bool)) or v is None else str(v)[:1000])
+    observed = raw.get("observed_at")
+    try:
+        observed = datetime.fromisoformat(str(observed)[:19]) if observed else now
+    except ValueError:
+        observed = now
+    return {"rule": rule, "severity": severity, "title": str(raw.get("title") or rule)[:200],
+            "details": details, "key": str(raw.get("key") or "")[:300],
+            "observed_at": min(observed, now)}
+
+def _enrich_with_cves(event: dict, hot: list) -> dict:
+    """Rattache l'événement aux logiciels vulnérables de la machine : les chemins et la
+    ligne de commande sont comparés aux mots distinctifs de chaque logiciel."""
+    haystack = " ".join(str(v) for v in event["details"].values() if isinstance(v, str)).lower()
+    if not haystack:
+        return event
+    related = [p for p in hot if any(t in haystack for t in p["match"])]
+    if related:
+        event["related_cves"] = [{"product": p["name"], "version": p.get("version"), "cves": p["cves"],
+                                  "max_cvss": p["max_cvss"], "max_epss": p["max_epss"]} for p in related[:3]]
+        if event["severity"] in ("medium", "high") and not event["details"].get("watchlist_match"):
+            event["severity"] = _bump_severity(event["severity"])
+            event["severity_reason"] = "Logiciel concerné par une CVE récente ou exploitée"
+    return event
+
+@app.route('/api/agents/<hostname>/watchlist', methods=['GET'])
+@require_agent_token
+def agent_watchlist(hostname):
+    """Configuration de surveillance de l'agent + logiciels de la machine à surveiller."""
+    enabled = _monitoring_enabled()
+    agent = mongo.db.agents.find_one({"hostname": hostname}, {
+        "vulnerabilities.product": 1, "vulnerabilities.name": 1, "vulnerabilities.version": 1,
+        "vulnerabilities.cves.cve_id": 1, "vulnerabilities.cves.cvss_score": 1,
+        "vulnerabilities.cves.epss_score": 1, "vulnerabilities.cves.date_published": 1}) or {}
+    return jsonify({"enabled": enabled,
+                    "products": _hot_products(agent.get("vulnerabilities"), datetime.utcnow()) if enabled else [],
+                    "generated_at": datetime.utcnow().isoformat()})
+
+@app.route('/api/agents/<hostname>/events', methods=['POST'])
+@require_agent_token
+def agent_security_events(hostname):
+    """Déclencheurs de surveillance détectés par l'agent."""
+    data = request.get_json(silent=True) or {}
+    raw_events = data.get("events") if isinstance(data.get("events"), list) else []
+    if not _monitoring_enabled():
+        return jsonify({"stored": 0, "enabled": False}), 200
+    now = datetime.utcnow()
+    budget = SECURITY_EVENTS_PER_HOUR - mongo.db.security_events.count_documents(
+        {"hostname": hostname, "received_at": {"$gte": now - timedelta(hours=1)}})
+    events = [e for e in (_sanitize_security_event(r, now) for r in raw_events[:SECURITY_EVENTS_PER_REPORT]) if e]
+    dropped = max(0, len(events) - max(0, budget))
+    events = events[:max(0, budget)]
+    if events:
+        agent = mongo.db.agents.find_one({"hostname": hostname}, {
+            "vulnerabilities.product": 1, "vulnerabilities.name": 1, "vulnerabilities.version": 1,
+            "vulnerabilities.cves.cve_id": 1, "vulnerabilities.cves.cvss_score": 1,
+            "vulnerabilities.cves.epss_score": 1, "vulnerabilities.cves.date_published": 1}) or {}
+        hot = _hot_products(agent.get("vulnerabilities"), now)
+        docs = [{**_enrich_with_cves(e, hot), "hostname": hostname, "received_at": now, "status": "new"}
+                for e in events]
+        mongo.db.security_events.insert_many(docs)
+        mongo.db.agents.update_one({"hostname": hostname}, {"$set": {"security_last_event_at": now}})
+        _queue_notifications(hostname, [("security_events", [
+            {"rule": d["rule"], "severity": d["severity"], "title": d["title"],
+             "summary": _event_summary(d), "cves": [c for r in d.get("related_cves", []) for c in r["cves"]][:5]}
+            for d in docs])])
+        logger.info("[SURVEILLANCE] %s : %d alerte(s) reçue(s)%s", hostname, len(docs),
+                    f", {dropped} ignorée(s) (plafond horaire)" if dropped else "")
+    return jsonify({"stored": len(events), "dropped": dropped, "enabled": True}), 200
+
+def _event_summary(event: dict) -> str:
+    """Résumé d'une ligne pour le mail et la liste."""
+    d = event.get("details") or {}
+    for key in ("command", "image", "path", "name", "member", "value", "line"):
+        if d.get(key):
+            return str(d[key])[:200]
+    return ""
+
+_SECURITY_EVENT_ROLES = ("admin", "inspection_logs")
+
+@app.route('/api/security-events', methods=['GET'])
+@require_role(*_SECURITY_EVENT_ROLES)
+def list_security_events():
+    status = request.args.get("status", "new")
+    query = {}
+    if status in ("new", "ack"):
+        query["status"] = status
+    severity = request.args.get("min_severity")
+    if severity in SECURITY_SEVERITIES:
+        query["severity"] = {"$in": list(SECURITY_SEVERITIES[SECURITY_SEVERITIES.index(severity):])}
+    if request.args.get("hostname"):
+        query["hostname"] = request.args["hostname"]
+    try:
+        limit = max(1, min(int(request.args.get("limit", 300)), 1000))
+    except ValueError:
+        limit = 300
+    events = list(mongo.db.security_events.find(query).sort("received_at", -1).limit(limit))
+    for e in events:
+        e["id"] = str(e.pop("_id"))
+        e["summary"] = _event_summary(e)
+    since = datetime.utcnow() - timedelta(hours=24)
+    counts = {s: mongo.db.security_events.count_documents({"status": "new", "severity": s})
+              for s in SECURITY_SEVERITIES}
+    return jsonify(_clean({
+        "events": events, "open_by_severity": counts,
+        "last_24h": mongo.db.security_events.count_documents({"received_at": {"$gte": since}}),
+        "hosts": sorted(mongo.db.security_events.distinct("hostname", {"status": "new"})),
+        "enabled": _monitoring_enabled(),
+    })), 200
+
+@app.route('/api/security-events/ack', methods=['POST'])
+@require_role(*_SECURITY_EVENT_ROLES)
+def ack_security_events():
+    """Marque des alertes comme traitées (ids) ou rouvre (status=new)."""
+    from bson import ObjectId
+    from bson.errors import InvalidId
+    data = request.get_json(silent=True) or {}
+    ids = []
+    for i in (data.get("ids") or [])[:1000]:
+        try:
+            ids.append(ObjectId(str(i)))
+        except (InvalidId, TypeError):
+            pass
+    if not ids:
+        return jsonify({"error": "Aucune alerte sélectionnée"}), 400
+    status = "new" if data.get("status") == "new" else "ack"
+    res = mongo.db.security_events.update_many({"_id": {"$in": ids}}, {"$set": {
+        "status": status, "acked_by": request.dashboard_user.get("email", ""),
+        "acked_at": datetime.utcnow()}})
+    return jsonify({"updated": res.modified_count}), 200
+
+@app.route('/api/settings/monitoring', methods=['PUT'])
+@require_role("admin")
+def set_monitoring_settings():
+    """Active ou suspend la surveillance sur tout le parc (pris en compte par les agents
+    à leur prochaine mise à jour de liste de surveillance, sous 30 min)."""
+    enabled = bool((request.get_json(silent=True) or {}).get("enabled"))
+    mongo.db.settings.update_one({"_id": "monitoring"}, {"$set": {
+        "enabled": enabled, "updated_at": datetime.utcnow(),
+        "updated_by": request.dashboard_user.get("email", "")}}, upsert=True)
+    return jsonify({"enabled": enabled}), 200
+
 # ─── Notifications mail ──────────────────────────────────────────────────────
 # L'admin configure le serveur SMTP ; chaque utilisateur du dashboard choisit ce
 # qu'il reçoit. Les nouveautés détectées à la réception des rapports (et lors des
@@ -3613,6 +3828,9 @@ _mail_send_lock     = threading.Lock()
 _CVE_ROLES        = ("admin", "inspection_logs")
 _COMPLIANCE_ROLES = ("admin", "inspection_logs", "codir")
 NOTIFICATION_TYPES = {
+    "security_events":   {"group": "Surveillance",
+                          "label": "Alerte de surveillance sur une machine (tâche planifiée, processus suspect…)",
+                          "roles": ("admin", "inspection_logs")},
     "new_cves":          {"group": "Vulnérabilités", "label": "Nouvelles CVE sur le parc",
                           "roles": _CVE_ROLES},
     "high_epss":         {"group": "Vulnérabilités",
@@ -4002,6 +4220,8 @@ def _normalized_preferences(user: dict) -> dict:
     prefs["compliance_report"]["every_days"] = bounded(report.get("every_days"), 7, 1, 90)
     prefs["compliance_report"]["last_sent_at"] = report.get("last_sent_at")
     prefs["agent_offline"]["hours"] = bounded(section("agent_offline").get("hours"), 24, 1, 720)
+    level = section("security_events").get("min_severity")
+    prefs["security_events"]["min_severity"] = level if level in SECURITY_SEVERITIES[1:] else "high"
     return prefs
 
 def _compliance_report_due(prefs: dict, now: datetime) -> bool:
@@ -4023,6 +4243,11 @@ _CHANGE_LABELS = {"installed": "Installé", "removed": "Désinstallé", "updated
 # Par type : (titre de section, en-têtes, ligne(hôte, élément), clé de dédoublonnage,
 # libellé du sujet où {n} est le nombre d'éléments)
 _DIGEST_SPECS = {
+    "security_events": ("Alertes de surveillance", ["Hôte", "Gravité", "Alerte", "Détail", "CVE liées"],
+                        lambda h, i: [h, SECURITY_SEVERITY_LABELS.get(i.get("severity"), i.get("severity")),
+                                      i.get("title"), i.get("summary"), ", ".join(i.get("cves") or [])],
+                        lambda h, i: (h, i.get("rule"), i.get("title"), i.get("summary")),
+                        "{n} alerte(s) de surveillance"),
     "new_cves": (None, ["Hôte", "CVE", "CVSS", "EPSS", "Logiciel", "Description"],
                  lambda h, i: [h, i.get("cve_id"), f"{_score(i.get('cvss_score')):.1f}", _pct(i.get("epss_score")),
                                f"{i.get('product')} {i.get('version') or ''}".strip(),
@@ -4100,11 +4325,16 @@ def _digest_for_user(prefs: dict, events: list, offline=None):
         for it in ev.get("items") or []:
             if notif_type == "new_cves" and _score(it.get("cvss_score")) < threshold:
                 continue
+            if notif_type == "security_events" and SECURITY_SEVERITIES.index(it.get("severity", "info")) < \
+                    SECURITY_SEVERITIES.index(prefs["security_events"]["min_severity"]):
+                continue
             key = (notif_type,) + key_of(host, it)
             if key not in seen:
                 seen.add(key)
                 rows[notif_type].append(row_of(host, it))
     rows["new_cves"].sort(key=lambda r: -_score(r[2]))
+    rank = {label: i for i, label in enumerate(SECURITY_SEVERITY_LABELS.values())}
+    rows["security_events"].sort(key=lambda r: -rank.get(r[1], 0))
     rows["high_epss"].sort(key=lambda r: -_score((r[2] or "0").rstrip(" %")))
 
     def note(count):
@@ -4210,6 +4440,7 @@ def _dispatch_notifications():
                         {"$set": {"notifications.compliance_report.last_sent_at": now}})
     mongo.db.notification_events.delete_many({"dispatched": True,
                                               "created_at": {"$lt": now - timedelta(days=30)}})
+    mongo.db.security_events.delete_many({"received_at": {"$lt": now - timedelta(days=SECURITY_RETENTION_DAYS)}})
 
 def _mail_scheduler():
     while True:
@@ -4281,6 +4512,11 @@ def set_notification_preferences():
         if not 1 <= every_days <= 90:
             return jsonify({"error": "La fréquence du rapport doit être comprise entre 1 et 90 jours"}), 400
         patch["notifications.compliance_report.every_days"] = every_days
+    monitoring = data.get("security_events") if isinstance(data.get("security_events"), dict) else {}
+    if "min_severity" in monitoring:
+        if monitoring["min_severity"] not in SECURITY_SEVERITIES[1:]:
+            return jsonify({"error": "Gravité minimale invalide (low, medium, high, critical)"}), 400
+        patch["notifications.security_events.min_severity"] = monitoring["min_severity"]
     offline = data.get("agent_offline") if isinstance(data.get("agent_offline"), dict) else {}
     if "hours" in offline:
         try:

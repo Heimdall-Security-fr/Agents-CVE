@@ -1021,6 +1021,475 @@ def collect_outdated_software(software_list, config=None) -> dict:
     return result
 
 
+# ─── Surveillance du serveur (Linux, mode démon) ──────────────────────────────
+# Analyse locale, légère : seuls les déclencheurs partent au serveur.
+#   • processus : seuls les NOUVEAUX processus de /proc sont examinés (toutes les 30 s) ;
+#   • cron, unités systemd, clés SSH autorisées, comptes, sudoers, ld.so.preload,
+#     /etc/hosts : toutes les 5 min, par différence avec l'instantané précédent ;
+#   • paquets : toutes les 15 min, seulement si la base du gestionnaire a changé.
+# Le fil tourne avec la priorité la plus basse (nice 19). Au premier passage, l'état
+# existant sert de référence : rien n'est signalé, sauf un processus déjà lancé qui
+# déclenche une règle moyenne ou plus.
+import json as _json_mon
+MONITOR_STATE_FILE = os.path.join(os.path.dirname(LOG_FILE), "monitor-state.json")
+_MONITOR_ALERT_TTL = 7 * 86400
+_MONITOR_FS_ROOT = ""        # préfixe des fichiers système lus (vide en production ; arborescence factice en test)
+_MONITOR_MAX_EVENTS_PER_CYCLE = 50
+_MONITOR_QUEUE_MAX = 300
+_SEVERITY_ORDER = ("info", "low", "medium", "high", "critical")
+_TEMP_DIRS = ("/tmp/", "/dev/shm/", "/var/tmp/", "/run/shm/")
+_SHELLS = {"sh", "bash", "dash", "zsh", "ksh", "ash", "busybox", "nc", "ncat", "netcat", "socat"}
+_WEB_SERVERS = {"nginx", "apache2", "httpd", "lighttpd", "caddy"}
+_APP_SERVERS = {"php-fpm", "php", "java", "node", "ruby", "tomcat", "gunicorn", "uwsgi", "mysqld",
+                "postgres", "redis-server", "mongod", "jenkins"}
+_OFFENSIVE_TOOLS = {"linpeas.sh": "high", "linpeas": "high", "linenum.sh": "high", "pspy": "high",
+                    "pspy64": "high", "chisel": "high", "ngrok": "medium", "hydra": "high",
+                    "masscan": "medium", "nmap": "medium", "sqlmap": "high", "mimipenguin": "critical",
+                    "xmrig": "high", "minerd": "high", "cpuminer": "high", "kdevtmpfsi": "critical",
+                    "kinsing": "critical"}
+_LINUX_CMD_RULES = [
+    (r"/dev/(tcp|udp)/", "critical", "Shell inversé (redirection vers /dev/tcp)"),
+    (r"\b(nc|ncat|netcat)\b.*\s-(e|c)\s", "critical", "Shell inversé avec netcat"),
+    (r"\bsocat\b.*\bexec:", "critical", "Shell inversé avec socat"),
+    (r"mkfifo\s+\S+.*\|\s*(/bin/)?(ba)?sh\b", "critical", "Shell inversé (tube nommé)"),
+    (r"\b(python[0-9.]*|perl|ruby|php)\b.*socket.*(subprocess|pty\.spawn|exec|/bin/(ba)?sh|fsockopen|proc_open)",
+     "critical", "Shell inversé (script)"),
+    (r"stratum\+tcp://|--donate-level", "high", "Mineur de cryptomonnaie"),
+    (r"(curl|wget)\s[^|;]*\|\s*(sudo\s+)?(ba)?sh\b", "high", "Téléchargement exécuté directement dans un shell"),
+    (r"base64\s+(-d|--decode)\b.*\|\s*(ba)?sh\b", "high", "Code décodé exécuté dans un shell"),
+    (r"chattr\s+\+i\s+/etc/|history\s+-c\b|unset\s+histfile|>\s*/var/log/(auth|secure|syslog)",
+     "high", "Effacement de traces ou verrouillage de fichiers système"),
+]
+_LINUX_CMD_RULES = [(re.compile(p), s, t) for p, s, t in _LINUX_CMD_RULES]
+
+def _rate_linux_command(command: str):
+    """Gravité d'une commande ajoutée à cron ou à une unité systemd : (gravité, [raisons])."""
+    cmd = (command or "").lower()
+    severity, reasons = "medium", []
+    def raise_to(level, reason):
+        nonlocal severity
+        reasons.append(reason)
+        if _SEVERITY_ORDER.index(level) > _SEVERITY_ORDER.index(severity):
+            severity = level
+    for rx, level, title in _LINUX_CMD_RULES:
+        if rx.search(cmd):
+            raise_to(level, title)
+    if any(d in cmd for d in _TEMP_DIRS):
+        raise_to("high", "programme dans un dossier temporaire")
+    return severity, reasons
+
+def _linux_process_findings(comm: str, exe: str, cmdline: str, parent_comm: str, parent_exe: str,
+                            parent_cmdline: str, watchlist: list) -> list:
+    """Règles appliquées à un nouveau processus : [(règle, gravité, titre, extra)]."""
+    findings = []
+    comm, cmd = (comm or "").lower(), (cmdline or "").lower()
+    exe_l = (exe or "").lower()
+    base = os.path.basename(exe_l.replace(" (deleted)", "")) or comm
+    parent = (parent_comm or "").lower()
+    if exe_l.startswith("/memfd:"):
+        findings.append(("fileless_process", "critical", f"{comm} exécuté en mémoire sans fichier (memfd)", {}))
+    elif exe_l.startswith(_TEMP_DIRS):
+        deleted = " puis supprimé" if exe_l.endswith(" (deleted)") else ""
+        findings.append(("suspicious_location", "high", f"{base} exécuté depuis un dossier temporaire{deleted}", {}))
+    for name in (base, comm):
+        if name in _OFFENSIVE_TOOLS:
+            findings.append(("offensive_tool", _OFFENSIVE_TOOLS[name], f"Outil offensif ou mineur : {name}", {}))
+            break
+    for rx, level, title in _LINUX_CMD_RULES:
+        if cmd and rx.search(cmd):
+            findings.append(("suspicious_command", level, title, {}))
+            break
+    child_is_shell = comm in _SHELLS or base in _SHELLS
+    if child_is_shell:
+        haystack = f"{parent_exe} {parent_cmdline}".lower()
+        match = next((p for p in watchlist or [] if any(t in haystack for t in p.get("match") or [])), None)
+        if match:
+            cves = ", ".join((match.get("cves") or [])[:3])
+            findings.append(("vulnerable_app_spawns_shell", "critical",
+                             f"{match.get('name')} (vulnérable : {cves}) a lancé {comm} — exploitation possible",
+                             {"watchlist_match": match.get("name"), "cves": cves}))
+        elif parent in _WEB_SERVERS:
+            findings.append(("webserver_spawns_shell", "high", f"Le serveur web {parent} a lancé {comm} (webshell ?)", {}))
+        elif parent in _APP_SERVERS or parent.startswith("php-fpm"):
+            findings.append(("service_spawns_shell", "medium", f"Le service {parent} a lancé {comm}", {}))
+    return findings
+
+# ── Capteurs Linux ───────────────────────────────────────────────────────────
+def _fs(path: str) -> str:
+    return _MONITOR_FS_ROOT + path
+
+def _read_text(path: str, limit: int = 1_000_000) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(limit)
+    except OSError:
+        return ""
+
+def _proc_info(pid: str):
+    """(ppid, starttime, comm, exe, cmdline) d'un processus, ou None (thread noyau, terminé)."""
+    stat = _read_text(f"/proc/{pid}/stat", 4096)
+    if not stat or ")" not in stat:
+        return None
+    comm = stat[stat.index("(") + 1:stat.rindex(")")]
+    fields = stat[stat.rindex(")") + 2:].split()
+    try:
+        ppid, start = int(fields[1]), fields[19]
+    except (IndexError, ValueError):
+        return None
+    try:
+        exe = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        exe = ""
+    cmdline = _read_text(f"/proc/{pid}/cmdline", 8192).replace("\x00", " ").strip()
+    if not exe and not cmdline:
+        return None                     # thread noyau
+    return ppid, start, comm, exe, cmdline
+
+def _cron_entries() -> dict:
+    """{fichier|ligne: ligne} des crontabs système et utilisateurs."""
+    import glob
+    patterns = ["/etc/crontab", "/etc/cron.d/*", "/var/spool/cron/crontabs/*", "/var/spool/cron/*",
+                "/etc/cron.hourly/*", "/etc/cron.daily/*", "/etc/cron.weekly/*", "/etc/cron.monthly/*"]
+    files = [f[len(_MONITOR_FS_ROOT):] for p in patterns for f in glob.glob(_fs(p))]
+    out = {}
+    for path in files:
+        if not os.path.isfile(_fs(path)):
+            continue
+        if "/cron." in path and not path.startswith("/etc/cron.d"):
+            out[f"{path}|"] = path                       # script exécuté tel quel : sa présence suffit
+            continue
+        for line in _read_text(_fs(path), 200_000).splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and not re.match(r"^[A-Z_]+=", line):
+                out[f"{path}|{line[:300]}"] = line[:500]
+    return out
+
+def _systemd_units() -> dict:
+    """{unité: ExecStart} des fichiers ajoutés par l'administrateur (/etc/systemd)."""
+    out = {}
+    for root in ("/etc/systemd/system", "/etc/systemd/user"):
+        for dirpath, _dirs, files in os.walk(_fs(root)):
+            for f in files:
+                path = os.path.join(dirpath, f)
+                if f.endswith((".service", ".timer")) and not os.path.islink(path):
+                    execs = [l.split("=", 1)[1].strip() for l in _read_text(path, 100_000).splitlines()
+                             if l.strip().startswith(("ExecStart=", "ExecStartPre=", "ExecStartPost="))]
+                    out[path[len(_MONITOR_FS_ROOT):]] = " ; ".join(execs)[:500]
+    return out
+
+def _passwd_users() -> dict:
+    """{utilisateur: "uid|home"}."""
+    out = {}
+    for line in _read_text(_fs("/etc/passwd")).splitlines():
+        parts = line.split(":")
+        if len(parts) >= 7:
+            out[parts[0]] = f"{parts[2]}|{parts[5]}"
+    return out
+
+def _admin_group_members() -> dict:
+    out = {}
+    for line in _read_text(_fs("/etc/group")).splitlines():
+        parts = line.split(":")
+        if len(parts) >= 4 and parts[0] in ("sudo", "wheel", "admin", "root"):
+            for member in filter(None, parts[3].split(",")):
+                out[f"{parts[0]}|{member}"] = member
+    return out
+
+def _sudoers_lines() -> dict:
+    import glob
+    out = {}
+    for path in ["/etc/sudoers"] + [f[len(_MONITOR_FS_ROOT):] for f in glob.glob(_fs("/etc/sudoers.d/*"))]:
+        for line in _read_text(_fs(path), 200_000).splitlines():
+            line = line.strip()
+            if line and not line.startswith(("#", "Defaults")):
+                out[f"{path}|{line[:300]}"] = line[:500]
+    return out
+
+def _authorized_keys(users: dict) -> dict:
+    """{utilisateur|clé: description} des clés SSH autorisées (root et comptes ≥ 1000)."""
+    out = {}
+    for user, info in users.items():
+        uid, _, home = info.partition("|")
+        if not home or not (uid == "0" or (uid.isdigit() and int(uid) >= 1000)):
+            continue
+        for name in ("authorized_keys", "authorized_keys2"):
+            for line in _read_text(_fs(os.path.join(home, ".ssh", name)), 500_000).splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    parts = line.split()
+                    key = next((p for p in parts if len(p) > 60), line)
+                    label = f"{parts[0] if parts else ''} …{key[-16:]} {parts[-1] if len(parts) > 2 else ''}".strip()
+                    out[f"{user}|{key[-40:]}"] = label[:200]
+    return out
+
+def _package_names(cache: dict) -> dict | None:
+    """Paquets installés, relus seulement si la base dpkg/rpm a changé (sinon None)."""
+    for db, kind in ((_fs("/var/lib/dpkg/status"), "dpkg"), (_fs("/var/lib/rpm"), "rpm")):
+        try:
+            mtime = os.stat(db).st_mtime
+        except OSError:
+            continue
+        if cache.get(kind) == mtime:
+            return None
+        cache[kind] = mtime
+        if kind == "dpkg":
+            names, current, installed = {}, None, False
+            for line in _read_text(db, 50_000_000).splitlines() + [""]:
+                if line.startswith("Package: "):
+                    current = line[9:].strip()
+                elif line.startswith("Status: "):
+                    installed = line.endswith(" installed")
+                elif line.startswith("Version: ") and current and installed:
+                    names[current] = line[9:].strip()
+                elif not line:
+                    current, installed = None, False
+            return names
+        try:
+            r = subprocess.run(["rpm", "-qa", "--qf", "%{NAME}|%{VERSION}\\n"], capture_output=True,
+                               text=True, timeout=120)
+            return dict(l.split("|", 1) for l in r.stdout.splitlines() if "|" in l)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    return None
+
+# ── Moteur ───────────────────────────────────────────────────────────────────
+class _Monitor:
+    def __init__(self, config):
+        self.config = config
+        self.state = {"snap": {}, "alerted": {}, "queue": []}
+        self.seen = set()
+        self.first_process_scan = True
+        self.watchlist, self.server_enabled, self.watch_at = [], True, 0.0
+        self.pkg_cache = {}
+        self.dirty = False
+        try:
+            with open(MONITOR_STATE_FILE, "r", encoding="utf-8") as f:
+                loaded = _json_mon.load(f)
+            if isinstance(loaded, dict):
+                self.state.update({k: loaded[k] for k in ("snap", "alerted", "queue") if k in loaded})
+        except (OSError, ValueError):
+            pass
+
+    def save(self):
+        if not self.dirty:
+            return
+        try:
+            tmp = MONITOR_STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json_mon.dump(self.state, f)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, MONITOR_STATE_FILE)
+            self.dirty = False
+        except OSError as e:
+            logger.warning(f"Surveillance : état non enregistré ({e})")
+
+    def event(self, rule, severity, title, key, **details):
+        now = time.time()
+        last = self.state["alerted"].get(key)
+        if last and now - last < _MONITOR_ALERT_TTL:
+            return None
+        self.state["alerted"][key] = now
+        self.dirty = True
+        return {"rule": rule, "severity": severity, "title": title[:200], "key": key[:300],
+                "observed_at": datetime.utcnow().isoformat(timespec="seconds"),
+                "details": {k: v for k, v in details.items() if v not in (None, "")}}
+
+    def diff(self, name, current: dict):
+        previous = self.state["snap"].get(name)
+        if previous != current:
+            self.state["snap"][name] = current
+            self.dirty = True
+        if previous is None:
+            return None
+        return [(k, v, previous.get(k)) for k, v in current.items() if previous.get(k) != v]
+
+    def scan_processes(self) -> list:
+        infos = {}
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            stat = _read_text(f"/proc/{pid}/stat", 4096)
+            if ")" not in stat:
+                continue
+            fields = stat[stat.rindex(")") + 2:].split()
+            if len(fields) > 19:
+                infos[pid] = (fields[1], fields[19])        # ppid, heure de démarrage
+        events, alive = [], set()
+        own = str(os.getpid())
+        for pid, (ppid, start) in infos.items():
+            ident = (pid, start)
+            alive.add(ident)
+            if ident in self.seen or pid == own:
+                continue
+            self.seen.add(ident)
+            info = _proc_info(pid)
+            if not info:
+                continue
+            _ppid, _start, comm, exe, cmdline = info
+            # Le parent ne sert qu'aux règles « tel service a lancé un shell »
+            is_shell = comm.lower() in _SHELLS or os.path.basename(exe.replace(" (deleted)", "")) in _SHELLS
+            parent = _proc_info(ppid) if is_shell and ppid != "0" else None
+            parent_comm, parent_exe, parent_cmd = (parent[2], parent[3], parent[4]) if parent else ("", "", "")
+            for rule, severity, title, extra in _linux_process_findings(
+                    comm, exe, cmdline, parent_comm, parent_exe, parent_cmd, self.watchlist):
+                if self.first_process_scan and _SEVERITY_ORDER.index(severity) < 2:
+                    continue
+                ev = self.event(rule, severity, title, f"{rule}|{exe or comm}|{cmdline[:200]}",
+                                image=exe or comm, pid=int(pid), parent=parent_comm, parent_image=parent_exe,
+                                command=cmdline[:1000], **extra)
+                if ev:
+                    events.append(ev)
+        self.seen &= alive
+        self.first_process_scan = False
+        return events
+
+    def scan_system(self) -> list:
+        events = []
+        def add(ev):
+            if ev:
+                events.append(ev)
+        for key, line, _old in self.diff("cron", _cron_entries()) or []:
+            path = key.split("|", 1)[0]
+            severity, reasons = _rate_linux_command(line)
+            add(self.event("new_scheduled_task", severity, f"Nouvelle tâche planifiée (cron) : {path}",
+                           f"cron|{key}", path=path, line=line, reasons=" ; ".join(reasons)))
+        for path, execs, old in self.diff("systemd", _systemd_units()) or []:
+            severity, reasons = _rate_linux_command(execs)
+            add(self.event("new_service", severity,
+                           f"{'Nouvelle' if old is None else 'Modification de l’'} unité systemd : {os.path.basename(path)}",
+                           f"systemd|{path}|{execs[:200]}", path=path, command=execs, previous=old,
+                           reasons=" ; ".join(reasons)))
+        users = _passwd_users()
+        for user, info, old in self.diff("users", users) or []:
+            uid = info.split("|", 1)[0]
+            if uid == "0" and user != "root":
+                add(self.event("uid0_account", "critical", f"Compte {user} avec l'UID 0 (droits root)",
+                               f"uid0|{user}", name=user))
+            elif old is None:
+                add(self.event("new_local_account", "medium", f"Nouveau compte local : {user}",
+                               f"account|{user}", name=user, value=info))
+        for key, member, _old in self.diff("admins", _admin_group_members()) or []:
+            group = key.split("|", 1)[0]
+            add(self.event("admin_group_added", "high", f"{member} ajouté au groupe {group}",
+                           f"admin|{key}", member=member, name=group))
+        for key, line, _old in self.diff("sudoers", _sudoers_lines()) or []:
+            add(self.event("sudoers_modified", "critical" if "nopasswd" in line.lower() else "high",
+                           "Nouvelle règle sudo", f"sudo|{key}", path=key.split("|", 1)[0], line=line))
+        for key, label, _old in self.diff("ssh_keys", _authorized_keys(users)) or []:
+            user = key.split("|", 1)[0]
+            add(self.event("ssh_key_added", "high", f"Nouvelle clé SSH autorisée pour {user}",
+                           f"sshkey|{key}", name=user, value=label))
+        preload = {l.strip(): "1" for l in _read_text(_fs("/etc/ld.so.preload")).splitlines() if l.strip()}
+        for lib, _v, _o in self.diff("ld_preload", preload) or []:
+            add(self.event("ld_preload", "critical", f"Bibliothèque préchargée dans tous les programmes : {lib}",
+                           f"preload|{lib}", path=lib))
+        hosts = {l.strip(): "1" for l in _read_text(_fs("/etc/hosts")).splitlines()
+                 if l.strip() and not l.strip().startswith("#")}
+        for line, _v, _o in self.diff("hosts", hosts) or []:
+            add(self.event("hosts_file_modified", "medium", "Fichier /etc/hosts modifié", f"hosts|{line}", line=line))
+        return events
+
+    def scan_software(self) -> list:
+        names = _package_names(self.pkg_cache)
+        if names is None:
+            return []
+        events = []
+        for name, version, old in self.diff("software", names) or []:
+            if old is None:
+                ev = self.event("new_software", "low", f"Nouveau paquet installé : {name} {version}",
+                                f"software|{name}", name=name, version=version)
+                if ev:
+                    events.append(ev)
+        return events
+
+    def refresh_watchlist(self):
+        if time.time() - self.watch_at < 1800:
+            return
+        self.watch_at = time.time()
+        try:
+            r = requests.get(f"{_server_url(self.config)}/api/agents/{platform.node()}/watchlist",
+                             headers=_agent_headers(self.config), timeout=15, verify=_tls_verify(self.config))
+            if r.ok:
+                data = r.json() or {}
+                self.server_enabled = bool(data.get("enabled", True))
+                self.watchlist = [p for p in data.get("products") or [] if isinstance(p, dict)]
+        except Exception:
+            pass
+
+    def flush(self, events: list):
+        if len(events) > _MONITOR_MAX_EVENTS_PER_CYCLE:
+            extra = len(events) - _MONITOR_MAX_EVENTS_PER_CYCLE
+            events = events[:_MONITOR_MAX_EVENTS_PER_CYCLE] + [self.event(
+                "event_flood", "medium", f"{extra} autre(s) alerte(s) non transmise(s) en une minute",
+                f"flood|{int(time.time() // 3600)}", count=extra)]
+        queue = (self.state["queue"] + [e for e in events if e])[-_MONITOR_QUEUE_MAX:]
+        if not queue:
+            return
+        try:
+            r = requests.post(f"{_server_url(self.config)}/api/agents/{platform.node()}/events",
+                              json={"events": queue[:100]}, headers=_agent_headers(self.config),
+                              timeout=20, verify=_tls_verify(self.config))
+            r.raise_for_status()
+            logger.info(f"Surveillance : {min(len(queue), 100)} alerte(s) envoyée(s) au serveur.")
+            queue = queue[100:]
+        except Exception as e:
+            logger.warning(f"Surveillance : envoi reporté ({type(e).__name__}), {len(queue)} alerte(s) en file.")
+        if queue != self.state["queue"]:
+            self.state["queue"] = queue
+            self.dirty = True
+
+def _monitor_settings(config):
+    def num(key, default, low, high):
+        try:
+            return max(low, min(int(config.get("monitoring", key, fallback=str(default))), high))
+        except ValueError:
+            return default
+    try:
+        enabled = config.getboolean("monitoring", "enabled", fallback=True)
+    except ValueError:
+        enabled = True
+    return enabled, num("process_interval_seconds", 30, 10, 600), num("system_interval_minutes", 5, 1, 120)
+
+def monitor_cycle(mon: "_Monitor", now: float, due_system: bool, due_software: bool) -> list:
+    """Un passage : processus, puis système et paquets s'ils sont dus. Retourne les alertes."""
+    events = []
+    for name, scan, due in (("processus", mon.scan_processes, True), ("système", mon.scan_system, due_system),
+                            ("paquets", mon.scan_software, due_software)):
+        if due:
+            try:
+                events += scan()
+            except Exception as e:
+                logger.warning(f"Surveillance ({name}) : {type(e).__name__}: {e}")
+    return [e for e in events if e]
+
+def monitor_loop(config):
+    """Boucle de surveillance (Linux, mode démon), à la priorité la plus basse."""
+    try:
+        os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 19)   # nice 19, ce fil seulement
+    except (AttributeError, OSError):
+        pass
+    time.sleep(20)
+    mon = _Monitor(config)
+    next_system = next_software = 0.0
+    while True:
+        enabled, proc_interval, system_minutes = _monitor_settings(config)
+        if enabled:
+            mon.refresh_watchlist()
+            if mon.server_enabled:
+                now = time.time()
+                events = monitor_cycle(mon, now, now >= next_system, now >= next_software)
+                if now >= next_system:
+                    next_system = now + system_minutes * 60
+                if now >= next_software:
+                    next_software = now + 15 * 60
+                mon.flush(events)
+                for key, ts in list(mon.state["alerted"].items()):
+                    if now - ts > 30 * 86400:
+                        del mon.state["alerted"][key]
+                        mon.dirty = True
+                mon.save()
+        time.sleep(proc_interval)
+
 # ─── Helpers serveur ──────────────────────────────────────────────────────────
 def _cfg_bool(config, key: str, default: bool) -> bool:
     try:
@@ -1447,6 +1916,8 @@ def run_daemon(config):
 
     threading.Thread(target=_hb_loop, daemon=True, name="Heartbeat").start()
     threading.Thread(target=_update_loop, daemon=True, name="UpdateLoop").start()
+    if platform.system() == "Linux":
+        threading.Thread(target=monitor_loop, args=(config,), daemon=True, name="Monitor").start()
 
     while True:
         try:

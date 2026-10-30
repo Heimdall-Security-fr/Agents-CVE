@@ -428,6 +428,7 @@
     <div class="nav-item" data-page="dashboard"><span class="icon">📊</span> Dashboard</div>
     <div class="nav-item" data-page="servers"><span class="icon">🖥</span> Serveurs</div>
     <div class="nav-item" data-page="vulns"><span class="icon">⚠️</span> Vulnérabilités</div>
+    <div class="nav-item" data-page="monitoring" id="nav-monitoring" style="display:none"><span class="icon">🛡️</span> Surveillance</div>
     <div class="nav-item" data-page="ai"><span class="icon">🤖</span> Assistant IA</div>
     <div class="nav-section">Gestion</div>
     <div class="nav-item" data-page="compliance"><span class="icon">✅</span> Conformité</div>
@@ -550,6 +551,15 @@
     <div class="page" id="page-deploy">
       <div class="header-row"><div><h1>Déploiement</h1><p>Téléchargement et installation des agents</p></div></div>
       <div id="deploy-content"><div class="loading-center"><div class="spinner"></div></div></div>
+    </div>
+
+    <!-- Surveillance des postes -->
+    <div class="page" id="page-monitoring">
+      <div class="header-row">
+        <div><h1>Surveillance</h1><p>Alertes détectées sur les machines : persistance, processus suspects, comptes, logiciels</p></div>
+        <div class="flex gap-2" id="monitoring-actions"></div>
+      </div>
+      <div id="monitoring-content"><div class="loading-center"><div class="spinner"></div></div></div>
     </div>
 
     <!-- Notifications mail -->
@@ -805,6 +815,9 @@ function showApp(u) {
   if (u.role === 'admin') {
     document.getElementById('nav-users').style.display = 'flex';
   }
+  if (u.role === 'admin' || u.role === 'inspection_logs') {
+    document.getElementById('nav-monitoring').style.display = 'flex';
+  }
   navigate('dashboard');
 }
 
@@ -820,7 +833,7 @@ function logout() {
 }
 
 /* ── Router ── */
-var LOADERS = { servers: loadServers, vulns: loadVulns, ai: loadAi, compliance: loadCompliance, updates: loadUpdates, deploy: loadDeploy, notifications: loadNotifications, users: loadUsers, dashboard: loadDashboard };
+var LOADERS = { servers: loadServers, vulns: loadVulns, ai: loadAi, compliance: loadCompliance, updates: loadUpdates, deploy: loadDeploy, notifications: loadNotifications, monitoring: loadMonitoring, users: loadUsers, dashboard: loadDashboard };
 
 function navigate(page) {
   document.querySelectorAll('.page').forEach(function(p){ p.classList.remove('active'); });
@@ -2054,8 +2067,132 @@ function renderResults() {
     }).join('')+'</div>'+paginationBar(paged, 'goCompliancePage');
 }
 
+/* ── Surveillance des postes ── */
+var SEV_BADGE = { critical: ['badge-red', 'Critique'], high: ['badge-orange', 'Élevée'], medium: ['badge-yellow', 'Moyenne'],
+                  low: ['badge-blue', 'Faible'], info: ['badge-gray', 'Info'] };
+var RULE_LABELS = {
+  new_scheduled_task: 'Tâche planifiée', modified_scheduled_task: 'Tâche planifiée modifiée', new_autorun: 'Démarrage automatique',
+  new_service: 'Service', new_software: 'Logiciel installé', admin_group_added: 'Administrateurs', new_local_account: 'Compte local',
+  uid0_account: 'Compte root', sudoers_modified: 'Sudo', ssh_key_added: 'Clé SSH', ld_preload: 'Préchargement',
+  defender_exclusion: 'Defender', hosts_file_modified: 'Fichier hosts', masquerading_process: 'Imitation',
+  offensive_tool: 'Outil offensif', suspicious_command: 'Commande suspecte', document_spawns_shell: 'Document piégé',
+  vulnerable_app_spawns_shell: 'Exploitation possible', webserver_spawns_shell: 'Webshell', service_spawns_shell: 'Service → shell',
+  suspicious_location: 'Emplacement suspect', double_extension: 'Double extension', fileless_process: 'Sans fichier',
+  event_flood: 'Trop d’alertes'
+};
+var _monFilter = { status: 'new', min_severity: 'low', hostname: '' };
+var _monEvents = [];
+var _monSelected = {};
+var _monOpen = {};
+
+async function loadMonitoring() {
+  var el = document.getElementById('monitoring-content');
+  try {
+    var q = '/api/security-events?status=' + encodeURIComponent(_monFilter.status) + '&min_severity=' + encodeURIComponent(_monFilter.min_severity)
+      + (_monFilter.hostname ? '&hostname=' + encodeURIComponent(_monFilter.hostname) : '');
+    var d = await api(q);
+    _monEvents = d.events || [];
+    renderMonitoring(d);
+  } catch(err) { el.innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>'; }
+}
+
+function renderMonitoring(d) {
+  var el = document.getElementById('monitoring-content');
+  var open = d.open_by_severity || {};
+  var cards = [['Critiques à traiter', open.critical || 0, 'color:var(--red)'], ['Élevées à traiter', open.high || 0, 'color:var(--orange)'],
+               ['Moyennes à traiter', open.medium || 0, 'color:var(--yellow)'], ['Alertes sur 24 h', d.last_24h || 0, '']]
+    .map(function(c){ return '<div class="card"><div class="card-label">'+esc(c[0])+'</div><div class="card-value" style="'+c[2]+'">'+c[1]+'</div></div>'; }).join('');
+  function sel(id, options, value) {
+    return '<select id="'+id+'" style="width:auto" onchange="setMonFilter()">'+options.map(function(o){
+      return '<option value="'+esc(o[0])+'"'+(o[0]===value?' selected':'')+'>'+esc(o[1])+'</option>'; }).join('')+'</select>';
+  }
+  var hosts = [['', 'Toutes les machines']].concat((d.hosts || []).map(function(h){ return [h, h]; }));
+  if (_monFilter.hostname && !(d.hosts || []).includes(_monFilter.hostname)) hosts.push([_monFilter.hostname, _monFilter.hostname]);
+  var filters = '<div class="flex gap-2" style="flex-wrap:wrap;margin-bottom:12px">'
+    + sel('mon-status', [['new', 'À traiter'], ['ack', 'Traitées'], ['all', 'Toutes']], _monFilter.status)
+    + sel('mon-sev', [['low', 'Faible et plus'], ['medium', 'Moyenne et plus'], ['high', 'Élevée et plus'], ['critical', 'Critiques'], ['info', 'Tout']], _monFilter.min_severity)
+    + sel('mon-host', hosts, _monFilter.hostname)
+    + '<button class="btn btn-ghost btn-sm" onclick="ackMonitoring(\'ack\')" id="mon-ack-btn" disabled>✓ Marquer la sélection comme traitée</button>'
+    + (_monFilter.status !== 'new' ? '<button class="btn btn-ghost btn-sm" onclick="ackMonitoring(\'new\')" id="mon-reopen-btn" disabled>↺ Rouvrir</button>' : '')
+    + '</div>';
+  var paused = d.enabled ? '' : '<div class="alert alert-warn">La surveillance est suspendue sur tout le parc : les agents n’analysent plus rien et les alertes reçues sont ignorées.</div>';
+  var toggle = isAdmin() ? '<button class="btn btn-ghost btn-sm" onclick="toggleMonitoring('+(!d.enabled)+')">'+(d.enabled ? '⏸ Suspendre la surveillance' : '▶ Réactiver la surveillance')+'</button>' : '';
+  document.getElementById('monitoring-actions').innerHTML = toggle + '<button class="btn btn-ghost btn-sm" onclick="loadMonitoring()">↻</button>';
+  var rows = _monEvents.map(function(e, i) {
+    var sev = SEV_BADGE[e.severity] || SEV_BADGE.info;
+    var cves = [];
+    (e.related_cves || []).forEach(function(r){ (r.cves || []).forEach(function(c){ cves.push(c); }); });
+    var cveHtml = cves.slice(0, 4).map(function(c){ var u = cveDetailUrl(c);
+      return u ? '<a class="badge badge-red" style="font-size:10px" target="_blank" rel="noopener noreferrer" href="'+esc(u)+'" onclick="event.stopPropagation()">'+esc(c)+'</a>' : '<span class="badge badge-red" style="font-size:10px">'+esc(c)+'</span>'; }).join(' ');
+    var details = Object.keys(e.details || {}).filter(function(k){ return e.details[k] !== '' && e.details[k] !== null; }).map(function(k){
+      return '<div style="display:grid;grid-template-columns:140px 1fr;gap:8px;padding:3px 0"><span class="text-muted">'+esc(k)+'</span><span class="code" style="white-space:pre-wrap">'+esc(String(e.details[k]))+'</span></div>'; }).join('');
+    var extra = (e.severity_reason ? '<div class="text-muted" style="margin-bottom:6px">Gravité relevée : '+esc(e.severity_reason)+'</div>' : '')
+      + (e.related_cves || []).map(function(r){ return '<div style="margin-bottom:4px">Logiciel vulnérable sur cette machine : <strong>'+esc(r.product)+' '+esc(r.version||'')+'</strong> — '+esc((r.cves||[]).join(', '))+' (CVSS max '+esc(r.max_cvss)+', EPSS max '+esc(Math.round((r.max_epss||0)*1000)/10)+' %)</div>'; }).join('')
+      + (e.acked_by ? '<div class="text-muted">Traitée par '+esc(e.acked_by)+' le '+esc(notifDate(e.acked_at))+'</div>' : '');
+    return '<tr style="cursor:pointer" onclick="toggleMonDetails('+i+')">'
+      + '<td onclick="event.stopPropagation()"><input type="checkbox" '+(_monSelected[e.id]?'checked':'')+' onchange="selectMonEvent(\''+esc(e.id)+'\', this.checked)"></td>'
+      + '<td style="font-size:11px;white-space:nowrap" class="text-muted">'+esc(notifDate(e.received_at))+'</td>'
+      + '<td style="white-space:nowrap"><strong>'+esc(e.hostname)+'</strong></td>'
+      + '<td><span class="badge '+sev[0]+'">'+sev[1]+'</span></td>'
+      + '<td><div>'+esc(e.title)+'</div><div class="text-muted" style="font-size:11px;margin-top:3px;max-width:560px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(e.summary || '')+'</div></td>'
+      + '<td><span class="badge badge-gray" style="font-size:10px">'+esc(RULE_LABELS[e.rule] || e.rule)+'</span></td>'
+      + '<td style="white-space:nowrap">'+(cveHtml || '<span class="text-muted">—</span>')+'</td>'
+      + '</tr><tr id="mon-det-'+i+'" style="display:'+(_monOpen[e.id]?'table-row':'none')+'"><td></td><td colspan="6" style="font-size:12px;background:rgba(0,0,0,.18)">'+extra+details+'</td></tr>';
+  }).join('');
+  el.innerHTML = paused + '<div class="cards mb-6">'+cards+'</div>' + filters
+    + '<div class="table-wrap" style="overflow-x:auto"><table style="min-width:900px"><thead><tr><th style="width:28px"><input type="checkbox" onchange="selectAllMon(this.checked)"></th><th>Reçue</th><th>Machine</th><th>Gravité</th><th>Alerte</th><th>Type</th><th>CVE liées</th></tr></thead><tbody>'
+    + (rows || '<tr><td colspan="7" style="padding:24px;text-align:center;color:var(--muted)">'+(_monFilter.status === 'new' ? 'Aucune alerte à traiter.' : 'Aucune alerte.')+'</td></tr>')
+    + '</tbody></table></div>'
+    + '<p class="text-muted" style="font-size:12px;margin-top:12px">Les agents analysent la machine en continu (nouveaux processus toutes les 30 s ; tâches planifiées, démarrage automatique, services, comptes toutes les 5 min ; logiciels toutes les 15 min) et n’envoient que les déclencheurs. '
+    + 'Une alerte qui touche un logiciel concerné par une CVE récente ou exploitée est rattachée à cette CVE et sa gravité est relevée. Les alertes sont conservées 90 jours.</p>';
+  updateMonButtons();
+}
+
+function setMonFilter() {
+  _monFilter = { status: document.getElementById('mon-status').value, min_severity: document.getElementById('mon-sev').value,
+                 hostname: document.getElementById('mon-host').value };
+  _monSelected = {};
+  loadMonitoring();
+}
+function toggleMonDetails(i) {
+  var row = document.getElementById('mon-det-' + i), e = _monEvents[i];
+  var show = row.style.display === 'none';
+  row.style.display = show ? 'table-row' : 'none';
+  _monOpen[e.id] = show;
+}
+function selectMonEvent(id, on) { if (on) _monSelected[id] = true; else delete _monSelected[id]; updateMonButtons(); }
+function selectAllMon(on) {
+  _monSelected = {};
+  if (on) _monEvents.forEach(function(e){ _monSelected[e.id] = true; });
+  document.querySelectorAll('#monitoring-content tbody input[type=checkbox]').forEach(function(c){ c.checked = on; });
+  updateMonButtons();
+}
+function updateMonButtons() {
+  var n = Object.keys(_monSelected).length;
+  ['mon-ack-btn', 'mon-reopen-btn'].forEach(function(id){ var b = document.getElementById(id); if (b) b.disabled = !n; });
+}
+async function ackMonitoring(status) {
+  var ids = Object.keys(_monSelected);
+  if (!ids.length) return;
+  try {
+    var r = await api('/api/security-events/ack', { method: 'POST', body: JSON.stringify({ ids: ids, status: status }) });
+    toast(r.updated + ' alerte(s) ' + (status === 'ack' ? 'marquée(s) comme traitée(s)' : 'rouverte(s)'), 'ok');
+    _monSelected = {};
+    loadMonitoring();
+  } catch(err) { toast(err.message, 'err'); }
+}
+async function toggleMonitoring(enabled) {
+  if (!enabled && !confirm('Suspendre la surveillance sur tout le parc ? Les agents arrêteront d’analyser les machines (sous 30 min).')) return;
+  try {
+    await api('/api/settings/monitoring', { method: 'PUT', body: JSON.stringify({ enabled: enabled }) });
+    toast(enabled ? 'Surveillance réactivée (agents mis à jour sous 30 min)' : 'Surveillance suspendue', 'ok');
+    loadMonitoring();
+  } catch(err) { toast(err.message, 'err'); }
+}
+
 /* ── Notifications mail ── */
 var NOTIF_HELP = {
+  security_events: "Un agent détecte un déclencheur : tâche planifiée ou programme au démarrage ajouté, processus suspect (PowerShell encodé, shell inversé, outil offensif…), ajout aux administrateurs, clé SSH… Rattachée aux CVE récentes de la machine.",
   new_cves: "Une CVE apparaît sur une machine : logiciel ajouté ou mis à jour, ou CVE publiée depuis l'analyse précédente.",
   high_epss: "Une CVE présente sur le parc dépasse 10 % de probabilité d'exploitation sous 30 jours (EPSS), quelle que soit sa note CVSS. L'EPSS évolue chaque jour : une CVE ancienne peut le devenir.",
   cve_scan_problem: "Les vulnérabilités ne sont plus analysées : quota épuisé, clé CVE_API_KEY invalide ou API injoignable. Rappel au plus une fois par jour tant que ça dure.",
@@ -2107,6 +2244,12 @@ function renderNotifPrefs(d, isAdmin) {
             return '<option value="'+o[0]+'"'+(o[0]===sev?' selected':'')+'>'+esc(o[1])+'</option>';
           }).join('') + '</select>';
     }
+    if (t.allowed && t.id === 'security_events') {
+      var lvl = p.security_events.min_severity;
+      extra = 'Gravité minimale <select id="np-sec-sev">'
+        + [['critical','Critique'],['high','Élevée'],['medium','Moyenne'],['low','Faible']].map(function(o){
+            return '<option value="'+o[0]+'"'+(o[0]===lvl?' selected':'')+'>'+esc(o[1])+'</option>'; }).join('') + '</select>';
+    }
     if (t.allowed && t.id === 'agent_offline') {
       extra = 'Après <input type="number" id="np-offline-hours" min="1" max="720" value="'+esc(p.agent_offline.hours)+'"> h sans contact';
     }
@@ -2142,6 +2285,8 @@ async function saveNotifPrefs(btn) {
   if (sev && body.new_cves) body.new_cves.min_severity = sev.value;
   var days = document.getElementById('np-report-days');
   if (days && body.compliance_report) body.compliance_report.every_days = parseInt(days.value, 10);
+  var secSev = document.getElementById('np-sec-sev');
+  if (secSev && body.security_events) body.security_events.min_severity = secSev.value;
   var hours = document.getElementById('np-offline-hours');
   if (hours && body.agent_offline) body.agent_offline.hours = parseInt(hours.value, 10);
   btn.disabled = true;

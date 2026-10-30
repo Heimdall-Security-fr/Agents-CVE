@@ -1228,6 +1228,738 @@ def _winget_upgrades(winget: str) -> dict:
         result["error"] = str(e)[:200]
     return result
 
+# ─── Surveillance du poste ───────────────────────────────────────────────────
+# Analyse locale, légère, en continu : seuls les déclencheurs partent au serveur.
+#   • processus : seuls les NOUVEAUX processus sont examinés (toutes les 30 s) ; la
+#     ligne de commande n'est lue que pour les programmes à risque (PowerShell, cmd…) ;
+#   • tâches planifiées, démarrage automatique, services, administrateurs, comptes,
+#     exclusions Defender, fichier hosts : toutes les 5 min, par différence avec
+#     l'instantané précédent (un fichier de tâche n'est relu que s'il a changé) ;
+#   • logiciels installés : toutes les 15 min.
+# Le fil tourne en mode « arrière-plan » de Windows (CPU, disque et mémoire au plus
+# bas). Au premier passage, l'état existant sert de référence : rien n'est signalé,
+# sauf un processus déjà en cours qui déclenche une règle moyenne ou plus.
+import json
+import ntpath       # chemins Windows, quel que soit l'OS qui exécute les règles (tests)
+MONITOR_STATE_FILE = os.path.join(_LOG_DIR, "monitor-state.json")
+_MONITOR_ALERT_TTL = 7 * 86400          # une même alerte de processus n'est renvoyée qu'après 7 jours
+_MONITOR_MAX_EVENTS_PER_CYCLE = 50
+_MONITOR_QUEUE_MAX = 300
+_SEVERITY_ORDER = ("info", "low", "medium", "high", "critical")
+
+_SCRIPT_HOSTS = {"cmd.exe", "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe", "mshta.exe",
+                 "rundll32.exe", "regsvr32.exe", "certutil.exe", "bitsadmin.exe", "msbuild.exe",
+                 "installutil.exe", "schtasks.exe", "wmic.exe", "bash.exe", "hh.exe", "forfiles.exe"}
+_DOCUMENT_APPS = {"winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "onenote.exe", "msaccess.exe",
+                  "mspub.exe", "visio.exe", "acrord32.exe", "acrobat.exe", "foxitpdfreader.exe",
+                  "foxitreader.exe", "wordpad.exe"}
+# Ligne de commande lue uniquement pour ceux-ci (le reste : nom et chemin suffisent)
+_CMDLINE_OF_INTEREST = _SCRIPT_HOSTS | {"vssadmin.exe", "wbadmin.exe", "bcdedit.exe", "procdump.exe",
+                                        "procdump64.exe", "reg.exe", "net.exe", "net1.exe", "sc.exe",
+                                        "wevtutil.exe", "curl.exe", "taskkill.exe"}
+# Binaires système souvent imités par les malwares : leur dossier légitime
+_SYSTEM_BINARIES = {"svchost.exe", "lsass.exe", "csrss.exe", "winlogon.exe", "services.exe", "smss.exe",
+                    "wininit.exe", "spoolsv.exe", "taskhostw.exe", "lsaiso.exe", "dllhost.exe",
+                    "conhost.exe", "explorer.exe", "rundll32.exe", "svchost32.exe"}
+_OFFENSIVE_TOOLS = {"mimikatz": "critical", "rubeus": "critical", "lazagne": "high", "sharphound": "high",
+                    "bloodhound": "high", "seatbelt": "high", "kerbrute": "high", "pwdump": "high",
+                    "gsecdump": "high", "safetykatz": "critical", "nanodump": "critical", "chisel": "high",
+                    "nc": "high", "nc64": "high", "ncat": "high", "netcat": "high", "psexesvc": "medium",
+                    "psexec": "medium", "psexec64": "medium", "ngrok": "medium", "plink": "medium",
+                    "rclone": "medium", "advanced_ip_scanner": "medium", "netscan": "medium",
+                    "xmrig": "high", "nheqminer": "high"}
+# (motif, gravité, titre) — appliqués à la ligne de commande, en minuscules
+_CMDLINE_RULES = [
+    (r"vssadmin(\.exe)?\s+delete\s+shadows|wmic(\.exe)?\s+shadowcopy\s+delete|wbadmin(\.exe)?\s+delete\s+"
+     r"(catalog|systemstatebackup)|bcdedit.*recoveryenabled\s+no|bcdedit.*bootstatuspolicy\s+ignoreallfailures",
+     "critical", "Suppression des sauvegardes / points de restauration (signe de rançongiciel)"),
+    (r"procdump.*lsass|comsvcs(\.dll)?[\s,].*minidump|comsvcs.*#\s*24|sekurlsa|lsadump",
+     "critical", "Tentative de vol d'identifiants (mémoire de LSASS)"),
+    (r"\s-(e|en|enc|enco|encod|encode|encoded|encodedc\w*)\s+[a-z0-9+/=]{20,}",
+     "high", "PowerShell avec commande encodée"),
+    (r"(downloadstring|downloadfile|downloaddata|net\.webclient|invoke-webrequest|\biwr\b|invoke-restmethod|"
+     r"\birm\b|start-bitstransfer).*(\biex\b|invoke-expression)|(\biex\b|invoke-expression).*(downloadstring|"
+     r"net\.webclient|\biwr\b|invoke-webrequest|invoke-restmethod|\birm\b)",
+     "high", "Téléchargement puis exécution de code (PowerShell)"),
+    (r"frombase64string.*(\biex\b|invoke-expression|\[reflection\.assembly\]::load)",
+     "high", "Exécution de code décodé en mémoire (PowerShell)"),
+    (r"certutil(\.exe)?.*\s[-/](urlcache|decode|decodehex)\b", "high", "Certutil détourné (téléchargement/décodage)"),
+    (r"bitsadmin(\.exe)?.*\s/transfer\b", "medium", "Téléchargement via BITSAdmin"),
+    (r"mshta(\.exe)?\s+[\"']?(https?:|javascript:|vbscript:)", "high", "MSHTA exécute un script distant"),
+    (r"regsvr32(\.exe)?.*(/i:\s*https?:|scrobj\.dll)", "high", "Regsvr32 détourné (Squiblydoo)"),
+    (r"rundll32(\.exe)?.*(javascript:|url\.dll.*(https?:|file)|shell32\.dll.*shellexec_rundll.*https?:)",
+     "high", "Rundll32 détourné"),
+    (r"wevtutil(\.exe)?\s+(cl|clear-log)\b|clear-eventlog", "high", "Effacement des journaux Windows"),
+    (r"set-mppreference.*-disable\w*\s+(\$true|1)|add-mppreference.*-exclusion", "high",
+     "Désactivation ou exclusion de Microsoft Defender"),
+    (r"net1?(\.exe)?\s+localgroup\s+\S*admin\S*\s+.*\s/add|net1?(\.exe)?\s+user\s+\S+\s+\S+\s+/add",
+     "high", "Création de compte ou ajout aux administrateurs en ligne de commande"),
+    (r"-w(indowstyle)?\s+h(idden)?\b.*-(nop|noprofile)\b.*https?:|-(nop|noprofile)\b.*-w(indowstyle)?\s+h(idden)?\b.*https?:",
+     "medium", "PowerShell caché qui contacte Internet"),
+]
+_CMDLINE_RULES = [(re.compile(p), s, t) for p, s, t in _CMDLINE_RULES]
+_DOUBLE_EXTENSION = re.compile(r"\.(pdf|docx?|xlsx?|pptx?|jpe?g|png|txt|zip|rar)\.(exe|scr|com|bat|cmd|js|vbs|pif)$")
+
+def _suspicious_location(path: str):
+    """(gravité, raison) si l'exécutable est dans un dossier où un programme légitime
+    n'a pas sa place, sinon None."""
+    p = (path or "").lower()
+    if not p:
+        return None
+    for marker, severity, reason in (
+            ("\\$recycle.bin\\", "high", "exécuté depuis la corbeille"),
+            ("\\users\\public\\", "high", "exécuté depuis C:\\Users\\Public"),
+            ("c:\\perflogs\\", "high", "exécuté depuis C:\\PerfLogs"),
+            ("\\appdata\\local\\temp\\", "low", "exécuté depuis un dossier temporaire"),
+            ("\\windows\\temp\\", "low", "exécuté depuis C:\\Windows\\Temp"),
+            ("\\downloads\\", "low", "exécuté depuis Téléchargements")):
+        if marker in p:
+            return severity, reason
+    return None
+
+def _command_program(command: str) -> str:
+    """Exécutable d'une ligne de commande (« "C:\\Program Files\\x\\a.exe" -arg »)."""
+    cmd = (command or "").strip()
+    if cmd.startswith('"'):
+        return cmd[1:].split('"', 1)[0]
+    m = re.match(r"(.+?\.(exe|com|bat|cmd|ps1|vbs|js|msc))(\s|$)", cmd, re.I)
+    return m.group(1) if m else cmd.split(" ", 1)[0]
+
+def _is_vendor_path(command: str) -> bool:
+    """Programme installé dans Program Files ou Windows (emplacements protégés en écriture)."""
+    program = os.path.expandvars(_command_program(command)).lower()
+    return program.startswith(("c:\\program files\\", "c:\\program files (x86)\\", "c:\\windows\\",
+                               "%systemroot%", "%windir%", "%programfiles%", "\\systemroot\\", "system32\\"))
+
+def _rate_command(command: str):
+    """Gravité d'une commande lancée par une tâche planifiée, un service ou une clé
+    de démarrage : (gravité, [raisons]). « low » si rien de particulier."""
+    cmd = (command or "").lower()
+    reasons, severity = [], "low"
+    def raise_to(level, reason):
+        nonlocal severity
+        reasons.append(reason)
+        if _SEVERITY_ORDER.index(level) > _SEVERITY_ORDER.index(severity):
+            severity = level
+    for rx, level, title in _CMDLINE_RULES:
+        if rx.search(cmd):
+            raise_to(level, title)
+    loc = _suspicious_location(cmd)
+    if loc:
+        raise_to("high" if loc[0] == "low" else loc[0], loc[1])
+    if re.search(r"\\appdata\\(roaming|local)\\[^\\]+\.(exe|dll|bat|cmd|ps1|vbs|js)\b", cmd):
+        raise_to("medium", "programme posé directement dans AppData")
+    first = ntpath.basename(_command_program(cmd))
+    if first in _SCRIPT_HOSTS or re.search(r"\.(ps1|vbs|js|jse|hta|bat|cmd)\b", cmd):
+        raise_to("medium", "lance un interpréteur ou un script")
+    if _DOUBLE_EXTENSION.search(_command_program(cmd)):
+        raise_to("high", "double extension trompeuse")
+    return severity, reasons
+
+def _persistence_severity(command: str, severity: str) -> str:
+    """Gravité d'un nouvel élément de démarrage : « faible » pour un programme d'éditeur
+    (Program Files, Windows), « moyenne » ailleurs, sinon celle des règles."""
+    if severity != "low":
+        return severity
+    return "low" if _is_vendor_path(command) else "medium"
+
+def _process_findings(name: str, image: str, parent_name: str, parent_image: str,
+                      cmdline: str, watchlist: list, system_root: str) -> list:
+    """Règles appliquées à un nouveau processus : [(règle, gravité, titre, extra)]."""
+    findings = []
+    name = (name or "").lower()
+    image_l = (image or "").lower()
+    parent = (parent_name or "").lower()
+    cmd = (cmdline or "").lower()
+    stem = name[:-4] if name.endswith(".exe") else name
+    sysroot = (system_root or r"C:\Windows").lower().rstrip("\\")
+    if name in _SYSTEM_BINARIES and image_l:
+        allowed = {sysroot + "\\system32", sysroot + "\\syswow64"}
+        if name == "explorer.exe":
+            allowed = {sysroot}
+        if ntpath.dirname(image_l) not in allowed:
+            findings.append(("masquerading_process", "critical",
+                             f"{name} lancé hors de son dossier système (imitation)", {}))
+    if stem in _OFFENSIVE_TOOLS:
+        findings.append(("offensive_tool", _OFFENSIVE_TOOLS[stem], f"Outil offensif ou de tunnel : {name}", {}))
+    for rx, level, title in _CMDLINE_RULES:
+        if cmd and rx.search(cmd):
+            findings.append(("suspicious_command", level, title, {}))
+            break
+    if parent in _DOCUMENT_APPS and name in _SCRIPT_HOSTS:
+        findings.append(("document_spawns_shell", "high",
+                         f"{parent} a lancé {name} (macro ou document piégé ?)", {}))
+    if name in _SCRIPT_HOSTS and parent_image:
+        haystack = parent_image.lower()
+        for product in watchlist or []:
+            if any(token in haystack for token in product.get("match") or []):
+                cves = ", ".join((product.get("cves") or [])[:3])
+                findings.append(("vulnerable_app_spawns_shell", "critical",
+                                 f"{product.get('name')} (vulnérable : {cves}) a lancé {name} — exploitation possible",
+                                 {"watchlist_match": product.get("name"), "cves": cves}))
+                break
+    loc = _suspicious_location(image)
+    if loc:
+        findings.append(("suspicious_location", loc[0], f"{name} {loc[1]}", {}))
+    if _DOUBLE_EXTENSION.search(image_l):
+        findings.append(("double_extension", "high", f"{name} : double extension trompeuse", {}))
+    return findings
+
+# ── Capteurs Windows ─────────────────────────────────────────────────────────
+_WIN_API = {}
+
+def _win_api():
+    """kernel32/ntdll avec types d'arguments déclarés (handles 64 bits), sur des
+    instances propres à la surveillance pour ne pas modifier celles du reste de l'agent."""
+    if _WIN_API:
+        return _WIN_API
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                               ctypes.POINTER(wintypes.DWORD)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.GetCurrentThread.restype = wintypes.HANDLE
+    k32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+    ntdll.NtQueryInformationProcess.argtypes = [wintypes.HANDLE, ctypes.c_ulong, ctypes.c_void_p,
+                                                ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+    ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+    _WIN_API.update(k32=k32, ntdll=ntdll)
+    return _WIN_API
+
+def _background_thread():
+    """Fil en mode arrière-plan : priorité CPU, disque et mémoire minimales."""
+    try:
+        k32 = _win_api()["k32"]
+        k32.SetThreadPriority(k32.GetCurrentThread(), 0x00010000)   # THREAD_MODE_BACKGROUND_BEGIN
+    except Exception:
+        pass
+
+def _list_processes() -> dict:
+    """{pid: (ppid, nom)} via un instantané ToolHelp (très peu coûteux)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+    k32 = _win_api()["k32"]
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)      # TH32CS_SNAPPROCESS
+    procs = {}
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        return procs
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            procs[int(entry.th32ProcessID)] = (int(entry.th32ParentProcessID), entry.szExeFile)
+            ok = k32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    return procs
+
+def _process_details(pid: int, want_cmdline: bool):
+    """(chemin de l'exécutable, ligne de commande ou "") — accès minimal en lecture."""
+    import ctypes
+    from ctypes import wintypes
+    api = _win_api()
+    k32, ntdll = api["k32"], api["ntdll"]
+    handle = k32.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return "", ""
+    try:
+        size = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(1024)
+        image = buf.value if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)) else ""
+        cmdline = ""
+        if want_cmdline:
+            class UNICODE_STRING(ctypes.Structure):
+                _fields_ = [("Length", ctypes.c_ushort), ("MaximumLength", ctypes.c_ushort),
+                            ("Buffer", ctypes.c_void_p)]
+            needed = ctypes.c_ulong(0)
+            ntdll.NtQueryInformationProcess(handle, 60, None, 0, ctypes.byref(needed))  # ProcessCommandLineInformation
+            if 0 < needed.value < 65536:
+                raw = ctypes.create_string_buffer(needed.value)
+                if ntdll.NtQueryInformationProcess(handle, 60, raw, needed.value, ctypes.byref(needed)) == 0:
+                    us = UNICODE_STRING.from_buffer(raw)
+                    if us.Buffer and us.Length:
+                        cmdline = ctypes.wstring_at(us.Buffer, us.Length // 2)
+        return image, cmdline
+    except Exception:
+        return "", ""
+    finally:
+        k32.CloseHandle(handle)
+
+def _reg_values(root, path: str) -> dict:
+    import winreg
+    out = {}
+    try:
+        with winreg.OpenKey(root, path) as key:
+            i = 0
+            while True:
+                try:
+                    name, value, _ = winreg.EnumValue(key, i)
+                except OSError:
+                    break
+                out[name or "(par défaut)"] = str(value)[:500]
+                i += 1
+    except OSError:
+        pass
+    return out
+
+def _snapshot_autoruns() -> dict:
+    """Clés Run/RunOnce (machine et chaque utilisateur chargé), Winlogon, débogueurs
+    IFEO (porte dérobée « touches rémanentes ») et dossiers Démarrage."""
+    import winreg, glob
+    out = {}
+    run_paths = (r"Software\Microsoft\Windows\CurrentVersion\Run",
+                 r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                 r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+                 r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce")
+    roots = [("HKLM", winreg.HKEY_LOCAL_MACHINE, "")]
+    if SERVICE_MODE:
+        try:
+            with winreg.OpenKey(winreg.HKEY_USERS, "") as users:
+                i = 0
+                while True:
+                    try:
+                        sid = winreg.EnumKey(users, i)
+                    except OSError:
+                        break
+                    i += 1
+                    if sid.startswith("S-1-5-21-") and not sid.endswith("_Classes"):
+                        roots.append((f"HKU\\{sid}", winreg.HKEY_USERS, sid + "\\"))
+        except OSError:
+            pass
+    else:
+        roots.append(("HKCU", winreg.HKEY_CURRENT_USER, ""))
+    for label, root, prefix in roots:
+        for path in run_paths:
+            for name, value in _reg_values(root, prefix + path).items():
+                out[f"{label}\\{path}\\{name}"] = value
+    winlogon = _reg_values(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon")
+    for name in ("Shell", "Userinit"):
+        if name in winlogon:
+            out[f"HKLM\\Winlogon\\{name}"] = winlogon[name]
+    ifeo = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+    for exe in ("sethc.exe", "utilman.exe", "osk.exe", "magnify.exe", "narrator.exe", "displayswitch.exe",
+                "atbroker.exe", "taskmgr.exe", "lsass.exe"):
+        debugger = _reg_values(winreg.HKEY_LOCAL_MACHINE, f"{ifeo}\\{exe}").get("Debugger")
+        if debugger:
+            out[f"HKLM\\IFEO\\{exe}\\Debugger"] = debugger
+    startup_dirs = [os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                                 r"Microsoft\Windows\Start Menu\Programs\StartUp")]
+    startup_dirs += glob.glob(os.path.join(os.environ.get("SystemDrive", "C:") + "\\", "Users", "*",
+                                           r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"))
+    for d in startup_dirs:
+        try:
+            for entry in os.scandir(d):
+                if entry.is_file() and entry.name.lower() != "desktop.ini":
+                    out[f"Démarrage\\{entry.path}"] = entry.path
+        except OSError:
+            pass
+    return out
+
+def _snapshot_services() -> dict:
+    """{service: "type|chemin"} — un nouveau service est un moyen de persistance courant."""
+    import winreg
+    out = {}
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services") as root:
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(root, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    with winreg.OpenKey(root, name) as key:
+                        image = str(winreg.QueryValueEx(key, "ImagePath")[0])[:500]
+                        try:
+                            stype = int(winreg.QueryValueEx(key, "Type")[0])
+                        except OSError:
+                            stype = 0
+                        out[name] = f"{stype}|{image}"
+                except OSError:
+                    pass    # pas d'ImagePath : pilote fourni sans binaire ou clé de paramètres
+    except OSError:
+        pass
+    return out
+
+def _snapshot_task_files(previous: dict) -> tuple:
+    """({chemin: "mtime|taille"}, [chemins nouveaux ou modifiés]) — seuls ceux-là sont relus."""
+    root = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "Tasks")
+    current, changed = {}, []
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            path = os.path.join(dirpath, f)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            rel = os.path.relpath(path, root)
+            sig = f"{st.st_mtime_ns}|{st.st_size}"
+            current[rel] = sig
+            if previous.get(rel) != sig:
+                changed.append(rel)
+    return current, changed
+
+def _read_task(rel: str) -> dict:
+    """Action, compte et déclencheurs d'une tâche planifiée (fichier XML)."""
+    import xml.etree.ElementTree as ET
+    path = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "Tasks", rel)
+    try:
+        with open(path, "rb") as f:
+            root = ET.fromstring(f.read())
+    except (OSError, ET.ParseError):
+        return {}
+    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+    def text(xpath):
+        el = root.find(xpath, ns)
+        return (el.text or "").strip() if el is not None and el.text else ""
+    triggers = root.find("t:Triggers", ns)
+    return {"command": (text("t:Actions/t:Exec/t:Command") + " " + text("t:Actions/t:Exec/t:Arguments")).strip(),
+            "user": text("t:Principals/t:Principal/t:UserId") or text("t:Principals/t:Principal/t:GroupId"),
+            "run_level": text("t:Principals/t:Principal/t:RunLevel"),
+            "author": text("t:RegistrationInfo/t:Author"),
+            "triggers": ", ".join(t.tag.split("}")[-1] for t in triggers) if triggers is not None else "",
+            "com_handler": text("t:Actions/t:ComHandler/t:ClassId")}
+
+def _local_group_members(sid_string: str) -> list:
+    """Membres d'un groupe local identifié par son SID (nom indépendant de la langue)."""
+    import ctypes
+    from ctypes import wintypes
+    advapi, k32 = ctypes.windll.advapi32, ctypes.windll.kernel32
+    sid = ctypes.c_void_p()
+    if not advapi.ConvertStringSidToSidW(sid_string, ctypes.byref(sid)):
+        return []
+    try:
+        name, domain = ctypes.create_unicode_buffer(256), ctypes.create_unicode_buffer(256)
+        n, d, use = wintypes.DWORD(256), wintypes.DWORD(256), wintypes.DWORD()
+        if not advapi.LookupAccountSidW(None, sid, name, ctypes.byref(n), domain, ctypes.byref(d), ctypes.byref(use)):
+            return []
+    finally:
+        k32.LocalFree(sid)
+
+    class LOCALGROUP_MEMBERS_INFO_3(ctypes.Structure):
+        _fields_ = [("domainandname", wintypes.LPWSTR)]
+    net = ctypes.WinDLL("netapi32")
+    buf = ctypes.c_void_p()
+    read, total = wintypes.DWORD(), wintypes.DWORD()
+    rc = net.NetLocalGroupGetMembers(None, name.value, 3, ctypes.byref(buf), 0xFFFFFFFF,
+                                     ctypes.byref(read), ctypes.byref(total), None)
+    if rc != 0 or not buf.value:
+        return []
+    try:
+        members = ctypes.cast(buf, ctypes.POINTER(LOCALGROUP_MEMBERS_INFO_3))
+        return sorted(members[i].domainandname for i in range(read.value) if members[i].domainandname)
+    finally:
+        net.NetApiBufferFree(buf)
+
+def _local_accounts() -> list:
+    """Comptes locaux (NetUserEnum, niveau 0)."""
+    import ctypes
+    from ctypes import wintypes
+    net = _netapi()
+    buf = ctypes.c_void_p()
+    read, total, resume = wintypes.DWORD(), wintypes.DWORD(), wintypes.DWORD(0)
+    rc = net.NetUserEnum(None, 0, 2, ctypes.byref(buf), 0xFFFFFFFF,
+                         ctypes.byref(read), ctypes.byref(total), ctypes.byref(resume))
+    if rc not in (0, 234) or not buf.value:
+        return []
+    try:
+        names = ctypes.cast(buf, ctypes.POINTER(wintypes.LPWSTR))
+        return sorted(names[i] for i in range(read.value) if names[i])
+    finally:
+        net.NetApiBufferFree(buf)
+
+def _hosts_lines() -> list:
+    path = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "drivers", "etc", "hosts")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return sorted({l.strip() for l in f if l.strip() and not l.strip().startswith("#")})[:500]
+    except OSError:
+        return []
+
+def _defender_exclusions() -> dict:
+    import winreg
+    out = {}
+    for kind in ("Paths", "Processes", "Extensions"):
+        for name in _reg_values(winreg.HKEY_LOCAL_MACHINE,
+                                rf"SOFTWARE\Microsoft\Windows Defender\Exclusions\{kind}"):
+            out[f"{kind}\\{name}"] = name
+    return out
+
+# ── Moteur ───────────────────────────────────────────────────────────────────
+class _Monitor:
+    def __init__(self):
+        self.state = {"snap": {}, "alerted": {}, "queue": []}
+        self.seen = set()            # (pid, ppid, nom) déjà examinés
+        self.first_process_scan = True
+        self.watchlist, self.server_enabled, self.watch_at = [], True, 0.0
+        self.dirty = False
+        try:
+            with open(MONITOR_STATE_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                self.state.update({k: loaded[k] for k in ("snap", "alerted", "queue") if k in loaded})
+        except (OSError, ValueError):
+            pass
+
+    def save(self):
+        if not self.dirty:
+            return
+        try:
+            tmp = MONITOR_STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.state, f)
+            os.replace(tmp, MONITOR_STATE_FILE)
+            self.dirty = False
+        except OSError as e:
+            logger.warning(f"Surveillance : état non enregistré ({e})")
+
+    def event(self, rule, severity, title, key, **details):
+        """Construit un événement, sauf s'il a déjà été signalé (dédoublonnage)."""
+        now = time.time()
+        last = self.state["alerted"].get(key)
+        if last and now - last < _MONITOR_ALERT_TTL:
+            return None
+        self.state["alerted"][key] = now
+        self.dirty = True
+        return {"rule": rule, "severity": severity, "title": title[:200], "key": key[:300],
+                "observed_at": datetime.utcnow().isoformat(timespec="seconds"),
+                "details": {k: v for k, v in details.items() if v not in (None, "")}}
+
+    def diff(self, name, current: dict):
+        """Éléments nouveaux ou modifiés depuis le dernier instantané (None au premier)."""
+        previous = self.state["snap"].get(name)
+        if previous != current:
+            self.state["snap"][name] = current
+            self.dirty = True
+        if previous is None:
+            return None
+        return [(k, v, previous.get(k)) for k, v in current.items() if previous.get(k) != v]
+
+    # Processus
+    def scan_processes(self) -> list:
+        procs = _list_processes()
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        events, alive = [], set()
+        for pid, (ppid, name) in procs.items():
+            ident = (pid, ppid, name)
+            alive.add(ident)
+            if ident in self.seen or pid in (0, 4):
+                continue
+            self.seen.add(ident)
+            lname = name.lower()
+            image, cmdline = _process_details(pid, lname in _CMDLINE_OF_INTEREST)
+            parent = procs.get(ppid)
+            parent_name = parent[1] if parent else ""
+            parent_image = _process_details(ppid, False)[0] if parent and lname in _SCRIPT_HOSTS else ""
+            for rule, severity, title, extra in _process_findings(
+                    name, image, parent_name, parent_image, cmdline, self.watchlist, system_root):
+                if self.first_process_scan and _SEVERITY_ORDER.index(severity) < 2:
+                    continue    # référence : les processus déjà lancés ne signalent que le notable
+                ev = self.event(rule, severity, title, f"{rule}|{(image or name).lower()}|{cmdline[:200].lower()}",
+                                image=image or name, pid=pid, parent=parent_name, parent_image=parent_image,
+                                command=cmdline[:1000], **extra)
+                if ev:
+                    events.append(ev)
+        self.seen &= alive              # oublie les processus terminés (mémoire bornée)
+        self.first_process_scan = False
+        return events
+
+    # Persistance et configuration système
+    def scan_system(self) -> list:
+        events = []
+        tasks_prev = self.state["snap"].get("tasks")
+        tasks, changed = _snapshot_task_files(tasks_prev or {})
+        if tasks_prev is not None:
+            for rel in changed:
+                info = _read_task(rel)
+                command = info.get("command") or (f"COM {info['com_handler']}" if info.get("com_handler") else "")
+                severity, reasons = _rate_command(command)
+                if rel.lower().startswith("microsoft\\") and severity in ("low", "medium"):
+                    continue    # tâches de Windows recréées par les mises à jour
+                if info.get("user", "").upper() in ("S-1-5-18", "SYSTEM") or info.get("run_level") == "HighestAvailable":
+                    reasons.append("s'exécute avec les privilèges les plus élevés")
+                new = rel not in tasks_prev
+                ev = self.event("new_scheduled_task" if new else "modified_scheduled_task",
+                                _persistence_severity(command, severity),
+                                f"{'Nouvelle' if new else 'Modification de la'} tâche planifiée : {rel}",
+                                f"task|{rel}|{command[:200]}", name=rel, command=command[:1000],
+                                user=info.get("user"), triggers=info.get("triggers"), author=info.get("author"),
+                                reasons=" ; ".join(reasons))
+                if ev:
+                    events.append(ev)
+        if tasks != tasks_prev:
+            self.state["snap"]["tasks"] = tasks
+            self.dirty = True
+
+        for key, value, old in self.diff("autoruns", _snapshot_autoruns()) or []:
+            severity, reasons = _rate_command(value)
+            if "\\IFEO\\" in key or "\\Winlogon\\" in key:
+                severity = "critical" if "\\IFEO\\" in key else "high"
+                reasons.insert(0, "détournement du démarrage de session ou d'un outil d'accessibilité")
+            ev = self.event("new_autorun", _persistence_severity(value, severity),
+                            f"{'Nouveau' if old is None else 'Modification d’un'} programme au démarrage : {key.rsplit(chr(92), 1)[-1]}",
+                            f"autorun|{key}|{value[:200]}", path=key, value=value, previous=old,
+                            reasons=" ; ".join(reasons))
+            if ev:
+                events.append(ev)
+
+        for name, value, old in self.diff("services", _snapshot_services()) or []:
+            stype, _, image = value.partition("|")
+            severity, reasons = _rate_command(image)
+            if stype in ("1", "2"):
+                reasons.append("pilote noyau")
+                if not image.lower().startswith(("system32\\drivers", "\\systemroot\\system32\\drivers")):
+                    severity = "high" if severity in ("low", "medium") else severity
+            ev = self.event("new_service", _persistence_severity(image, severity),
+                            f"{'Nouveau' if old is None else 'Modification du'} service : {name}",
+                            f"service|{name}|{image[:200]}", name=name, image=image, previous=old,
+                            reasons=" ; ".join(reasons))
+            if ev:
+                events.append(ev)
+
+        admins = {m: "1" for m in _local_group_members("S-1-5-32-544")}
+        for member, _v, _o in self.diff("admins", admins) or []:
+            ev = self.event("admin_group_added", "high", f"Ajout aux administrateurs locaux : {member}",
+                            f"admin|{member}", member=member)
+            if ev:
+                events.append(ev)
+
+        for account, _v, _o in self.diff("accounts", {a: "1" for a in _local_accounts()}) or []:
+            ev = self.event("new_local_account", "medium", f"Nouveau compte local : {account}",
+                            f"account|{account}", name=account)
+            if ev:
+                events.append(ev)
+
+        for key, value, _o in self.diff("defender_exclusions", _defender_exclusions()) or []:
+            ev = self.event("defender_exclusion", "high", f"Nouvelle exclusion Microsoft Defender : {value}",
+                            f"defender|{key}", path=key, value=value)
+            if ev:
+                events.append(ev)
+
+        for line, _v, _o in self.diff("hosts", {l: "1" for l in _hosts_lines()}) or []:
+            ev = self.event("hosts_file_modified", "medium", "Fichier hosts modifié",
+                            f"hosts|{line}", line=line)
+            if ev:
+                events.append(ev)
+        return events
+
+    def scan_software(self) -> list:
+        current = {}
+        for sw in _registry_software():
+            current[(sw.get("product_raw") or sw.get("product") or "").strip()] = sw.get("version") or ""
+        events = []
+        for name, version, old in self.diff("software", current) or []:
+            if old is not None or not name:
+                continue    # simple mise à jour de version : suivie par la page Mises à jour
+            ev = self.event("new_software", "low", f"Nouveau logiciel installé : {name} {version}".strip(),
+                            f"software|{name.lower()}", name=name, version=version)
+            if ev:
+                events.append(ev)
+        return events
+
+    def refresh_watchlist(self, cfg):
+        if time.time() - self.watch_at < 1800:
+            return
+        self.watch_at = time.time()
+        try:
+            r = requests.get(f"{_base_url(cfg)}/api/agents/{_hostname()}/watchlist",
+                             headers={"x-agent-token": cfg.get("main_server", "token", fallback="")},
+                             timeout=15, verify=_tls_verify(cfg))
+            if r.ok:
+                data = r.json() or {}
+                self.server_enabled = bool(data.get("enabled", True))
+                self.watchlist = [p for p in data.get("products") or [] if isinstance(p, dict)]
+        except Exception:
+            pass    # serveur injoignable : on garde la liste précédente
+
+    def flush(self, cfg, events: list):
+        """Envoie les déclencheurs (file conservée si le serveur est injoignable)."""
+        if len(events) > _MONITOR_MAX_EVENTS_PER_CYCLE:
+            extra = len(events) - _MONITOR_MAX_EVENTS_PER_CYCLE
+            events = events[:_MONITOR_MAX_EVENTS_PER_CYCLE] + [self.event(
+                "event_flood", "medium", f"{extra} autre(s) alerte(s) non transmise(s) en une minute",
+                f"flood|{int(time.time() // 3600)}", count=extra) or {}]
+        queue = (self.state["queue"] + [e for e in events if e])[-_MONITOR_QUEUE_MAX:]
+        if not queue:
+            return
+        try:
+            r = requests.post(f"{_base_url(cfg)}/api/agents/{_hostname()}/events", json={"events": queue[:100]},
+                              headers={"x-agent-token": cfg.get("main_server", "token", fallback="")},
+                              timeout=20, verify=_tls_verify(cfg))
+            r.raise_for_status()
+            sent = queue[:100]
+            queue = queue[100:]
+            logger.info(f"Surveillance : {len(sent)} alerte(s) envoyée(s) au serveur.")
+        except Exception as e:
+            logger.warning(f"Surveillance : envoi reporté ({type(e).__name__}), {len(queue)} alerte(s) en file.")
+        if queue != self.state["queue"]:
+            self.state["queue"] = queue
+            self.dirty = True
+
+def _monitor_settings(cfg):
+    def num(key, default, low, high):
+        try:
+            return max(low, min(int(cfg.get("monitoring", key, fallback=str(default))), high))
+        except ValueError:
+            return default
+    return (_cfg_bool(cfg, "monitoring", "enabled", True),
+            num("process_interval_seconds", 30, 10, 600), num("system_interval_minutes", 5, 1, 120))
+
+def monitor_loop():
+    """Boucle de surveillance, en arrière-plan. Un seul processus surveille : le
+    service s'il tourne, sinon l'icône de la session."""
+    _background_thread()
+    time.sleep(20)          # laisse passer le démarrage de la session et le premier rapport
+    mon = _Monitor()
+    next_system = next_software = 0.0
+    while state.running:
+        cfg = state.config or configparser.ConfigParser()
+        enabled, proc_interval, system_minutes = _monitor_settings(cfg)
+        if enabled and (SERVICE_MODE or not _service_running()) and config_exists():
+            mon.refresh_watchlist(cfg)
+            if mon.server_enabled:
+                events = []
+                for name, scan, due in (("processus", mon.scan_processes, True),
+                                        ("système", mon.scan_system, time.time() >= next_system),
+                                        ("logiciels", mon.scan_software, time.time() >= next_software)):
+                    if not due:
+                        continue
+                    try:
+                        events += scan()
+                    except Exception as e:
+                        logger.warning(f"Surveillance ({name}) : {type(e).__name__}: {e}")
+                    if name == "système" and due:
+                        next_system = time.time() + system_minutes * 60
+                    if name == "logiciels" and due:
+                        next_software = time.time() + 15 * 60
+                mon.flush(cfg, [e for e in events if e])
+                for key, ts in list(mon.state["alerted"].items()):
+                    if time.time() - ts > 30 * 86400:
+                        del mon.state["alerted"][key]
+                        mon.dirty = True
+                mon.save()
+        for _ in range(proc_interval):
+            if not state.running:
+                break
+            time.sleep(1)
+
 # ─── Envoi du rapport ────────────────────────────────────────────────────────
 def send_report(max_attempts: int = 6):
     """Envoie le rapport avec retry exponentiel. Si le serveur est indisponible,
@@ -1760,6 +2492,7 @@ def _run_service():
     load_config()
     threading.Thread(target=heartbeat_loop, daemon=True, name="Heartbeat").start()
     threading.Thread(target=update_loop,    daemon=True, name="UpdateCheck").start()
+    threading.Thread(target=monitor_loop,   daemon=True, name="Monitor").start()
     agent_loop()
     ctypes.windll.kernel32.CloseHandle(mutex)
 
@@ -2383,6 +3116,7 @@ def main():
     if args.once or args.no_tray or not TRAY_OK:
         send_report()
         if not args.once:
+            threading.Thread(target=monitor_loop, daemon=True, name="Monitor").start()
             agent_loop()
         return
 
@@ -2390,6 +3124,7 @@ def main():
     threading.Thread(target=agent_loop,     daemon=True, name="AgentLoop").start()
     threading.Thread(target=heartbeat_loop, daemon=True, name="Heartbeat").start()
     threading.Thread(target=update_loop,    daemon=True, name="UpdateCheck").start()
+    threading.Thread(target=monitor_loop,   daemon=True, name="Monitor").start()
 
     # state.tk_root est déjà créé en début de main()
 
