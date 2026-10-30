@@ -1618,24 +1618,12 @@ def _snapshot_task_files(previous: dict) -> tuple:
 
 def _read_task(rel: str) -> dict:
     """Action, compte et déclencheurs d'une tâche planifiée (fichier XML)."""
-    import xml.etree.ElementTree as ET
     path = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "Tasks", rel)
     try:
         with open(path, "rb") as f:
-            root = ET.fromstring(f.read())
-    except (OSError, ET.ParseError):
+            return _parse_task_xml(f.read())
+    except OSError:
         return {}
-    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
-    def text(xpath):
-        el = root.find(xpath, ns)
-        return (el.text or "").strip() if el is not None and el.text else ""
-    triggers = root.find("t:Triggers", ns)
-    return {"command": (text("t:Actions/t:Exec/t:Command") + " " + text("t:Actions/t:Exec/t:Arguments")).strip(),
-            "user": text("t:Principals/t:Principal/t:UserId") or text("t:Principals/t:Principal/t:GroupId"),
-            "run_level": text("t:Principals/t:Principal/t:RunLevel"),
-            "author": text("t:RegistrationInfo/t:Author"),
-            "triggers": ", ".join(t.tag.split("}")[-1] for t in triggers) if triggers is not None else "",
-            "com_handler": text("t:Actions/t:ComHandler/t:ClassId")}
 
 def _local_group_members(sid_string: str) -> list:
     """Membres d'un groupe local identifié par son SID (nom indépendant de la langue)."""
@@ -1702,52 +1690,563 @@ def _defender_exclusions() -> dict:
             out[f"{kind}\\{name}"] = name
     return out
 
+# ── Analyse YARA (fichiers et scripts PowerShell journalisés) ────────────────
+# Règles reçues du serveur. Fichiers ciblés uniquement : exécutable des nouveaux
+# processus, programmes cités par une persistance (tâche, service, démarrage), fichiers
+# nouveaux ou modifiés dans Téléchargements, Temp, Bureau, C:\Users\Public… Budget
+# d'octets par passage et cache taille/date.
+try:
+    import yara as _yara_mod
+except Exception:          # module absent du build ou DLL introuvable
+    _yara_mod = None
+import collections
+YARA_MAX_FILE = 32 << 20
+YARA_BUDGET_PER_CYCLE = 32 << 20
+_YARA_CACHE_MAX = 5000
+_YARA_SEVERITIES = ("low", "medium", "high", "critical")
+_YARA_FILE_EXT = (".exe", ".dll", ".scr", ".com", ".pif", ".cpl", ".sys", ".ps1", ".psm1", ".vbs", ".vbe",
+                  ".js", ".jse", ".wsf", ".hta", ".bat", ".cmd", ".lnk", ".msi", ".jar")
+
+class _YaraEngine:
+    """Règles compilées jeu par jeu (un jeu invalide n'empêche pas les autres)."""
+    def __init__(self):
+        self.compiled, self.version = [], None
+        self.lock = threading.Lock()
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.compiled)
+
+    def load(self, version: str, rulesets: list) -> list:
+        compiled, errors = [], []
+        for i, rs in enumerate(rulesets):
+            name = str(rs.get("name") or f"jeu {i}")
+            try:
+                compiled.append((name, _yara_mod.compile(source=str(rs.get("source") or ""))))
+            except Exception as e:
+                errors.append(f"{name} : {str(e)[:200]}")
+        with self.lock:
+            self.compiled, self.version = compiled, version
+        return errors
+
+    def scan(self, path: str = None, data: bytes = None) -> list:
+        with self.lock:
+            compiled = list(self.compiled)
+        out = []
+        for name, rules in compiled:
+            try:
+                matches = (rules.match(filepath=path, timeout=10, fast=True) if path is not None
+                           else rules.match(data=data, timeout=5, fast=True))
+            except Exception:
+                continue
+            for m in matches:
+                severity = str(m.meta.get("severity") or "high").lower()
+                out.append({"rule": m.rule, "ruleset": name,
+                            "severity": severity if severity in _YARA_SEVERITIES else "high",
+                            "description": str(m.meta.get("description") or "")[:300]})
+        return out
+
+def _yara_skip(path: str) -> bool:
+    """Fichiers de Windows et des applications du Store : non analysés (sauf Temp)."""
+    p = path.lower()
+    sysroot = os.environ.get("SystemRoot", r"C:\Windows").lower().rstrip("\\") + "\\"
+    if p.startswith(sysroot) and not p.startswith(sysroot + "temp\\"):
+        return True
+    return "\\windowsapps\\" in p
+
+def _program_file(command: str) -> str:
+    """Fichier exécuté par une commande de tâche, service ou clé de démarrage."""
+    program = os.path.expandvars(_command_program(command or "").strip())
+    sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+    for prefix, repl in (("\\??\\", ""), ("\\systemroot\\", sysroot + "\\")):
+        if program.lower().startswith(prefix):
+            program = repl + program[len(prefix):]
+    if program.lower().startswith("system32\\"):
+        program = os.path.join(sysroot, program)
+    return program if ntpath.isabs(program) else ""
+
+def _watched_dirs() -> list:
+    """(dossier, profondeur) où un fichier déposé mérite une analyse YARA."""
+    import glob
+    drive = os.environ.get("SystemDrive", "C:") + "\\"
+    dirs = [(os.path.join(drive, "Users", "Public"), 2), (os.environ.get("ProgramData", r"C:\ProgramData"), 0),
+            (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "Temp"), 1), (os.path.join(drive, "PerfLogs"), 2)]
+    for home in glob.glob(os.path.join(drive, "Users", "*")):
+        if os.path.basename(home).lower() in ("public", "default", "default user", "all users"):
+            continue
+        dirs += [(os.path.join(home, "Downloads"), 1), (os.path.join(home, "Desktop"), 0),
+                 (os.path.join(home, "AppData", "Local", "Temp"), 1)]
+    return dirs
+
+def _walk_files(root: str, max_depth: int, extensions=None, limit: int = 3000):
+    count, stack = 0, [(root, 0)]
+    while stack and count < limit:
+        path, depth = stack.pop()
+        try:
+            entries = list(os.scandir(path))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink():
+                    continue
+                if e.is_dir():
+                    if depth < max_depth:
+                        stack.append((e.path, depth + 1))
+                elif e.is_file() and (extensions is None or e.name.lower().endswith(extensions)):
+                    count += 1
+                    yield e.path
+            except OSError:
+                continue
+
+# ── Journaux d'événements en temps réel ──────────────────────────────────────
+# Abonnement EvtSubscribe : Windows signale chaque nouvel événement, le fil dort sinon
+# (aucune consommation entre deux événements). Les signets sont conservés : après un
+# redémarrage, l'agent reprend où il s'était arrêté (événements de moins de 24 h).
+_EVT_QUERIES = {
+    "Security": ["*[System[(EventID=4625 or EventID=1102 or EventID=4720 or EventID=4728 or EventID=4732 "
+                 "or EventID=4756 or EventID=4698 or EventID=4688)]]",
+                 "*[System[(EventID=4624)]] and *[EventData[Data[@Name='LogonType']='10']]"],
+    "System": ["*[System[(EventID=7045 or EventID=104)]]"],
+    "Microsoft-Windows-PowerShell/Operational": ["*[System[(EventID=4104)]]"],
+    "Microsoft-Windows-Windows Defender/Operational": ["*[System[(EventID=1116 or EventID=5001 or EventID=5007)]]"],
+    "Microsoft-Windows-Sysmon/Operational": ["*[System[(EventID=1)]]"],
+}
+_ADMIN_GROUP_SIDS = ("S-1-5-32-544",)                       # Administrateurs locaux
+_DOMAIN_ADMIN_RIDS = ("-512", "-518", "-519")               # Admins du domaine, du schéma, de l'entreprise
+
+def _parse_event_xml(xml: str) -> dict | None:
+    """Événement rendu en XML → {channel, id, record, time, computer, data}."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return None
+    ns = "{http://schemas.microsoft.com/win/2004/08/events/event}"
+    system = root.find(ns + "System")
+    if system is None:
+        return None
+    try:
+        event_id = int(system.findtext(ns + "EventID") or 0)
+    except ValueError:
+        return None
+    created = system.find(ns + "TimeCreated")
+    data = {}
+    for el in root.iter(ns + "Data"):
+        if el.get("Name"):
+            data[el.get("Name")] = (el.text or "").strip()
+    user_data = root.find(ns + "UserData")
+    if user_data is not None:
+        for el in user_data.iter():
+            if len(el) == 0 and el.text and el.text.strip():
+                data[el.tag.split("}")[-1]] = el.text.strip()
+    return {"channel": system.findtext(ns + "Channel") or "", "id": event_id,
+            "record": system.findtext(ns + "EventRecordID") or "",
+            "time": created.get("SystemTime", "") if created is not None else "",
+            "computer": system.findtext(ns + "Computer") or "", "data": data}
+
+def _parse_task_xml(content) -> dict:
+    """Action, compte et déclencheurs d'une définition de tâche planifiée (XML)."""
+    import xml.etree.ElementTree as ET
+    try:
+        # Octets (fichier) : l'encodage est détecté. Texte (événement 4698) : la déclaration
+        # « encoding="UTF-16" » est retirée, Python refusant de l'appliquer à une chaîne.
+        root = ET.fromstring(content if isinstance(content, bytes)
+                             else re.sub(r"^\s*<\?xml[^>]*\?>", "", content))
+    except (ET.ParseError, ValueError):
+        return {}
+    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+    def text(xpath):
+        el = root.find(xpath, ns)
+        return (el.text or "").strip() if el is not None and el.text else ""
+    triggers = root.find("t:Triggers", ns)
+    return {"command": (text("t:Actions/t:Exec/t:Command") + " " + text("t:Actions/t:Exec/t:Arguments")).strip(),
+            "user": text("t:Principals/t:Principal/t:UserId") or text("t:Principals/t:Principal/t:GroupId"),
+            "run_level": text("t:Principals/t:Principal/t:RunLevel"),
+            "author": text("t:RegistrationInfo/t:Author"),
+            "triggers": ", ".join(t.tag.split("}")[-1] for t in triggers) if triggers is not None else "",
+            "com_handler": text("t:Actions/t:ComHandler/t:ClassId")}
+
+class _RateTracker:
+    """Compteurs glissants (tentatives échouées par adresse…)."""
+    def __init__(self):
+        self.hits = {}
+
+    def add(self, key, now, window) -> int:
+        self.hits.setdefault(key, collections.deque()).append(now)
+        return self.count(key, now, window)
+
+    def count(self, key, now, window) -> int:
+        dq = self.hits.get(key)
+        if not dq:
+            return 0
+        while dq and dq[0] < now - window:
+            dq.popleft()
+        if len(self.hits) > 20000:
+            for k in [k for k, v in self.hits.items() if not v][:10000]:
+                del self.hits[k]
+        return len(dq)
+
+def _windows_log_findings(ev: dict, tracker: "_RateTracker", watchlist: list, system_root: str,
+                          now: float) -> list:
+    """Règles appliquées à un événement : [(règle, gravité, titre, clé, détails)]."""
+    out, d, eid, channel = [], ev["data"], ev["id"], ev["channel"]
+    day = time.strftime("%Y-%m-%d", time.localtime(now))
+    def add(rule, severity, title, key, **details):
+        out.append((rule, severity, title, key, {"event_id": eid, "channel": channel, **details}))
+    if channel == "Security" and eid == 4625:
+        ip, user = d.get("IpAddress") or "-", d.get("TargetUserName") or "?"
+        source = ip if ip not in ("-", "", "::1", "127.0.0.1") else f"compte {user}"
+        tracker.add(f"fail15|{source}", now, 900)
+        if tracker.add(f"fail5|{source}", now, 300) >= 10:
+            add("brute_force", "high", f"Attaque par force brute ({source})", f"brute_force|win|{source}|{day}",
+                source_ip=ip, name=user, value=d.get("LogonType"))
+    elif channel == "Security" and eid == 4624:
+        ip, user = d.get("IpAddress") or "-", d.get("TargetUserName") or "?"
+        failures = tracker.count(f"fail15|{ip}", now, 900)
+        if failures >= 5:
+            add("login_after_failures", "critical",
+                f"Connexion bureau à distance réussie pour {user} depuis {ip} après {failures} échecs",
+                f"login_after_failures|{ip}|{user}|{day}", source_ip=ip, name=user)
+    elif (channel == "Security" and eid == 1102) or (channel == "System" and eid == 104):
+        log = "de sécurité" if eid == 1102 else f"« {d.get('Channel') or d.get('channel') or 'système'} »"
+        add("log_cleared", "critical" if eid == 1102 else "high", f"Journal {log} effacé",
+            f"log_cleared|{channel}|{ev['record']}", name=d.get("SubjectUserName"))
+    elif channel == "Security" and eid == 4720:
+        user = d.get("TargetUserName") or "?"
+        add("new_local_account", "medium", f"Compte créé : {user} (par {d.get('SubjectUserName') or '?'})",
+            f"account|{user}", name=user)
+    elif channel == "Security" and eid in (4728, 4732, 4756):
+        sid = d.get("TargetSid") or ""
+        group = d.get("TargetUserName") or sid
+        member = (d.get("MemberName") if d.get("MemberName") not in (None, "", "-") else d.get("MemberSid")) or "?"
+        if sid in _ADMIN_GROUP_SIDS or sid.endswith(_DOMAIN_ADMIN_RIDS):
+            add("admin_group_added", "critical" if sid.endswith(_DOMAIN_ADMIN_RIDS) else "high",
+                f"{member} ajouté au groupe {group}", f"admin|{member}",
+                member=member, name=group, user=d.get("SubjectUserName"))
+    elif channel == "Security" and eid == 4698:
+        name = (d.get("TaskName") or "").lstrip("\\")
+        info = _parse_task_xml(d.get("TaskContent") or "")
+        command = info.get("command") or (f"COM {info['com_handler']}" if info.get("com_handler") else "")
+        severity, reasons = _rate_command(command)
+        if not (name.lower().startswith("microsoft\\") and severity in ("low", "medium")):
+            add("new_scheduled_task", _persistence_severity(command, severity),
+                f"Nouvelle tâche planifiée : {name}", f"task|{name}|{command[:200]}", name=name,
+                command=command[:1000], user=info.get("user") or d.get("SubjectUserName"),
+                triggers=info.get("triggers"), reasons=" ; ".join(reasons))
+    elif channel == "System" and eid == 7045:
+        name, image = d.get("ServiceName") or "?", d.get("ImagePath") or ""
+        severity, reasons = _rate_command(image)
+        if "kernel" in (d.get("ServiceType") or "").lower():
+            reasons.append("pilote noyau")
+        add("new_service", _persistence_severity(image, severity), f"Nouveau service installé : {name}",
+            f"service|{name}|{image[:200]}", name=name, image=image, user=d.get("AccountName"),
+            reasons=" ; ".join(reasons))
+    elif (channel == "Security" and eid == 4688) or (channel.endswith("Sysmon/Operational") and eid == 1):
+        image = d.get("NewProcessName") or d.get("Image") or ""
+        parent_image = d.get("ParentProcessName") or d.get("ParentImage") or ""
+        cmdline = d.get("CommandLine") or ""
+        for rule, severity, title, extra in _process_findings(
+                ntpath.basename(image), image, ntpath.basename(parent_image), parent_image, cmdline,
+                watchlist, system_root):
+            add(rule, severity, title, f"{rule}|{image.lower()}|{cmdline[:200].lower()}",
+                image=image, parent_image=parent_image, command=cmdline[:1000], **extra)
+    elif channel.endswith("PowerShell/Operational") and eid == 4104:
+        text = (d.get("ScriptBlockText") or "").lower()
+        for rx, severity, title in _CMDLINE_RULES:
+            if rx.search(text):
+                import hashlib
+                add("suspicious_script", severity, f"Script PowerShell : {title}",
+                    f"script|{hashlib.sha1(text[:4000].encode()).hexdigest()}",
+                    command=(d.get("ScriptBlockText") or "")[:1000], path=d.get("Path"))
+                break
+    elif channel.endswith("Windows Defender/Operational") and eid == 1116:
+        threat = d.get("Threat Name") or "?"
+        level = (d.get("Severity Name") or "").lower()
+        add("defender_detection", "critical" if level in ("severe", "high", "grave", "élevé") else "high",
+            f"Menace détectée par Defender : {threat}", f"defender|{threat}|{d.get('Path')}",
+            name=threat, path=d.get("Path"), image=d.get("Process Name"), value=d.get("Action Name"))
+    elif channel.endswith("Windows Defender/Operational") and eid == 5001:
+        add("defender_disabled", "high", "Protection en temps réel de Defender désactivée",
+            f"defender_disabled|{day}")
+    elif channel.endswith("Windows Defender/Operational") and eid == 5007:
+        new = d.get("New Value") or ""
+        if "\\exclusions\\" in new.lower():
+            add("defender_exclusion", "high", "Exclusion ajoutée à Microsoft Defender", f"defender|{new[:200]}",
+                value=new)
+    return out
+
+class _EventLogWatcher:
+    """Abonnements aux journaux d'événements (wevtapi), un signal par journal."""
+    def __init__(self, mon: "_Monitor"):
+        import ctypes
+        from ctypes import wintypes
+        self.ctypes, self.wt, self.mon = ctypes, wintypes, mon
+        H = ctypes.c_void_p
+        w = ctypes.WinDLL("wevtapi", use_last_error=True)
+        w.EvtSubscribe.argtypes = [H, wintypes.HANDLE, wintypes.LPCWSTR, wintypes.LPCWSTR, H, ctypes.c_void_p,
+                                   ctypes.c_void_p, wintypes.DWORD]
+        w.EvtSubscribe.restype = H
+        w.EvtNext.argtypes = [H, wintypes.DWORD, ctypes.POINTER(H), wintypes.DWORD, wintypes.DWORD,
+                              ctypes.POINTER(wintypes.DWORD)]
+        w.EvtNext.restype = wintypes.BOOL
+        w.EvtRender.argtypes = [H, H, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD)]
+        w.EvtRender.restype = wintypes.BOOL
+        w.EvtCreateBookmark.argtypes = [wintypes.LPCWSTR]
+        w.EvtCreateBookmark.restype = H
+        w.EvtUpdateBookmark.argtypes = [H, H]
+        w.EvtUpdateBookmark.restype = wintypes.BOOL
+        w.EvtClose.argtypes = [H]
+        w.EvtClose.restype = wintypes.BOOL
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+        k.CreateEventW.restype = wintypes.HANDLE
+        k.ResetEvent.argtypes = [wintypes.HANDLE]
+        k.WaitForMultipleObjects.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE), wintypes.BOOL,
+                                             wintypes.DWORD]
+        k.WaitForMultipleObjects.restype = wintypes.DWORD
+        self.w, self.k = w, k
+        self.subs = []          # [(journal, abonnement, signal, signet)]
+        self.tracker = _RateTracker()
+
+    def render(self, handle, flag: int) -> str:
+        used, count = self.wt.DWORD(0), self.wt.DWORD(0)
+        self.w.EvtRender(None, handle, flag, 0, None, self.ctypes.byref(used), self.ctypes.byref(count))
+        if self.ctypes.get_last_error() != 122 or not used.value:          # ERROR_INSUFFICIENT_BUFFER
+            return ""
+        buf = self.ctypes.create_unicode_buffer(used.value // 2 + 1)
+        if not self.w.EvtRender(None, handle, flag, used.value, buf, self.ctypes.byref(used),
+                                self.ctypes.byref(count)):
+            return ""
+        return buf.value
+
+    def subscribe(self):
+        bookmarks = self.mon.state.setdefault("bookmarks", {})
+        for channel, selects in _EVT_QUERIES.items():
+            query = ('<QueryList><Query Id="0">' + "".join(
+                f'<Select Path="{channel}">{s}</Select>' for s in selects)
+                + "</Query></QueryList>")
+            signal = self.k.CreateEventW(None, True, True, None)
+            saved = bookmarks.get(channel)
+            bookmark = self.w.EvtCreateBookmark(saved) if saved else None
+            sub = None
+            if bookmark:
+                sub = self.w.EvtSubscribe(None, signal, None, query, bookmark, None, None, 3)   # après le signet
+            if not sub:
+                if bookmark:
+                    self.w.EvtClose(bookmark)
+                bookmark = self.w.EvtCreateBookmark(None)
+                sub = self.w.EvtSubscribe(None, signal, None, query, None, None, None, 1)       # événements futurs
+            if sub:
+                self.subs.append((channel, sub, signal, bookmark))
+            else:
+                self.w.EvtClose(bookmark)
+                logger.info(f"Surveillance : journal « {channel} » non suivi (absent ou accès refusé).")
+
+    def drain(self, index: int):
+        channel, sub, signal, bookmark = self.subs[index]
+        handles = (self.ctypes.c_void_p * 32)()
+        got_any = False
+        while True:
+            returned = self.wt.DWORD(0)
+            if not self.w.EvtNext(sub, 32, handles, 0, 0, self.ctypes.byref(returned)):
+                if self.ctypes.get_last_error() == 259:          # ERROR_NO_MORE_ITEMS
+                    self.k.ResetEvent(signal)
+                break
+            for i in range(returned.value):
+                h = handles[i]
+                xml = self.render(h, 1)                          # EvtRenderEventXml
+                self.w.EvtUpdateBookmark(bookmark, h)
+                self.w.EvtClose(h)
+                got_any = True
+                if xml:
+                    self.handle(xml)
+        if got_any:
+            mark = self.render(bookmark, 2)                       # EvtRenderBookmark
+            if mark:
+                with self.mon.lock:
+                    self.mon.state.setdefault("bookmarks", {})[channel] = mark
+                    self.mon.dirty_cache = True
+
+    def handle(self, xml: str):
+        if not (self.mon.server_enabled and _monitor_settings(state.config or configparser.ConfigParser())[0]):
+            return
+        ev = _parse_event_xml(xml)
+        if not ev:
+            return
+        now = time.time()
+        try:
+            created = datetime.strptime(ev["time"][:19], "%Y-%m-%dT%H:%M:%S")
+            if (datetime.utcnow() - created).total_seconds() > 86400:
+                return          # reprise après un long arrêt : on ignore le trop ancien
+        except ValueError:
+            pass
+        for rule, severity, title, key, details in _windows_log_findings(
+                ev, self.tracker, self.mon.watchlist, os.environ.get("SystemRoot", r"C:\Windows"), now):
+            self.mon.add_async(self.mon.event(rule, severity, title, key, **details))
+        if ev["id"] == 4104 and self.mon.yara.ready:
+            text = ev["data"].get("ScriptBlockText") or ""
+            matches = self.mon.yara.scan(data=text.encode("utf-8", "replace")) if text else []
+            if matches:
+                import hashlib
+                worst = max(matches, key=lambda m: _YARA_SEVERITIES.index(m["severity"]))
+                self.mon.add_async(self.mon.event(
+                    "yara_match", worst["severity"], f"Règle YARA {worst['rule']} : script PowerShell exécuté",
+                    f"yara|script|{hashlib.sha1(text[:4000].encode()).hexdigest()}",
+                    rules=", ".join(sorted({m['rule'] for m in matches})), description=worst["description"],
+                    command=text[:1000], path=ev["data"].get("Path"), ruleset=worst["ruleset"]))
+
+    def run(self):
+        self.subscribe()
+        if not self.subs:
+            return
+        n = len(self.subs)
+        signals = (self.wt.HANDLE * n)(*[s[2] for s in self.subs])
+        while state.running:
+            r = self.k.WaitForMultipleObjects(n, signals, False, 2000)
+            try:
+                if r < n:
+                    self.drain(r)
+                elif r == 0x102:                 # délai : rattrape un signal manqué (coût négligeable)
+                    for i in range(n):
+                        self.drain(i)
+            except Exception as e:
+                logger.warning(f"Surveillance (journaux) : {type(e).__name__}: {e}")
+                time.sleep(5)
+
+def event_log_loop(mon: "_Monitor"):
+    _background_thread()
+    try:
+        _EventLogWatcher(mon).run()
+    except Exception as e:
+        logger.warning(f"Surveillance : journaux d'événements indisponibles ({type(e).__name__}: {e})")
+
 # ── Moteur ───────────────────────────────────────────────────────────────────
 class _Monitor:
     def __init__(self):
-        self.state = {"snap": {}, "alerted": {}, "queue": []}
+        self.state = {"snap": {}, "alerted": {}, "queue": [], "yara_cache": {}, "bookmarks": {}}
         self.seen = set()            # (pid, ppid, nom) déjà examinés
         self.first_process_scan = True
         self.watchlist, self.server_enabled, self.watch_at = [], True, 0.0
-        self.dirty = False
+        self.dirty = self.dirty_cache = False
+        self.last_save = 0.0
+        # Les journaux d'événements sont lus par un autre fil : état partagé sous verrou
+        self.lock = threading.RLock()
+        self.pending = []                       # alertes produites hors du passage principal
+        self.wake = threading.Event()           # alerte grave : envoi sans attendre le passage suivant
+        self.yara = _YaraEngine()
+        self.yara_queue = collections.OrderedDict()
         try:
             with open(MONITOR_STATE_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
             if isinstance(loaded, dict):
-                self.state.update({k: loaded[k] for k in ("snap", "alerted", "queue") if k in loaded})
+                self.state.update({k: loaded[k] for k in self.state if k in loaded})
         except (OSError, ValueError):
             pass
 
     def save(self):
-        if not self.dirty:
-            return
-        try:
-            tmp = MONITOR_STATE_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.state, f)
-            os.replace(tmp, MONITOR_STATE_FILE)
-            self.dirty = False
-        except OSError as e:
-            logger.warning(f"Surveillance : état non enregistré ({e})")
+        """Écrit l'état si une alerte ou un instantané a changé ; le cache YARA et les
+        signets des journaux, eux, au plus toutes les 5 min."""
+        with self.lock:
+            if not self.dirty and not (self.dirty_cache and time.time() - self.last_save > 300):
+                return
+            try:
+                tmp = MONITOR_STATE_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self.state, f)
+                os.replace(tmp, MONITOR_STATE_FILE)
+                self.dirty = self.dirty_cache = False
+                self.last_save = time.time()
+            except OSError as e:
+                logger.warning(f"Surveillance : état non enregistré ({e})")
 
     def event(self, rule, severity, title, key, **details):
         """Construit un événement, sauf s'il a déjà été signalé (dédoublonnage)."""
-        now = time.time()
-        last = self.state["alerted"].get(key)
-        if last and now - last < _MONITOR_ALERT_TTL:
-            return None
-        self.state["alerted"][key] = now
-        self.dirty = True
+        with self.lock:
+            now = time.time()
+            last = self.state["alerted"].get(key)
+            if last and now - last < _MONITOR_ALERT_TTL:
+                return None
+            self.state["alerted"][key] = now
+            self.dirty = True
         return {"rule": rule, "severity": severity, "title": title[:200], "key": key[:300],
                 "observed_at": datetime.utcnow().isoformat(timespec="seconds"),
                 "details": {k: v for k, v in details.items() if v not in (None, "")}}
+
+    def add_async(self, ev):
+        """Alerte des journaux : envoyée au prochain passage, ou tout de suite si grave."""
+        if not ev:
+            return
+        with self.lock:
+            self.pending.append(ev)
+        if ev["severity"] in ("high", "critical"):
+            self.wake.set()
+
+    # Analyse YARA
+    def yara_enqueue(self, path: str, reason: str, force: bool = False):
+        if not self.yara.ready or not path or (not force and _yara_skip(path)):
+            return
+        with self.lock:
+            if len(self.yara_queue) < 20000:
+                self.yara_queue.setdefault(path, reason)
+
+    def yara_watch_dirs(self):
+        for root, depth in _watched_dirs():
+            for path in _walk_files(root, depth, _YARA_FILE_EXT):
+                self.yara_enqueue(path, "fichier déposé")
+
+    def yara_drain(self, budget: int) -> list:
+        """Analyse la file dans la limite du budget d'octets ; fichiers inchangés ignorés."""
+        events, spent = [], 0
+        cache = self.state["yara_cache"]
+        while spent < budget:
+            with self.lock:
+                if not self.yara_queue:
+                    break
+                path, reason = self.yara_queue.popitem(last=False)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if not os.path.isfile(path) or not 0 < st.st_size <= YARA_MAX_FILE:
+                continue
+            sig = f"{st.st_size}|{int(st.st_mtime)}"
+            key = path.lower()
+            if cache.get(key) == sig:
+                continue
+            with self.lock:
+                cache.pop(key, None)
+                cache[key] = sig
+                while len(cache) > _YARA_CACHE_MAX:
+                    cache.pop(next(iter(cache)))
+                self.dirty_cache = True
+            spent += st.st_size
+            matches = self.yara.scan(path=path)
+            if not matches:
+                continue
+            worst = max(matches, key=lambda m: _YARA_SEVERITIES.index(m["severity"]))
+            rules = ", ".join(sorted({m["rule"] for m in matches}))
+            try:
+                import hashlib
+                with open(path, "rb") as f:
+                    sha = hashlib.sha256(f.read()).hexdigest()
+            except OSError:
+                sha = ""
+            events.append(self.event("yara_match", worst["severity"],
+                                     f"Règle YARA {worst['rule']} : {ntpath.basename(path)}",
+                                     f"yara|{key}|{rules}|{sig}", path=path, rules=rules,
+                                     description=worst["description"], sha256=sha, reason=reason,
+                                     ruleset=worst["ruleset"]))
+        return [e for e in events if e]
 
     def diff(self, name, current: dict):
         """Éléments nouveaux ou modifiés depuis le dernier instantané (None au premier)."""
         previous = self.state["snap"].get(name)
         if previous != current:
-            self.state["snap"][name] = current
-            self.dirty = True
+            with self.lock:
+                self.state["snap"][name] = current
+                self.dirty = True
         if previous is None:
             return None
         return [(k, v, previous.get(k)) for k, v in current.items() if previous.get(k) != v]
@@ -1765,6 +2264,7 @@ class _Monitor:
             self.seen.add(ident)
             lname = name.lower()
             image, cmdline = _process_details(pid, lname in _CMDLINE_OF_INTEREST)
+            self.yara_enqueue(image, "processus")
             parent = procs.get(ppid)
             parent_name = parent[1] if parent else ""
             parent_image = _process_details(ppid, False)[0] if parent and lname in _SCRIPT_HOSTS else ""
@@ -1790,6 +2290,7 @@ class _Monitor:
             for rel in changed:
                 info = _read_task(rel)
                 command = info.get("command") or (f"COM {info['com_handler']}" if info.get("com_handler") else "")
+                self.yara_enqueue(_program_file(command), "persistance", force=True)
                 severity, reasons = _rate_command(command)
                 if rel.lower().startswith("microsoft\\") and severity in ("low", "medium"):
                     continue    # tâches de Windows recréées par les mises à jour
@@ -1809,6 +2310,7 @@ class _Monitor:
             self.dirty = True
 
         for key, value, old in self.diff("autoruns", _snapshot_autoruns()) or []:
+            self.yara_enqueue(_program_file(value), "persistance", force=True)
             severity, reasons = _rate_command(value)
             if "\\IFEO\\" in key or "\\Winlogon\\" in key:
                 severity = "critical" if "\\IFEO\\" in key else "high"
@@ -1822,6 +2324,7 @@ class _Monitor:
 
         for name, value, old in self.diff("services", _snapshot_services()) or []:
             stype, _, image = value.partition("|")
+            self.yara_enqueue(_program_file(image), "persistance", force=True)
             severity, reasons = _rate_command(image)
             if stype in ("1", "2"):
                 reasons.append("pilote noyau")
@@ -1886,8 +2389,24 @@ class _Monitor:
                 data = r.json() or {}
                 self.server_enabled = bool(data.get("enabled", True))
                 self.watchlist = [p for p in data.get("products") or [] if isinstance(p, dict)]
+                version = data.get("yara_version")
+                if version and version != self.yara.version and _yara_mod is not None:
+                    self.load_yara_rules(cfg, version)
         except Exception:
             pass    # serveur injoignable : on garde la liste précédente
+
+    def load_yara_rules(self, cfg, version: str):
+        r = requests.get(f"{_base_url(cfg)}/api/agents/{_hostname()}/yara-rules",
+                         headers={"x-agent-token": cfg.get("main_server", "token", fallback="")},
+                         timeout=30, verify=_tls_verify(cfg))
+        r.raise_for_status()
+        data = r.json() or {}
+        for error in self.yara.load(data.get("version") or version, data.get("rulesets") or []):
+            logger.warning(f"Surveillance : jeu de règles YARA ignoré — {error}")
+        with self.lock:
+            self.state["yara_cache"] = {}       # nouvelles règles : les fichiers seront réanalysés
+            self.dirty_cache = True
+        logger.info(f"Surveillance : règles YARA chargées ({len(self.yara.compiled)} jeu(x)).")
 
     def flush(self, cfg, events: list):
         """Envoie les déclencheurs (file conservée si le serveur est injoignable)."""
@@ -1896,7 +2415,9 @@ class _Monitor:
             events = events[:_MONITOR_MAX_EVENTS_PER_CYCLE] + [self.event(
                 "event_flood", "medium", f"{extra} autre(s) alerte(s) non transmise(s) en une minute",
                 f"flood|{int(time.time() // 3600)}", count=extra) or {}]
-        queue = (self.state["queue"] + [e for e in events if e])[-_MONITOR_QUEUE_MAX:]
+        with self.lock:
+            events, self.pending = list(self.pending) + events, []
+            queue = (self.state["queue"] + [e for e in events if e])[-_MONITOR_QUEUE_MAX:]
         if not queue:
             return
         try:
@@ -1909,9 +2430,10 @@ class _Monitor:
             logger.info(f"Surveillance : {len(sent)} alerte(s) envoyée(s) au serveur.")
         except Exception as e:
             logger.warning(f"Surveillance : envoi reporté ({type(e).__name__}), {len(queue)} alerte(s) en file.")
-        if queue != self.state["queue"]:
-            self.state["queue"] = queue
-            self.dirty = True
+        with self.lock:
+            if queue != self.state["queue"]:
+                self.state["queue"] = queue
+                self.dirty = True
 
 def _monitor_settings(cfg):
     def num(key, default, low, high):
@@ -1928,17 +2450,24 @@ def monitor_loop():
     _background_thread()
     time.sleep(20)          # laisse passer le démarrage de la session et le premier rapport
     mon = _Monitor()
+    log_thread = None
     next_system = next_software = 0.0
     while state.running:
         cfg = state.config or configparser.ConfigParser()
         enabled, proc_interval, system_minutes = _monitor_settings(cfg)
         if enabled and (SERVICE_MODE or not _service_running()) and config_exists():
             mon.refresh_watchlist(cfg)
+            if log_thread is None:
+                log_thread = threading.Thread(target=event_log_loop, args=(mon,), daemon=True, name="EventLog")
+                log_thread.start()
             if mon.server_enabled:
                 events = []
+                if time.time() >= next_system:
+                    mon.yara_watch_dirs()
                 for name, scan, due in (("processus", mon.scan_processes, True),
                                         ("système", mon.scan_system, time.time() >= next_system),
-                                        ("logiciels", mon.scan_software, time.time() >= next_software)):
+                                        ("logiciels", mon.scan_software, time.time() >= next_software),
+                                        ("YARA", lambda: mon.yara_drain(YARA_BUDGET_PER_CYCLE), True)):
                     if not due:
                         continue
                     try:
@@ -1950,15 +2479,14 @@ def monitor_loop():
                     if name == "logiciels" and due:
                         next_software = time.time() + 15 * 60
                 mon.flush(cfg, [e for e in events if e])
-                for key, ts in list(mon.state["alerted"].items()):
-                    if time.time() - ts > 30 * 86400:
-                        del mon.state["alerted"][key]
-                        mon.dirty = True
+                with mon.lock:
+                    for key, ts in list(mon.state["alerted"].items()):
+                        if time.time() - ts > 30 * 86400:
+                            del mon.state["alerted"][key]
+                            mon.dirty = True
                 mon.save()
-        for _ in range(proc_interval):
-            if not state.running:
-                break
-            time.sleep(1)
+        mon.wake.wait(proc_interval)      # réveillé tout de suite par une alerte grave des journaux
+        mon.wake.clear()
 
 # ─── Envoi du rapport ────────────────────────────────────────────────────────
 def send_report(max_attempts: int = 6):

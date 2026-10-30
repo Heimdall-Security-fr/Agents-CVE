@@ -2042,6 +2042,10 @@ def download_agent(target_os):
         python3 -m pip install --upgrade --quiet requests || \\
             pip3 install --upgrade --quiet requests || \\
             echo "⚠  Impossible d'installer 'requests' automatiquement — installez-le manuellement."
+        # Analyse YARA de la surveillance (facultative : sans elle, l'agent utilise la
+        # commande « yara » si elle est installée, sinon s'en passe)
+        python3 -m pip install --upgrade --quiet --only-binary=:all: yara-python >/dev/null 2>&1 || \\
+            echo "ℹ  yara-python non installé : analyse YARA via la commande « yara » si présente."
 
         mkdir -p "$INSTALL_DIR"
 
@@ -3707,6 +3711,7 @@ def agent_watchlist(hostname):
         "vulnerabilities.cves.epss_score": 1, "vulnerabilities.cves.date_published": 1}) or {}
     return jsonify({"enabled": enabled,
                     "products": _hot_products(agent.get("vulnerabilities"), datetime.utcnow()) if enabled else [],
+                    "yara_version": _yara_bundle()["version"] if enabled else "disabled",
                     "generated_at": datetime.utcnow().isoformat()})
 
 @app.route('/api/agents/<hostname>/events', methods=['POST'])
@@ -3801,6 +3806,132 @@ def ack_security_events():
         "status": status, "acked_by": request.dashboard_user.get("email", ""),
         "acked_at": datetime.utcnow()}})
     return jsonify({"updated": res.modified_count}), 200
+
+# ── Règles YARA ──────────────────────────────────────────────────────────────
+# Le jeu par défaut (server/yara/heimdall_default.yar) et les jeux ajoutés depuis le
+# dashboard sont distribués aux agents. Les binaires des agents ne contiennent donc
+# aucune signature. Chaque jeu est compilé séparément par l'agent : un jeu invalide
+# n'empêche pas les autres de fonctionner.
+try:
+    import yara as _yara
+    _HAS_YARA = True
+except ImportError:
+    _yara = None
+    _HAS_YARA = False
+
+YARA_DEFAULT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yara", "heimdall_default.yar")
+YARA_MAX_SOURCE = 2 * 1024 * 1024        # par jeu
+_YARA_RULE_NAME_RE = re.compile(r"^\s*(?:(?:private|global)\s+)*rule\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)
+
+def _yara_default_source() -> str:
+    try:
+        with open(YARA_DEFAULT_PATH, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+def _yara_check(source: str):
+    """(nombre de règles, erreur ou None). Compile réellement si yara-python est installé."""
+    if not source.strip():
+        return 0, "Jeu de règles vide"
+    if len(source.encode()) > YARA_MAX_SOURCE:
+        return 0, "Jeu de règles trop volumineux (2 Mo maximum)"
+    names = _YARA_RULE_NAME_RE.findall(source)
+    if not names:
+        return 0, "Aucune règle trouvée (mot-clé « rule »)"
+    if _HAS_YARA:
+        try:
+            _yara.compile(source=source)
+        except _yara.Error as e:
+            return 0, f"Règles invalides : {e}"[:500]
+    return len(names), None
+
+def _yara_rulesets(include_source: bool = True) -> list:
+    """Jeu par défaut + jeux du dashboard, dans l'ordre d'affichage."""
+    builtin = mongo.db.settings.find_one({"_id": "yara_builtin"}) or {}
+    default_source = _yara_default_source()
+    out = [{"id": "builtin", "name": "Heimdall (par défaut)", "builtin": True,
+            "enabled": bool(builtin.get("enabled", True)),
+            "rule_count": len(_YARA_RULE_NAME_RE.findall(default_source)),
+            **({"source": default_source} if include_source else {})}]
+    for doc in mongo.db.yara_rulesets.find({}).sort("name", 1):
+        out.append({"id": doc["_id"], "name": doc.get("name"), "builtin": False,
+                    "enabled": bool(doc.get("enabled", True)), "rule_count": doc.get("rule_count", 0),
+                    "updated_at": doc.get("updated_at"), "updated_by": doc.get("updated_by"),
+                    **({"source": doc.get("source", "")} if include_source else {})})
+    return out
+
+def _yara_bundle() -> dict:
+    """Jeux actifs envoyés aux agents + version (empreinte) pour ne les retélécharger
+    qu'en cas de changement."""
+    active = [{"name": r["name"], "source": r["source"]} for r in _yara_rulesets() if r["enabled"]]
+    digest = hashlib.sha256(json.dumps(active, sort_keys=True).encode()).hexdigest()[:16]
+    return {"version": digest, "rulesets": active}
+
+@app.route('/api/agents/<hostname>/yara-rules', methods=['GET'])
+@require_agent_token
+def agent_yara_rules(hostname):
+    if not _monitoring_enabled():
+        return jsonify({"version": "disabled", "rulesets": []})
+    return jsonify(_yara_bundle())
+
+@app.route('/api/yara-rules', methods=['GET'])
+@require_role(*_SECURITY_EVENT_ROLES)
+def list_yara_rules():
+    return jsonify(_clean({"rulesets": _yara_rulesets(), "validation": _HAS_YARA,
+                           "version": _yara_bundle()["version"]})), 200
+
+@app.route('/api/yara-rules', methods=['POST'])
+@require_role("admin")
+def create_yara_rules():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name") or "").strip()[:80]
+    source = str(data.get("source") or "")
+    if not name:
+        return jsonify({"error": "Nom requis"}), 400
+    count, error = _yara_check(source)
+    if error:
+        return jsonify({"error": error}), 400
+    doc = {"_id": str(uuid.uuid4()), "name": name, "source": source, "enabled": True, "rule_count": count,
+           "updated_at": datetime.utcnow(), "updated_by": request.dashboard_user.get("email", "")}
+    mongo.db.yara_rulesets.insert_one(doc)
+    return jsonify({"id": doc["_id"], "rule_count": count}), 201
+
+@app.route('/api/yara-rules/<ruleset_id>', methods=['PUT'])
+@require_role("admin")
+def update_yara_rules(ruleset_id):
+    data = request.get_json(silent=True) or {}
+    if ruleset_id == "builtin":
+        if "enabled" not in data:
+            return jsonify({"error": "Le jeu par défaut ne peut qu'être activé ou désactivé"}), 400
+        mongo.db.settings.update_one({"_id": "yara_builtin"}, {"$set": {"enabled": bool(data["enabled"])}},
+                                     upsert=True)
+        return jsonify({"status": "ok"}), 200
+    patch = {"updated_at": datetime.utcnow(), "updated_by": request.dashboard_user.get("email", "")}
+    if "name" in data:
+        name = str(data.get("name") or "").strip()[:80]
+        if not name:
+            return jsonify({"error": "Nom requis"}), 400
+        patch["name"] = name
+    if "source" in data:
+        count, error = _yara_check(str(data.get("source") or ""))
+        if error:
+            return jsonify({"error": error}), 400
+        patch.update(source=str(data["source"]), rule_count=count)
+    if "enabled" in data:
+        patch["enabled"] = bool(data["enabled"])
+    res = mongo.db.yara_rulesets.update_one({"_id": ruleset_id}, {"$set": patch})
+    if res.matched_count == 0:
+        return jsonify({"error": "Jeu de règles introuvable"}), 404
+    return jsonify({"status": "ok"}), 200
+
+@app.route('/api/yara-rules/<ruleset_id>', methods=['DELETE'])
+@require_role("admin")
+def delete_yara_rules(ruleset_id):
+    if ruleset_id == "builtin":
+        return jsonify({"error": "Le jeu par défaut ne peut pas être supprimé (désactivez-le)"}), 400
+    mongo.db.yara_rulesets.delete_one({"_id": ruleset_id})
+    return jsonify({"status": "ok"}), 200
 
 @app.route('/api/settings/monitoring', methods=['PUT'])
 @require_role("admin")

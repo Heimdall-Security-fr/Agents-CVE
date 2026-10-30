@@ -18,6 +18,13 @@ RUN V="$AGENT_VERSION"; \
 
 RUN pip install --quiet "requests" "pillow" "pystray>=0.19.5" "pyinstaller>=5.13"
 
+# Analyse YARA de la surveillance (facultative) : 4.5.1 est la dernière version publiée en
+# paquet Windows précompilé pour le Python 3.7 de cette image. Un échec n'arrête pas le
+# build : l'agent fonctionne alors sans YARA (le reste de la surveillance est inchangé).
+RUN (pip install --quiet --only-binary=:all: "yara-python==4.5.1" \
+     && wine python -c "import yara; print('yara', yara.__version__)") \
+    || echo "AVERTISSEMENT : yara-python indisponible, agent Windows sans analyse YARA"
+
 # Vérifie que les dépendances clés sont bien importables sous Wine/Python Windows
 RUN wine python -c "import pystray, PIL, PIL.Image, PIL.ImageDraw, requests; print('deps OK')"
 
@@ -35,6 +42,7 @@ RUN pyinstaller \
     --hidden-import PIL.ImageDraw \
     --hidden-import tkinter \
     --hidden-import tkinter.messagebox \
+    --hidden-import yara \
     --collect-all pystray \
     --collect-all PIL \
     --add-data "heimdall-logo.png;." \

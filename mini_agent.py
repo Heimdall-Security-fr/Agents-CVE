@@ -1031,6 +1031,7 @@ def collect_outdated_software(software_list, config=None) -> dict:
 # existant sert de référence : rien n'est signalé, sauf un processus déjà lancé qui
 # déclenche une règle moyenne ou plus.
 import json as _json_mon
+import collections
 MONITOR_STATE_FILE = os.path.join(os.path.dirname(LOG_FILE), "monitor-state.json")
 _MONITOR_ALERT_TTL = 7 * 86400
 _MONITOR_FS_ROOT = ""        # préfixe des fichiers système lus (vide en production ; arborescence factice en test)
@@ -1252,47 +1253,477 @@ def _package_names(cache: dict) -> dict | None:
             return None
     return None
 
+# ── Analyse YARA (fichiers) ──────────────────────────────────────────────────
+# Règles reçues du serveur. N'analyse que des fichiers ciblés : exécutable des nouveaux
+# processus, programmes référencés par une persistance (cron, systemd), fichiers nouveaux
+# ou modifiés dans /tmp, /var/tmp, /dev/shm et les racines web. Budget d'octets par
+# passage et cache taille/date : un fichier n'est relu que s'il a changé.
+try:
+    import yara as _yara_mod
+except Exception:          # module absent ou bibliothèque native introuvable
+    _yara_mod = None
+YARA_MAX_FILE = 32 << 20                  # fichiers plus gros ignorés
+YARA_BUDGET_PER_CYCLE = 32 << 20          # octets analysés au plus par passage (~1 Mo/s)
+_YARA_CACHE_MAX = 5000
+_YARA_SKIP_PREFIXES = ("/usr/", "/lib/", "/lib64/", "/lib32/", "/bin/", "/sbin/", "/snap/", "/proc/sys",
+                       "/sys/", "/boot/", "/opt/heimdall-agent/")
+_YARA_TMP_DIRS = ("/tmp", "/var/tmp", "/dev/shm")
+_YARA_WEB_ROOTS = ("/var/www", "/srv/www", "/srv/http", "/usr/share/nginx/html")
+_YARA_WEB_EXT = (".php", ".phtml", ".php5", ".php7", ".phar", ".inc", ".jsp", ".jspx", ".asp", ".aspx",
+                 ".ashx", ".cgi", ".pl", ".py", ".sh")
+_YARA_SEVERITIES = ("low", "medium", "high", "critical")
+
+class _YaraEngine:
+    """Règles compilées jeu par jeu (un jeu invalide n'empêche pas les autres) ; à défaut
+    du module Python, la commande « yara » est utilisée si elle est installée."""
+    def __init__(self, state_dir: str):
+        self.compiled, self.cli_files, self.version = [], [], None
+        self.state_dir = state_dir
+        self.lock = threading.Lock()
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.compiled or self.cli_files)
+
+    def load(self, version: str, rulesets: list) -> list:
+        compiled, cli_files, errors = [], [], []
+        cli = shutil.which("yara") if _yara_mod is None else None
+        for i, rs in enumerate(rulesets):
+            name, source = str(rs.get("name") or f"jeu {i}"), str(rs.get("source") or "")
+            try:
+                if _yara_mod is not None:
+                    compiled.append((name, _yara_mod.compile(source=source)))
+                elif cli:
+                    path = os.path.join(self.state_dir, f"yara-rules-{i}.yar")
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(source)
+                    cli_files.append((name, path))
+            except Exception as e:
+                errors.append(f"{name} : {str(e)[:200]}")
+        with self.lock:
+            self.compiled, self.cli_files, self.version = compiled, cli_files, version
+        return errors
+
+    def scan(self, path: str = None, data: bytes = None) -> list:
+        """[{rule, ruleset, severity, description}] des règles qui correspondent."""
+        out = []
+        with self.lock:
+            compiled, cli_files = list(self.compiled), list(self.cli_files)
+        for name, rules in compiled:
+            try:
+                matches = (rules.match(filepath=path, timeout=10, fast=True) if path is not None
+                           else rules.match(data=data, timeout=5, fast=True))
+            except Exception:
+                continue        # fichier illisible ou délai dépassé : on passe
+            for m in matches:
+                out.append(_yara_finding(m.rule, name, m.meta))
+        if path is not None:
+            for name, rules_file in cli_files:
+                try:
+                    r = subprocess.run(["yara", "-m", "-f", rules_file, path], capture_output=True,
+                                       text=True, timeout=30, preexec_fn=lambda: os.nice(19))
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
+                for line in r.stdout.splitlines():
+                    m = re.match(r"(\S+)\s+\[(.*)\]\s", line)
+                    if m:
+                        meta = dict(re.findall(r'(\w+)="((?:[^"\\]|\\.)*)"', m.group(2)))
+                        out.append(_yara_finding(m.group(1), name, meta))
+        return out
+
+def _yara_finding(rule, ruleset, meta) -> dict:
+    severity = str((meta or {}).get("severity") or "high").lower()
+    return {"rule": str(rule), "ruleset": ruleset,
+            "severity": severity if severity in _YARA_SEVERITIES else "high",
+            "description": str((meta or {}).get("description") or "")[:300]}
+
+def _walk_files(root: str, max_depth: int, extensions=None, limit: int = 20000):
+    """Fichiers d'une arborescence (profondeur et nombre bornés, liens ignorés)."""
+    count, stack = 0, [(root, 0)]
+    while stack and count < limit:
+        path, depth = stack.pop()
+        try:
+            entries = list(os.scandir(path))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink():
+                    continue
+                if e.is_dir():
+                    if depth < max_depth:
+                        stack.append((e.path, depth + 1))
+                elif e.is_file() and (extensions is None or e.name.lower().endswith(extensions)):
+                    count += 1
+                    yield e.path
+            except OSError:
+                continue
+
+def _paths_in_command(command: str) -> list:
+    """Fichiers absolus cités dans une commande (cron, ExecStart…)."""
+    return [p for p in re.findall(r"(/[\w.+@%-]+(?:/[\w.+@%-]+)+)", command or "")
+            if not p.startswith(("/dev/", "/proc/"))][:5]
+
+# ── Journaux en temps réel ───────────────────────────────────────────────────
+_AUTH_LOGS = ("/var/log/auth.log", "/var/log/secure")
+_WEB_LOGS = ("/var/log/nginx/access.log", "/var/log/apache2/access.log", "/var/log/httpd/access_log")
+_AUDIT_LOG = "/var/log/audit/audit.log"
+_LOG_POLL_SECONDS = 2
+_ADMIN_GROUPS = ("sudo", "wheel", "admin", "root")
+
+class _RateTracker:
+    """Compteurs glissants (tentatives échouées par adresse…)."""
+    def __init__(self):
+        self.hits = {}
+
+    def add(self, key, now, window) -> int:
+        dq = self.hits.setdefault(key, collections.deque())
+        dq.append(now)
+        return self.count(key, now, window)
+
+    def count(self, key, now, window) -> int:
+        dq = self.hits.get(key)
+        if not dq:
+            return 0
+        while dq and dq[0] < now - window:
+            dq.popleft()
+        if len(self.hits) > 20000:          # borne la mémoire face à un balayage massif
+            for k in [k for k, v in self.hits.items() if not v][:10000]:
+                del self.hits[k]
+        return len(dq)
+
+class _LogTail:
+    """Lit les lignes ajoutées à un fichier journal (rotation et troncature gérées).
+    Premier suivi : on part de la fin, sans relire l'historique."""
+    def __init__(self, path: str, saved: dict | None):
+        self.path, self.inode, self.offset, self.partial = path, None, 0, b""
+        if saved:
+            self.inode, self.offset = saved.get("inode"), int(saved.get("offset") or 0)
+
+    def state(self) -> dict:
+        return {"inode": self.inode, "offset": self.offset}
+
+    def read_lines(self, limit: int = 1 << 20) -> list:
+        try:
+            st = os.stat(_fs(self.path))
+        except OSError:
+            return []
+        if self.inode is None:
+            self.inode, self.offset = st.st_ino, st.st_size          # pas d'historique
+        elif st.st_ino != self.inode or st.st_size < self.offset:
+            self.inode, self.offset, self.partial = st.st_ino, 0, b""  # rotation ou troncature
+        elif st.st_size - self.offset > 5 * limit:
+            self.offset = st.st_size - limit                          # retard important : on saute
+        if st.st_size == self.offset:
+            return []
+        try:
+            with open(_fs(self.path), "rb") as f:
+                f.seek(self.offset)
+                chunk = f.read(limit)
+        except OSError:
+            return []
+        self.offset += len(chunk)
+        data = self.partial + chunk
+        lines = data.split(b"\n")
+        self.partial = lines.pop()          # ligne incomplète : attendue au prochain passage
+        return [l.decode("utf-8", "replace") for l in lines if l]
+
+_SSH_FAIL_RE = re.compile(r"sshd\[\d+\]: (?:Failed (?:password|publickey|keyboard-interactive/pam) for "
+                          r"(?:invalid user )?(\S+)|Invalid user (\S*)) from ([0-9a-fA-F.:]+)")
+_SSH_OK_RE = re.compile(r"sshd\[\d+\]: Accepted (\S+) for (\S+) from ([0-9a-fA-F.:]+)")
+_SUDO_RE = re.compile(r"sudo(?:\[\d+\])?:\s+(\S+) : (.*)")
+_USERADD_RE = re.compile(r"useradd\[\d+\]: new user: name=([^,\s]+)")
+_GROUP_ADD_RE = re.compile(r"(?:usermod|gpasswd)\[\d+\]: (?:add '([^']+)' to (?:shadow )?group '([^']+)'|"
+                           r"user (\S+) added by \S+ to group (\S+))")
+_WEB_LINE_RE = re.compile(r'^(\S+) \S+ \S+ \[[^\]]*\] "(\S+) (\S+)[^"]*" (\d{3}) \S+(?: "[^"]*" "([^"]*)")?')
+_WEB_RULES = [
+    (re.compile(r"\$\{(jndi|\$\{(lower|upper|env|::-)|::-j)"), "high", "Tentative d'exploitation Log4Shell"),
+    (re.compile(r"\.(php\d?|phtml|jsp|aspx?)\?(cmd|exec|command|c|execute|shell)=[^&]+"), "high",
+     "Accès à un webshell probable"),
+    (re.compile(r"(\.\./){3,}|/etc/passwd|/proc/self/environ|win\.ini"), "medium", "Tentative de traversée de répertoires"),
+    (re.compile(r"union(\s|\+|%20)+(all(\s|\+|%20)+)?select|information_schema|sleep\(\d+\)|benchmark\(\d+"),
+     "medium", "Tentative d'injection SQL"),
+]
+_WEB_SCANNERS = re.compile(r"sqlmap|nikto|nuclei|wpscan|acunetix|nessus|openvas|dirbuster|gobuster|ffuf|masscan|zgrab")
+_AUDIT_ARG_RE = re.compile(r' a\d+=(?:"([^"]*)"|([0-9A-Fa-f]+))')
+
+def _linux_log_findings(source: str, line: str, tracker: "_RateTracker", now: float) -> list:
+    """Règles appliquées à une ligne de journal : [(règle, gravité, titre, clé, détails)]."""
+    out = []
+    day = time.strftime("%Y-%m-%d", time.localtime(now))
+    if source == "auth":
+        m = _SSH_FAIL_RE.search(line)
+        if m:
+            user, ip = m.group(1) or m.group(2) or "?", m.group(3)
+            tracker.add(f"ssh15|{ip}", now, 900)
+            if tracker.add(f"ssh5|{ip}", now, 300) >= 10:
+                out.append(("brute_force", "high", f"Attaque par force brute SSH depuis {ip}",
+                            f"brute_force|ssh|{ip}|{day}", {"source_ip": ip, "name": user, "line": line}))
+            return out
+        m = _SSH_OK_RE.search(line)
+        if m:
+            method, user, ip = m.groups()
+            failures = tracker.count(f"ssh15|{ip}", now, 900)
+            if failures >= 5:
+                out.append(("login_after_failures", "critical",
+                            f"Connexion SSH réussie pour {user} depuis {ip} après {failures} échecs",
+                            f"login_after_failures|{ip}|{user}|{day}", {"source_ip": ip, "name": user, "line": line}))
+            elif user == "root" and method == "password":
+                out.append(("root_password_login", "medium", f"Connexion SSH de root par mot de passe depuis {ip}",
+                            f"root_login|{ip}|{day}", {"source_ip": ip, "line": line}))
+            return out
+        m = _SUDO_RE.search(line)
+        if m:
+            user, rest = m.groups()
+            if "user NOT in sudoers" in rest:
+                out.append(("sudo_denied", "medium", f"sudo refusé : {user} n'est pas autorisé",
+                            f"sudo_denied|{user}|{day}", {"name": user, "line": line}))
+            elif "COMMAND=" in rest:
+                command = rest.split("COMMAND=", 1)[1]
+                severity, reasons = _rate_linux_command(command)
+                if severity in ("high", "critical"):
+                    out.append(("suspicious_command", severity, f"Commande suspecte lancée par sudo ({user})",
+                                f"suspicious_command|{command[:200]}", {"name": user, "command": command,
+                                                                        "reasons": " ; ".join(reasons)}))
+            return out
+        m = _USERADD_RE.search(line)
+        if m:
+            out.append(("new_local_account", "medium", f"Nouveau compte local : {m.group(1)}",
+                        f"account|{m.group(1)}", {"name": m.group(1), "line": line}))
+            return out
+        m = _GROUP_ADD_RE.search(line)
+        if m:
+            user, group = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+            if group in _ADMIN_GROUPS:
+                out.append(("admin_group_added", "high", f"{user} ajouté au groupe {group}",
+                            f"admin|{group}|{user}", {"member": user, "name": group, "line": line}))
+    elif source == "web":
+        m = _WEB_LINE_RE.match(line)
+        if not m:
+            return out
+        ip, method, url, status, agent = m.groups()
+        try:
+            from urllib.parse import unquote_plus
+            target = unquote_plus(unquote_plus(url)).lower()
+        except Exception:
+            target = url.lower()
+        for rx, severity, title in _WEB_RULES:
+            if rx.search(target):
+                if title.startswith("Accès à un webshell") and not status.startswith("2"):
+                    continue        # le fichier n'existe pas : simple tentative
+                out.append(("web_attack", severity, f"{title} depuis {ip}", f"web|{title}|{ip}|{day}",
+                            {"source_ip": ip, "path": url[:500], "status": status, "command": (agent or "")[:300]}))
+                return out
+        if agent and _WEB_SCANNERS.search(agent.lower()):
+            out.append(("web_scan", "low", f"Scanner de vulnérabilités web depuis {ip}", f"webscan|{ip}|{day}",
+                        {"source_ip": ip, "path": url[:500], "command": agent[:300]}))
+    elif source == "audit" and "type=EXECVE" in line:
+        args = []
+        for quoted, hexa in _AUDIT_ARG_RE.findall(line):
+            if quoted:
+                args.append(quoted)
+            else:
+                try:
+                    args.append(bytes.fromhex(hexa).decode("utf-8", "replace"))
+                except ValueError:
+                    args.append(hexa)
+        command = " ".join(args)
+        for rx, severity, title in _LINUX_CMD_RULES:
+            if rx.search(command.lower()):
+                out.append(("suspicious_command", severity, title, f"suspicious_command|{command[:200]}",
+                            {"command": command[:1000], "line": "auditd"}))
+                break
+    return out
+
+def _log_sources() -> list:
+    """(source, chemin) des journaux présents sur la machine."""
+    out = [("auth", p) for p in _AUTH_LOGS if os.path.isfile(_fs(p))]
+    out += [("web", p) for p in _WEB_LOGS if os.path.isfile(_fs(p))]
+    if os.path.isfile(_fs(_AUDIT_LOG)):
+        out.append(("audit", _AUDIT_LOG))
+    return out
+
+def _journal_reader(lines: "collections.deque", stop: "threading.Event"):
+    """Sans auth.log/secure (distributions récentes sans rsyslog) : suivi de journald,
+    messages d'authentification uniquement, en priorité minimale."""
+    try:
+        proc = subprocess.Popen(["journalctl", "-f", "-n", "0", "-o", "short", "SYSLOG_FACILITY=4",
+                                 "SYSLOG_FACILITY=10"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, errors="replace", preexec_fn=lambda: os.nice(19))
+    except OSError:
+        return
+    try:
+        for line in proc.stdout:
+            if stop.is_set():
+                break
+            if len(lines) < 10000:
+                lines.append(line.rstrip("\n"))
+    finally:
+        proc.kill()
+
+def log_watch_loop(mon: "_Monitor"):
+    """Suivi des journaux en temps réel (lecture des nouvelles lignes toutes les 2 s)."""
+    try:
+        os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 19)
+    except (AttributeError, OSError):
+        pass
+    tracker, tails, journal, stop = _RateTracker(), {}, collections.deque(), threading.Event()
+    journal_started, refresh_at = False, 0.0
+    saved = mon.state.setdefault("log_offsets", {})
+    while True:
+        now = time.time()
+        if now >= refresh_at:       # journaux apparus ou disparus (installation de nginx…)
+            refresh_at = now + 300
+            sources = _log_sources()
+            for source, path in sources:
+                tails.setdefault(path, (source, _LogTail(path, saved.get(path))))
+            if not any(s == "auth" for s, _ in sources) and not journal_started and not _MONITOR_FS_ROOT \
+                    and shutil.which("journalctl"):
+                journal_started = True
+                threading.Thread(target=_journal_reader, args=(journal, stop), daemon=True,
+                                 name="Journald").start()
+        batches = [(source, tail.read_lines()) for source, tail in tails.values()]
+        if journal:
+            batches.append(("auth", [journal.popleft() for _ in range(len(journal))]))
+        if not (mon.server_enabled and _monitor_settings(mon.config)[0]):
+            batches = []        # surveillance suspendue : on avance dans les fichiers sans alerter
+        for source, lines in batches:
+            for line in lines:
+                for rule, severity, title, key, details in _linux_log_findings(source, line, tracker, now):
+                    mon.add_async(mon.event(rule, severity, title, key, **details))
+        with mon.lock:
+            for path, (_s, tail) in tails.items():
+                if saved.get(path) != tail.state():
+                    saved[path] = tail.state()
+                    mon.dirty_cache = True
+        time.sleep(_LOG_POLL_SECONDS)
+
 # ── Moteur ───────────────────────────────────────────────────────────────────
 class _Monitor:
     def __init__(self, config):
         self.config = config
-        self.state = {"snap": {}, "alerted": {}, "queue": []}
+        self.state = {"snap": {}, "alerted": {}, "queue": [], "yara_cache": {}, "log_offsets": {}}
         self.seen = set()
         self.first_process_scan = True
         self.watchlist, self.server_enabled, self.watch_at = [], True, 0.0
         self.pkg_cache = {}
-        self.dirty = False
+        self.dirty = self.dirty_cache = False
+        self.last_save = 0.0
+        # Les journaux sont lus par un autre fil : accès à l'état sous verrou
+        self.lock = threading.RLock()
+        self.pending = []                       # alertes produites hors du passage principal
+        self.wake = threading.Event()           # alerte grave : envoi sans attendre le passage suivant
+        self.yara = _YaraEngine(os.path.dirname(MONITOR_STATE_FILE))
+        self.yara_queue = collections.OrderedDict()
         try:
             with open(MONITOR_STATE_FILE, "r", encoding="utf-8") as f:
                 loaded = _json_mon.load(f)
             if isinstance(loaded, dict):
-                self.state.update({k: loaded[k] for k in ("snap", "alerted", "queue") if k in loaded})
+                self.state.update({k: loaded[k] for k in self.state if k in loaded})
         except (OSError, ValueError):
             pass
 
     def save(self):
-        if not self.dirty:
-            return
-        try:
-            tmp = MONITOR_STATE_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                _json_mon.dump(self.state, f)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, MONITOR_STATE_FILE)
-            self.dirty = False
-        except OSError as e:
-            logger.warning(f"Surveillance : état non enregistré ({e})")
+        """Écrit l'état si une alerte ou un instantané a changé ; le cache YARA et les
+        positions de lecture des journaux, eux, au plus toutes les 5 min."""
+        with self.lock:
+            if not self.dirty and not (self.dirty_cache and time.time() - self.last_save > 300):
+                return
+            try:
+                tmp = MONITOR_STATE_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    _json_mon.dump(self.state, f)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, MONITOR_STATE_FILE)
+                self.dirty = self.dirty_cache = False
+                self.last_save = time.time()
+            except OSError as e:
+                logger.warning(f"Surveillance : état non enregistré ({e})")
 
     def event(self, rule, severity, title, key, **details):
-        now = time.time()
-        last = self.state["alerted"].get(key)
-        if last and now - last < _MONITOR_ALERT_TTL:
-            return None
-        self.state["alerted"][key] = now
-        self.dirty = True
+        with self.lock:
+            now = time.time()
+            last = self.state["alerted"].get(key)
+            if last and now - last < _MONITOR_ALERT_TTL:
+                return None
+            self.state["alerted"][key] = now
+            self.dirty = True
         return {"rule": rule, "severity": severity, "title": title[:200], "key": key[:300],
                 "observed_at": datetime.utcnow().isoformat(timespec="seconds"),
                 "details": {k: v for k, v in details.items() if v not in (None, "")}}
+
+    def add_async(self, ev):
+        """Alerte produite par la lecture des journaux : envoyée au prochain passage, ou
+        tout de suite si elle est grave."""
+        if not ev:
+            return
+        with self.lock:
+            self.pending.append(ev)
+        if ev["severity"] in ("high", "critical"):
+            self.wake.set()
+
+    # Analyse YARA
+    def yara_enqueue(self, path: str, reason: str, force: bool = False):
+        if not self.yara.ready or not path:
+            return
+        if not force and path.startswith(_YARA_SKIP_PREFIXES):
+            return          # fichiers des paquets du système (hors persistance citée)
+        with self.lock:
+            if len(self.yara_queue) < 20000:
+                self.yara_queue.setdefault(path, reason)
+
+    def yara_watch_dirs(self, web: bool):
+        for root in _YARA_TMP_DIRS:
+            for path in _walk_files(_fs(root), 2, limit=3000):
+                self.yara_enqueue(path[len(_MONITOR_FS_ROOT):] if _MONITOR_FS_ROOT else path, "dossier temporaire")
+        if web:
+            for root in _YARA_WEB_ROOTS:
+                for path in _walk_files(_fs(root), 8, _YARA_WEB_EXT, limit=20000):
+                    self.yara_enqueue(path[len(_MONITOR_FS_ROOT):] if _MONITOR_FS_ROOT else path, "racine web")
+
+    def yara_drain(self, budget: int) -> list:
+        """Analyse la file dans la limite du budget d'octets ; fichiers inchangés ignorés."""
+        events, spent = [], 0
+        cache = self.state["yara_cache"]
+        while spent < budget:
+            with self.lock:
+                if not self.yara_queue:
+                    break
+                path, reason = self.yara_queue.popitem(last=False)
+            real = _fs(path) if not path.startswith("/proc/") else path
+            try:
+                st = os.stat(real)
+            except OSError:
+                continue
+            if not os.path.isfile(real) or not 0 < st.st_size <= YARA_MAX_FILE:
+                continue
+            sig = f"{st.st_size}|{int(st.st_mtime)}"
+            if cache.get(path) == sig:
+                continue
+            with self.lock:
+                cache.pop(path, None)
+                cache[path] = sig
+                while len(cache) > _YARA_CACHE_MAX:
+                    cache.pop(next(iter(cache)))
+                self.dirty_cache = True
+            spent += st.st_size
+            matches = self.yara.scan(path=real)
+            if not matches:
+                continue
+            worst = max(matches, key=lambda m: _YARA_SEVERITIES.index(m["severity"]))
+            rules = ", ".join(sorted({m["rule"] for m in matches}))
+            try:
+                import hashlib
+                with open(real, "rb") as f:
+                    sha = hashlib.sha256(f.read()).hexdigest()
+            except OSError:
+                sha = ""
+            events.append(self.event("yara_match", worst["severity"],
+                                     f"Règle YARA {worst['rule']} : {os.path.basename(path)}",
+                                     f"yara|{path}|{rules}|{sig}", path=path, rules=rules,
+                                     description=worst["description"], sha256=sha, reason=reason,
+                                     ruleset=worst["ruleset"]))
+        return [e for e in events if e]
 
     def diff(self, name, current: dict):
         previous = self.state["snap"].get(name)
@@ -1326,6 +1757,10 @@ class _Monitor:
             if not info:
                 continue
             _ppid, _start, comm, exe, cmdline = info
+            if exe:
+                # Binaire supprimé, en mémoire ou dans /tmp : analysé via /proc/<pid>/exe
+                hidden = exe.endswith(" (deleted)") or exe.startswith("/memfd:") or exe.startswith(_TEMP_DIRS)
+                self.yara_enqueue(f"/proc/{pid}/exe" if hidden else exe, "processus", force=hidden)
             # Le parent ne sert qu'aux règles « tel service a lancé un shell »
             is_shell = comm.lower() in _SHELLS or os.path.basename(exe.replace(" (deleted)", "")) in _SHELLS
             parent = _proc_info(ppid) if is_shell and ppid != "0" else None
@@ -1334,7 +1769,9 @@ class _Monitor:
                     comm, exe, cmdline, parent_comm, parent_exe, parent_cmd, self.watchlist):
                 if self.first_process_scan and _SEVERITY_ORDER.index(severity) < 2:
                     continue
-                ev = self.event(rule, severity, title, f"{rule}|{exe or comm}|{cmdline[:200]}",
+                key = (f"{rule}|{cmdline[:200]}" if rule == "suspicious_command"     # même clé que auditd
+                       else f"{rule}|{exe or comm}|{cmdline[:200]}")
+                ev = self.event(rule, severity, title, key,
                                 image=exe or comm, pid=int(pid), parent=parent_comm, parent_image=parent_exe,
                                 command=cmdline[:1000], **extra)
                 if ev:
@@ -1351,10 +1788,14 @@ class _Monitor:
         for key, line, _old in self.diff("cron", _cron_entries()) or []:
             path = key.split("|", 1)[0]
             severity, reasons = _rate_linux_command(line)
+            for p in _paths_in_command(line):
+                self.yara_enqueue(p, "persistance", force=True)
             add(self.event("new_scheduled_task", severity, f"Nouvelle tâche planifiée (cron) : {path}",
                            f"cron|{key}", path=path, line=line, reasons=" ; ".join(reasons)))
         for path, execs, old in self.diff("systemd", _systemd_units()) or []:
             severity, reasons = _rate_linux_command(execs)
+            for p in _paths_in_command(execs):
+                self.yara_enqueue(p, "persistance", force=True)
             add(self.event("new_service", severity,
                            f"{'Nouvelle' if old is None else 'Modification de l’'} unité systemd : {os.path.basename(path)}",
                            f"systemd|{path}|{execs[:200]}", path=path, command=execs, previous=old,
@@ -1413,8 +1854,24 @@ class _Monitor:
                 data = r.json() or {}
                 self.server_enabled = bool(data.get("enabled", True))
                 self.watchlist = [p for p in data.get("products") or [] if isinstance(p, dict)]
+                version = data.get("yara_version")
+                if version and version != self.yara.version and (_yara_mod is not None or shutil.which("yara")):
+                    self.load_yara_rules(version)
         except Exception:
             pass
+
+    def load_yara_rules(self, version: str):
+        r = requests.get(f"{_server_url(self.config)}/api/agents/{platform.node()}/yara-rules",
+                         headers=_agent_headers(self.config), timeout=30, verify=_tls_verify(self.config))
+        r.raise_for_status()
+        data = r.json() or {}
+        errors = self.yara.load(data.get("version") or version, data.get("rulesets") or [])
+        for error in errors:
+            logger.warning(f"Surveillance : jeu de règles YARA ignoré — {error}")
+        with self.lock:
+            self.state["yara_cache"] = {}       # nouvelles règles : les fichiers seront réanalysés
+            self.dirty_cache = True
+        logger.info(f"Surveillance : règles YARA chargées ({len(self.yara.compiled) or len(self.yara.cli_files)} jeu(x)).")
 
     def flush(self, events: list):
         if len(events) > _MONITOR_MAX_EVENTS_PER_CYCLE:
@@ -1422,7 +1879,9 @@ class _Monitor:
             events = events[:_MONITOR_MAX_EVENTS_PER_CYCLE] + [self.event(
                 "event_flood", "medium", f"{extra} autre(s) alerte(s) non transmise(s) en une minute",
                 f"flood|{int(time.time() // 3600)}", count=extra)]
-        queue = (self.state["queue"] + [e for e in events if e])[-_MONITOR_QUEUE_MAX:]
+        with self.lock:
+            events, self.pending = list(self.pending) + events, []
+            queue = (self.state["queue"] + [e for e in events if e])[-_MONITOR_QUEUE_MAX:]
         if not queue:
             return
         try:
@@ -1434,9 +1893,10 @@ class _Monitor:
             queue = queue[100:]
         except Exception as e:
             logger.warning(f"Surveillance : envoi reporté ({type(e).__name__}), {len(queue)} alerte(s) en file.")
-        if queue != self.state["queue"]:
-            self.state["queue"] = queue
-            self.dirty = True
+        with self.lock:
+            if queue != self.state["queue"]:
+                self.state["queue"] = queue
+                self.dirty = True
 
 def _monitor_settings(config):
     def num(key, default, low, high):
@@ -1453,8 +1913,11 @@ def _monitor_settings(config):
 def monitor_cycle(mon: "_Monitor", now: float, due_system: bool, due_software: bool) -> list:
     """Un passage : processus, puis système et paquets s'ils sont dus. Retourne les alertes."""
     events = []
+    if due_system:
+        mon.yara_watch_dirs(web=True)
     for name, scan, due in (("processus", mon.scan_processes, True), ("système", mon.scan_system, due_system),
-                            ("paquets", mon.scan_software, due_software)):
+                            ("paquets", mon.scan_software, due_software),
+                            ("YARA", lambda: mon.yara_drain(YARA_BUDGET_PER_CYCLE), True)):
         if due:
             try:
                 events += scan()
@@ -1470,6 +1933,7 @@ def monitor_loop(config):
         pass
     time.sleep(20)
     mon = _Monitor(config)
+    threading.Thread(target=log_watch_loop, args=(mon,), daemon=True, name="LogWatch").start()
     next_system = next_software = 0.0
     while True:
         enabled, proc_interval, system_minutes = _monitor_settings(config)
@@ -1483,12 +1947,14 @@ def monitor_loop(config):
                 if now >= next_software:
                     next_software = now + 15 * 60
                 mon.flush(events)
-                for key, ts in list(mon.state["alerted"].items()):
-                    if now - ts > 30 * 86400:
-                        del mon.state["alerted"][key]
-                        mon.dirty = True
+                with mon.lock:
+                    for key, ts in list(mon.state["alerted"].items()):
+                        if now - ts > 30 * 86400:
+                            del mon.state["alerted"][key]
+                            mon.dirty = True
                 mon.save()
-        time.sleep(proc_interval)
+        mon.wake.wait(proc_interval)      # réveillé tout de suite par une alerte grave des journaux
+        mon.wake.clear()
 
 # ─── Helpers serveur ──────────────────────────────────────────────────────────
 def _cfg_bool(config, key: str, default: bool) -> bool:

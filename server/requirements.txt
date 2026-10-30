@@ -8,3 +8,4 @@ PyJWT>=2.8.0
 bcrypt>=4.0.0
 pypdf>=5.0.0
 reportlab>=4.0.0
+yara-python>=4.5.0

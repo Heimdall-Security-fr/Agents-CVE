@@ -21,6 +21,9 @@ Write-Host "✅ $pyVer" -ForegroundColor Green
 # ── 2. Installer les dépendances ────────────────────────────
 Write-Host "`n📦  Installation des dépendances..." -ForegroundColor Cyan
 pip install --quiet requests pystray pillow pyinstaller
+# Analyse YARA de la surveillance : facultative, l'agent fonctionne sans
+pip install --quiet --only-binary=:all: yara-python
+if ($LASTEXITCODE -ne 0) { Write-Host "⚠ yara-python indisponible : agent sans analyse YARA" -ForegroundColor Yellow }
 
 # ── 3. Logo + icône .ico générée depuis le logo Heimdall ─────
 $LogoSrc = "server\static\heimdall-logo.png"
@@ -44,6 +47,7 @@ pyinstaller `
     --add-data "heimdall-logo.png;." `
     --hidden-import "pystray._win32" `
     --hidden-import "PIL._imaging" `
+    --hidden-import "yara" `
     windows_agent_tray.py
 
 if ($LASTEXITCODE -ne 0) {

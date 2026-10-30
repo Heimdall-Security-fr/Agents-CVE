@@ -437,6 +437,37 @@ gravité minimale choisie par chaque utilisateur).
 | **Processus suspects** | PowerShell encodé ou qui télécharge et exécute, outils détournés (certutil, mshta, regsvr32, rundll32…), suppression des sauvegardes (rançongiciel), dump de LSASS, effacement des journaux, document Office qui lance un shell, imitation d'un binaire système, outils offensifs (mimikatz…), exécution depuis un dossier temporaire ou public, double extension | Shell inversé (`/dev/tcp`, netcat, socat, scripts), téléchargement exécuté dans un shell, mineur de cryptomonnaie, exécution depuis `/tmp` ou `/dev/shm`, exécution en mémoire (memfd), serveur web qui lance un shell (webshell), outils offensifs |
 | **Autres** | Exclusions Microsoft Defender, fichier hosts | `/etc/ld.so.preload` (rootkit), `/etc/hosts` |
 
+**Journaux en temps réel.**
+
+| Windows (abonnement aux journaux, aucun coût entre deux événements) | Linux (nouvelles lignes lues toutes les 2 s) |
+|---|---|
+| Sécurité : force brute (≥ 10 échecs en 5 min), connexion bureau à distance réussie après des échecs, journal effacé, compte créé, ajout aux administrateurs (locaux ou du domaine), tâche planifiée créée, création de processus (4688, si l'audit est activé) | `auth.log` / `secure` (ou journald) : force brute SSH, connexion réussie après des échecs, connexion root par mot de passe, sudo refusé, commande sudo suspecte, compte créé, ajout à `sudo`/`wheel` |
+| Système : service installé, journal effacé | Accès web nginx/Apache : Log4Shell, accès à un webshell, traversée de répertoires, injection SQL, scanners |
+| PowerShell (4104, journalisation des blocs de script) : chargeurs, commandes encodées, contournement de l'AMSI — et analyse YARA du script | `audit.log` (auditd) : commandes exécutées (shells inversés…), y compris les plus brèves |
+| Defender : menace détectée, protection désactivée, exclusion ajoutée ; Sysmon (événement 1) si installé | |
+
+Les signets de lecture sont conservés : après un redémarrage, l'agent reprend où il s'était
+arrêté. Une alerte élevée ou critique issue des journaux est envoyée **immédiatement**.
+Sous Windows, le journal de sécurité n'est lisible qu'en mode service (compte SYSTEM).
+Pour voir les processus les plus brefs, activez l'audit de création de processus (4688,
+ligne de commande incluse) ou installez Sysmon ; sous Linux, auditd.
+
+**Règles YARA.** Le serveur distribue aux agents un jeu de règles par défaut
+(`server/yara/heimdall_default.yar` : webshells, shells inversés, Mimikatz et outils de vol
+d'identifiants, chargeurs PowerShell, contournement de l'AMSI, mineurs, notes de rançon,
+destruction des sauvegardes, raccourcis piégés, persistances Linux) et les jeux que vous
+ajoutez depuis la page *Surveillance* (collés ou importés en `.yar`, compilés par le serveur
+avant d'être acceptés ; métadonnées `severity` et `description` reconnues). Sont analysés :
+l'exécutable des nouveaux processus, les programmes cités par une persistance (tâche,
+service, démarrage, cron, systemd), les fichiers déposés dans les dossiers sensibles
+(Téléchargements, Bureau, Temp, `C:\Users\Public`, `/tmp`, `/dev/shm`, racines web
+`/var/www`…), et sous Windows les scripts PowerShell journalisés. Les fichiers de Windows
+et des paquets Linux ne sont pas analysés, et un fichier n'est relu que s'il change. Le
+jeu par défaut ne déclenche rien sur 7 000 fichiers système sains (800 Mo).
+Agent Windows : YARA est inclus dans l'exe. Agent Linux : `yara-python` est installé
+par le script d'installation si possible, sinon la commande `yara` est utilisée si elle est
+présente ; sans l'un ni l'autre, la surveillance fonctionne sans analyse YARA.
+
 **Appui sur les CVE récentes.** Toutes les 30 min, l'agent reçoit sa *liste de
 surveillance* : les logiciels de **sa** machine concernés par une CVE publiée depuis moins de
 60 jours (CVSS ≥ 7), critique (CVSS ≥ 9) ou probablement exploitée (EPSS ≥ 10 %). Si l'un
@@ -449,8 +480,10 @@ de commande n'est lue que pour une courte liste de programmes à risque. Tâches
 services et comptes sont relevés toutes les 5 min par différence avec l'instantané précédent
 (un fichier de tâche n'est relu que s'il a changé), les logiciels toutes les 15 min. Le fil de
 surveillance tourne en priorité minimale (mode « arrière-plan » de Windows, `nice 19` sous
-Linux). Mesuré sous Linux : **~2 ms de CPU par passage** (80 processus). Rien n'est envoyé
-tant qu'aucune règle ne se déclenche.
+Linux). Mesuré sous Linux : **~2 ms de CPU par passage** (80 processus). L'analyse YARA est
+plafonnée à 32 Mo par passage de 30 s (environ 120 ms de CPU au maximum, puis rien tant
+qu'aucun fichier ne change) ; un gros dépôt de fichiers est analysé progressivement. Rien
+n'est envoyé tant qu'aucune règle ne se déclenche.
 
 **Bruit.** Au premier démarrage, l'état existant sert de référence : seuls les changements
 ultérieurs sont signalés (sauf un processus déjà lancé qui déclenche une règle moyenne ou
@@ -461,9 +494,11 @@ conserve 90 jours.
 Réglages côté agent : section `[monitoring]` de `agent.conf` (voir `agent.conf.example`).
 Le bouton *Suspendre la surveillance* (admin) l'arrête sur tout le parc sous 30 min.
 
-> Limite : c'est une surveillance par relevés réguliers, pas un EDR temps réel. Un processus
-> qui démarre et se termine entre deux relevés (30 s) peut échapper à l'analyse ; les
-> persistances qu'il installe (tâche, service, clé de démarrage…) sont, elles, détectées.
+> Limite : ce n'est pas un EDR. Sans audit des créations de processus (4688, Sysmon ou
+> auditd), un processus qui démarre et se termine entre deux relevés (30 s) peut échapper à
+> l'analyse ; les persistances qu'il installe (tâche, service, clé de démarrage…) et les
+> traces qu'il laisse dans les journaux sont, elles, détectées. Les règles YARA ne
+> remplacent pas un antivirus : elles complètent Defender avec des règles ciblées.
 
 ---
 

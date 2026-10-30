@@ -560,6 +560,7 @@
         <div class="flex gap-2" id="monitoring-actions"></div>
       </div>
       <div id="monitoring-content"><div class="loading-center"><div class="spinner"></div></div></div>
+      <div id="yara-content" style="margin-top:28px"></div>
     </div>
 
     <!-- Notifications mail -->
@@ -601,6 +602,24 @@
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="closeUserModal()">Annuler</button>
       <button class="btn btn-primary" onclick="saveUser()">Enregistrer</button>
+    </div>
+  </div>
+</div>
+
+<!-- YARA MODAL -->
+<div class="modal-backdrop" id="yara-modal">
+  <div class="modal" style="width:min(900px,96vw);max-width:none">
+    <h2 id="yara-modal-title">Jeu de règles YARA</h2>
+    <div id="yara-modal-alert" class="alert" style="display:none"></div>
+    <label>Nom</label>
+    <input type="text" id="yara-name" placeholder="Ex. YARA-Forge core, règles internes…">
+    <label style="display:flex;justify-content:space-between;align-items:center">Règles
+      <span id="yara-file-wrap" style="text-transform:none;letter-spacing:0;font-weight:400">Importer un fichier .yar : <input type="file" id="yara-file" accept=".yar,.yara,.txt" onchange="loadYaraFile(this)" style="width:auto"></span></label>
+    <textarea id="yara-source" spellcheck="false" style="width:100%;height:min(420px,50vh);font-family:'JetBrains Mono',monospace;font-size:12px;background:rgba(0,0,0,.35);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:10px"></textarea>
+    <div class="text-muted" style="font-size:11px;margin-top:6px">Métadonnées reconnues dans chaque règle : <span class="code">severity = "low|medium|high|critical"</span> et <span class="code">description = "…"</span> (gravité « high » par défaut).</div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeYaraModal()">Fermer</button>
+      <button class="btn btn-primary" id="yara-save" onclick="saveYaraRules()">Enregistrer</button>
     </div>
   </div>
 </div>
@@ -2078,7 +2097,10 @@ var RULE_LABELS = {
   offensive_tool: 'Outil offensif', suspicious_command: 'Commande suspecte', document_spawns_shell: 'Document piégé',
   vulnerable_app_spawns_shell: 'Exploitation possible', webserver_spawns_shell: 'Webshell', service_spawns_shell: 'Service → shell',
   suspicious_location: 'Emplacement suspect', double_extension: 'Double extension', fileless_process: 'Sans fichier',
-  event_flood: 'Trop d’alertes'
+  event_flood: 'Trop d’alertes', yara_match: 'YARA', brute_force: 'Force brute', login_after_failures: 'Connexion suspecte',
+  root_password_login: 'Connexion root', sudo_denied: 'Sudo refusé', web_attack: 'Attaque web', web_scan: 'Scan web',
+  log_cleared: 'Journal effacé', defender_detection: 'Defender', defender_disabled: 'Defender coupé',
+  suspicious_script: 'Script PowerShell'
 };
 var _monFilter = { status: 'new', min_severity: 'low', hostname: '' };
 var _monEvents = [];
@@ -2093,6 +2115,7 @@ async function loadMonitoring() {
     var d = await api(q);
     _monEvents = d.events || [];
     renderMonitoring(d);
+    loadYaraRules();
   } catch(err) { el.innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>'; }
 }
 
@@ -2144,6 +2167,7 @@ function renderMonitoring(d) {
     + (rows || '<tr><td colspan="7" style="padding:24px;text-align:center;color:var(--muted)">'+(_monFilter.status === 'new' ? 'Aucune alerte à traiter.' : 'Aucune alerte.')+'</td></tr>')
     + '</tbody></table></div>'
     + '<p class="text-muted" style="font-size:12px;margin-top:12px">Les agents analysent la machine en continu (nouveaux processus toutes les 30 s ; tâches planifiées, démarrage automatique, services, comptes toutes les 5 min ; logiciels toutes les 15 min) et n’envoient que les déclencheurs. '
+    + 'Les journaux (Windows : sécurité, système, PowerShell, Defender, Sysmon ; Linux : authentification, accès web, auditd) sont lus en temps réel et les fichiers suspects analysés avec les règles YARA ci-dessous. '
     + 'Une alerte qui touche un logiciel concerné par une CVE récente ou exploitée est rattachée à cette CVE et sa gravité est relevée. Les alertes sont conservées 90 jours.</p>';
   updateMonButtons();
 }
@@ -2190,9 +2214,86 @@ async function toggleMonitoring(enabled) {
   } catch(err) { toast(err.message, 'err'); }
 }
 
+/* ── Règles YARA ── */
+var _yaraSets = [], _yaraEditId = null;
+async function loadYaraRules() {
+  var el = document.getElementById('yara-content');
+  try {
+    var d = await api('/api/yara-rules');
+    _yaraSets = d.rulesets || [];
+    var admin = isAdmin();
+    var rows = _yaraSets.map(function(r, i) {
+      return '<tr><td><strong>'+esc(r.name)+'</strong>'+(r.builtin ? ' <span class="badge badge-blue" style="font-size:10px">par défaut</span>' : '')
+        + (r.updated_by ? '<div class="text-muted" style="font-size:10px">modifié par '+esc(r.updated_by)+' le '+esc(notifDate(r.updated_at))+'</div>' : '')+'</td>'
+        + '<td>'+esc(r.rule_count)+' règle(s)</td>'
+        + '<td>'+(admin ? '<span class="toggle'+(r.enabled?' on':'')+'" role="switch" aria-checked="'+r.enabled+'" title="'+(r.enabled?'Désactiver':'Activer')+'" onclick="toggleYaraSet('+i+')"></span>'
+                        : '<span class="badge '+(r.enabled?'badge-green':'badge-gray')+'">'+(r.enabled?'Actif':'Inactif')+'</span>')+'</td>'
+        + '<td style="white-space:nowrap"><button class="btn btn-ghost btn-sm" onclick="openYaraModal('+i+')">'+(admin && !r.builtin ? 'Modifier' : 'Voir')+'</button>'
+        + (admin && !r.builtin ? ' <button class="btn btn-danger btn-sm" onclick="deleteYaraSet('+i+')">Supprimer</button>' : '')+'</td></tr>';
+    }).join('');
+    el.innerHTML = '<div class="header-row" style="margin-bottom:12px"><div><h1 style="font-size:1.15rem">Règles YARA</h1>'
+      + '<p>Distribuées aux agents (version '+esc(d.version)+'), qui analysent les fichiers nouveaux ou exécutés et les scripts PowerShell journalisés.</p></div>'
+      + (admin ? '<button class="btn btn-primary btn-sm" onclick="openYaraModal(null)">+ Ajouter un jeu</button>' : '') + '</div>'
+      + (d.validation ? '' : '<div class="alert alert-warn">Le serveur ne peut pas compiler les règles (yara-python absent) : un jeu invalide sera ignoré par les agents.</div>')
+      + '<div class="table-wrap" style="overflow-x:auto"><table style="min-width:600px"><thead><tr><th>Jeu</th><th>Règles</th><th>Actif</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+      + '<p class="text-muted" style="font-size:12px;margin-top:10px">Vous pouvez ajouter des jeux publics (par exemple les paquets de YARA-Forge) en vérifiant leur licence. Les agents se mettent à jour sous 30 min.</p>';
+  } catch(err) { el.innerHTML = '<div class="alert alert-err">'+esc(err.message)+'</div>'; }
+}
+function openYaraModal(i) {
+  var r = i === null ? null : _yaraSets[i];
+  var editable = isAdmin() && !(r && r.builtin);
+  _yaraEditId = r ? r.id : null;
+  document.getElementById('yara-modal-title').textContent = r ? r.name : 'Nouveau jeu de règles YARA';
+  document.getElementById('yara-name').value = r ? r.name : '';
+  document.getElementById('yara-source').value = r ? (r.source || '') : 'rule Exemple\n{\n    meta:\n        severity = "high"\n        description = "…"\n    strings:\n        $a = "chaîne caractéristique" ascii wide nocase\n    condition:\n        $a\n}\n';
+  ['yara-name', 'yara-source'].forEach(function(id){ document.getElementById(id).readOnly = !editable; });
+  document.getElementById('yara-file-wrap').style.display = editable ? '' : 'none';
+  document.getElementById('yara-save').style.display = editable ? '' : 'none';
+  document.getElementById('yara-modal-alert').style.display = 'none';
+  document.getElementById('yara-modal').classList.add('open');
+}
+function closeYaraModal() { document.getElementById('yara-modal').classList.remove('open'); }
+function loadYaraFile(input) {
+  var f = input.files && input.files[0];
+  if (!f) return;
+  if (f.size > 2 * 1024 * 1024) { showAlert('yara-modal-alert', 'Fichier trop volumineux (2 Mo maximum)'); return; }
+  var reader = new FileReader();
+  reader.onload = function() {
+    document.getElementById('yara-source').value = reader.result;
+    if (!document.getElementById('yara-name').value) document.getElementById('yara-name').value = f.name.replace(/\.(yara?|txt)$/i, '');
+  };
+  reader.readAsText(f);
+  input.value = '';
+}
+async function saveYaraRules() {
+  var body = { name: document.getElementById('yara-name').value.trim(), source: document.getElementById('yara-source').value };
+  var btn = document.getElementById('yara-save');
+  btn.disabled = true;
+  try {
+    var r = await api(_yaraEditId ? '/api/yara-rules/' + encodeURIComponent(_yaraEditId) : '/api/yara-rules',
+                      { method: _yaraEditId ? 'PUT' : 'POST', body: JSON.stringify(body) });
+    toast('Jeu de règles enregistré' + (r.rule_count ? ' (' + r.rule_count + ' règle(s))' : ''), 'ok');
+    closeYaraModal(); loadYaraRules();
+  } catch(err) { showAlert('yara-modal-alert', err.message); }
+  finally { btn.disabled = false; }
+}
+async function toggleYaraSet(i) {
+  var r = _yaraSets[i];
+  try {
+    await api('/api/yara-rules/' + encodeURIComponent(r.id), { method: 'PUT', body: JSON.stringify({ enabled: !r.enabled }) });
+    toast(r.name + (r.enabled ? ' désactivé' : ' activé'), 'ok'); loadYaraRules();
+  } catch(err) { toast(err.message, 'err'); }
+}
+async function deleteYaraSet(i) {
+  var r = _yaraSets[i];
+  if (!confirm('Supprimer le jeu de règles « ' + r.name + ' » ? Les agents cesseront de l’utiliser sous 30 min.')) return;
+  try { await api('/api/yara-rules/' + encodeURIComponent(r.id), { method: 'DELETE' }); toast('Jeu supprimé', 'ok'); loadYaraRules(); }
+  catch(err) { toast(err.message, 'err'); }
+}
+
 /* ── Notifications mail ── */
 var NOTIF_HELP = {
-  security_events: "Un agent détecte un déclencheur : tâche planifiée ou programme au démarrage ajouté, processus suspect (PowerShell encodé, shell inversé, outil offensif…), ajout aux administrateurs, clé SSH… Rattachée aux CVE récentes de la machine.",
+  security_events: "Un agent détecte un déclencheur : tâche planifiée ou programme au démarrage ajouté, processus suspect, fichier reconnu par une règle YARA, force brute ou journal effacé dans les journaux, ajout aux administrateurs… Rattachée aux CVE récentes de la machine.",
   new_cves: "Une CVE apparaît sur une machine : logiciel ajouté ou mis à jour, ou CVE publiée depuis l'analyse précédente.",
   high_epss: "Une CVE présente sur le parc dépasse 10 % de probabilité d'exploitation sous 30 jours (EPSS), quelle que soit sa note CVSS. L'EPSS évolue chaque jour : une CVE ancienne peut le devenir.",
   cve_scan_problem: "Les vulnérabilités ne sont plus analysées : quota épuisé, clé CVE_API_KEY invalide ou API injoignable. Rappel au plus une fois par jour tant que ça dure.",
