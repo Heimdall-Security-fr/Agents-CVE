@@ -10,6 +10,10 @@ import os
 # ─── Crash handler (avant TOUS les autres imports) ──────────────────────────────
 def _excepthook(etype, evalue, etb):
     import traceback
+    if "--selftest" in sys.argv[1:]:
+        # Vérification par l'agent qui se met à jour : pas de fenêtre, code de sortie ≠ 0
+        traceback.print_exception(etype, evalue, etb)
+        os._exit(3)
     _log = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')),
                         'Desktop', 'heimdall-crash.log')
     try:
@@ -1815,8 +1819,8 @@ _EVT_QUERIES = {
 _ADMIN_GROUP_SIDS = ("S-1-5-32-544",)                       # Administrateurs locaux
 _DOMAIN_ADMIN_RIDS = ("-512", "-518", "-519")               # Admins du domaine, du schéma, de l'entreprise
 
-def _parse_event_xml(xml: str) -> dict | None:
-    """Événement rendu en XML → {channel, id, record, time, computer, data}."""
+def _parse_event_xml(xml: str):
+    """Événement rendu en XML → {channel, id, record, time, computer, data}, ou None."""
     import xml.etree.ElementTree as ET
     try:
         root = ET.fromstring(xml)
@@ -2766,6 +2770,15 @@ def _do_self_update(base: str, token: str, url: str):
             magic = f.read(2)
         if magic != b"MZ":
             raise ValueError("Le fichier téléchargé n'est pas un exécutable Windows valide")
+        # La nouvelle version doit au moins démarrer. Sinon on garde l'actuelle : une erreur
+        # au chargement laisserait l'agent arrêté, donc incapable de se remettre à jour.
+        _set_status("🔎 Vérification de la mise à jour…")
+        check = subprocess.run([new_exe, "--selftest"], capture_output=True, text=True, errors="replace",
+                               timeout=180, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if check.returncode != 0:
+            detail = ((check.stderr or check.stdout).strip().splitlines() or ["aucune sortie"])[-1][:200]
+            raise ValueError(f"la nouvelle version ne démarre pas (code {check.returncode} : {detail}) "
+                             f"— version actuelle conservée")
         # Windows autorise le renommage d'un exe en cours d'exécution : on écarte
         # l'actuel (.old, supprimé au prochain démarrage), on met le nouveau à sa place
         # et on le lance — sans script cmd intermédiaire.
@@ -3525,6 +3538,10 @@ def _apply_cli_config(args):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
+    if "--selftest" in sys.argv[1:]:
+        # Le module entier s'est chargé : cette version démarre (utilisé par la mise à jour)
+        print(f"Heimdall Agent {AGENT_VERSION} : OK")
+        return
     parser = argparse.ArgumentParser(description="Heimdall Mini Agent (Windows)")
     parser.add_argument("--once",       action="store_true", help="Envoie unique puis exit")
     parser.add_argument("--scan-ports", action="store_true", help="Forcer scan réseau")
