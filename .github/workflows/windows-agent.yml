@@ -75,6 +75,11 @@ jobs:
         run: |
           $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
           & $mp -SignatureUpdate | Out-Null
+          # Les quarantaines « au téléchargement » viennent de la protection cloud (apprentissage
+          # automatique, réputation) : on l'active pour se rapprocher d'un poste réel.
+          Set-MpPreference -MAPSReporting Advanced -CloudBlockLevel High -CloudExtendedTimeout 50 -ErrorAction SilentlyContinue
+          Get-MpComputerStatus | Format-List AMServiceEnabled, AntivirusEnabled, RealTimeProtectionEnabled, IsTamperProtected, AntivirusSignatureVersion
+          Get-MpPreference | Format-List MAPSReporting, SubmitSamplesConsent, CloudBlockLevel
           $summary = @("## Analyse Microsoft Defender", "", "| Fichier | Résultat |", "|---|---|")
           foreach ($target in @("dist\HeimdallAgent", "published\published-HeimdallAgent.exe")) {
             $path = (Resolve-Path $target).Path
