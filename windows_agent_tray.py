@@ -12,7 +12,11 @@ def _excepthook(etype, evalue, etb):
     import traceback
     if "--selftest" in sys.argv[1:]:
         # Vérification par l'agent qui se met à jour : pas de fenêtre, code de sortie ≠ 0
-        traceback.print_exception(etype, evalue, etb)
+        # (exe sans console : la sortie d'erreur peut ne pas exister)
+        try:
+            traceback.print_exception(etype, evalue, etb)
+        except Exception:
+            pass
         os._exit(3)
     _log = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')),
                         'Desktop', 'heimdall-crash.log')

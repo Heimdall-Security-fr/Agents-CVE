@@ -1,0 +1,94 @@
+# Agent Windows : construction, démarrage réel et analyse Microsoft Defender sur une
+# vraie machine Windows (GitHub Actions). Ce workflow ne publie rien : la publication
+# reste assurée par Gitea (.gitea/workflows), qui ignore le dossier .github.
+#
+# Objectifs : vérifier que l'exe démarre (--selftest), mesurer si Defender le signale,
+# comparer avec l'exe actuellement publié, et fournir l'exe construit en téléchargement
+# (artefact) pour le tester sur un poste.
+name: Agent Windows
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - windows_agent_tray.py
+      - make_icon.py
+      - server/static/heimdall-logo.png
+      - .github/workflows/windows-agent.yml
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  published:
+    name: Exe actuellement publié (Docker Hub)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extraire l'exe de l'image
+        run: |
+          docker pull --quiet heimdallsecurity/agent-cve:latest
+          id=$(docker create heimdallsecurity/agent-cve:latest)
+          docker cp "$id:/app/static/heimdall-agent.exe" published-HeimdallAgent.exe
+          docker rm "$id" >/dev/null
+          sha256sum published-HeimdallAgent.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: published-exe
+          path: published-HeimdallAgent.exe
+          retention-days: 7
+
+  windows:
+    name: Build, démarrage et Defender
+    runs-on: windows-latest
+    needs: published
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Dépendances
+        run: >
+          python -m pip install --disable-pip-version-check --quiet
+          "pyinstaller==6.22.3" "requests==2.34.2" "pillow==13.0.0" "pystray==0.19.5" "yara-python==4.5.4"
+      - name: Icône
+        run: python make_icon.py server/static/heimdall-logo.png heimdall.ico
+      - name: Construction (dossier, sans auto-extraction dans %TEMP%)
+        run: >
+          pyinstaller --noconfirm --clean --onedir --windowed --name HeimdallAgent --icon heimdall.ico
+          --hidden-import pystray._win32 --hidden-import yara --collect-all pystray
+          --add-data "server/static/heimdall-logo.png;." windows_agent_tray.py
+      - name: Démarrage réel (--selftest)
+        run: |
+          $p = Start-Process -FilePath dist\HeimdallAgent\HeimdallAgent.exe -ArgumentList "--selftest" -Wait -PassThru
+          "Code de sortie : $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) {
+            Get-Content "$env:USERPROFILE\Desktop\heimdall-crash.log" -ErrorAction SilentlyContinue
+            exit 1
+          }
+      - uses: actions/download-artifact@v4
+        with:
+          name: published-exe
+          path: published
+      - name: Analyse Microsoft Defender
+        continue-on-error: true
+        run: |
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          & $mp -SignatureUpdate | Out-Null
+          $summary = @("## Analyse Microsoft Defender", "", "| Fichier | Résultat |", "|---|---|")
+          foreach ($target in @("dist\HeimdallAgent", "published\published-HeimdallAgent.exe")) {
+            $path = (Resolve-Path $target).Path
+            $out = & $mp -Scan -ScanType 3 -File $path -DisableRemediation 2>&1 | Out-String
+            Write-Host "=== $target (code $LASTEXITCODE)"; Write-Host $out
+            $verdict = if ($LASTEXITCODE -eq 2) { "⚠ menace détectée" } elseif ($LASTEXITCODE -eq 0) { "✅ rien détecté" } else { "code $LASTEXITCODE" }
+            $summary += "| $target | $verdict |"
+          }
+          $threats = Get-MpThreat -ErrorAction SilentlyContinue | ForEach-Object { "- $($_.ThreatName) (gravité $($_.SeverityID))" }
+          if ($threats) { $summary += @("", "Détections :") + $threats }
+          $summary -join "`n" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          Get-MpThreatDetection -ErrorAction SilentlyContinue | Format-List ThreatID, Resources, InitialDetectionTime
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HeimdallAgent-windows
+          path: dist/HeimdallAgent
+          retention-days: 14
