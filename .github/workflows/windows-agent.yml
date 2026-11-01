@@ -44,6 +44,15 @@ jobs:
     needs: published
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Numéro de version (même calcul que la publication Gitea)
+        run: |
+          $v = "1.1.$(git rev-list --count HEAD)"
+          (Get-Content windows_agent_tray.py -Raw -Encoding utf8) -replace '(?m)^AGENT_VERSION = "[^"]*"', "AGENT_VERSION = `"$v`"" |
+            Set-Content windows_agent_tray.py -Encoding utf8 -NoNewline
+          Select-String -Path windows_agent_tray.py -Pattern '^AGENT_VERSION = ' | ForEach-Object { $_.Line }
+          if (-not (Select-String -Path windows_agent_tray.py -Pattern "^AGENT_VERSION = `"$v`"" -Quiet)) { exit 1 }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
