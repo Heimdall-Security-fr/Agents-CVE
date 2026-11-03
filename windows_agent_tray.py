@@ -2466,8 +2466,8 @@ def monitor_loop():
         if enabled and (SERVICE_MODE or not _service_running()) and config_exists():
             mon.refresh_watchlist(cfg)
             if log_thread is None:
-                log_thread = threading.Thread(target=event_log_loop, args=(mon,), daemon=True, name="EventLog")
-                log_thread.start()
+                log_thread = True
+                _spawn("EventLog", event_log_loop, mon)
             if mon.server_enabled:
                 events = []
                 if time.time() >= next_system:
@@ -2596,6 +2596,27 @@ def _set_status(msg: str, connected=None, vulns: bool = False):
             state.tray_icon.title = f"Heimdall — {msg}"
         except Exception:
             pass
+
+# ─── Superviseur de fils ──────────────────────────────────────────────────────
+def _supervise(name: str, target, *args):
+    """Exécute `target(*args)` et le relance s'il lève une exception (backoff 5 s → 5 min).
+    Un plantage d'un fil de fond (surveillance, journaux, rapports…) ne doit jamais arrêter
+    l'agent durablement : il est journalisé et le fil redémarre tout seul."""
+    delay = 5
+    while state.running:
+        try:
+            target(*args)
+            return                      # fin normale (ex. mise à jour appliquée)
+        except Exception:
+            logger.exception("Fil « %s » interrompu par une erreur — redémarrage dans %s s", name, delay)
+            for _ in range(delay):
+                if not state.running:
+                    return
+                time.sleep(1)
+            delay = min(delay * 2, 300)
+
+def _spawn(name: str, target, *args):
+    threading.Thread(target=_supervise, args=(name, target) + args, daemon=True, name=name).start()
 
 # ─── Boucle agent ────────────────────────────────────────────────────────────
 def agent_loop():
@@ -2881,6 +2902,7 @@ def _set_autostart(enable: bool):
 _SERVICE_TASK  = "HeimdallSecurityAgentService"
 _SERVICE_MUTEX = "Global\\HeimdallAgentService"
 _SERVICE_CONF  = os.path.join(_PROGRAMDATA_DIR, "agent.conf")
+_SERVICE_PID   = os.path.join(_PROGRAMDATA_DIR, "service.pid")
 _service_installed_cache = None
 
 def _is_admin() -> bool:
@@ -2917,69 +2939,124 @@ def _is_service_installed(refresh: bool = False) -> bool:
             _service_installed_cache = False
     return _service_installed_cache
 
-def _ps_quote(v: str) -> str:
-    return "'" + str(v).replace("'", "''") + "'"
+def _load_service_config():
+    """Configuration de l'agent, cherchée dans tous les emplacements standard (le
+    processus élevé peut ne pas voir le %APPDATA% de l'utilisateur). None si absente."""
+    for path in CONFIG_PATHS:
+        try:
+            if os.path.isfile(path):
+                cfg = configparser.ConfigParser()
+                cfg.read(path, encoding="utf-8")
+                if cfg.get("main_server", "token", fallback=""):
+                    return cfg
+        except Exception:
+            continue
+    return None
 
-def _run_powershell(script: str, timeout: int = 60):
-    return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                           "-Command", script], capture_output=True, text=True, errors="replace",
-                          timeout=timeout)
+def _service_task_xml(exe: str) -> str:
+    """Définition de la tâche planifiée (démarrage machine, SYSTEM). Sans limite de durée
+    (PT0S : la limite de 72 h par défaut couperait l'agent), relancée en cas d'échec."""
+    import xml.sax.saxutils as _sx
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        '  <RegistrationInfo><Description>Heimdall Security Agent (demarrage de la machine)</Description></RegistrationInfo>\n'
+        '  <Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers>\n'
+        '  <Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\n'
+        '  <Settings>\n'
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n'
+        '    <AllowHardTerminate>true</AllowHardTerminate>\n'
+        '    <StartWhenAvailable>true</StartWhenAvailable>\n'
+        '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n'
+        '    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>\n'
+        '    <AllowStartOnDemand>true</AllowStartOnDemand>\n'
+        '    <Enabled>true</Enabled><Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun>\n'
+        '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>5</Priority>\n'
+        '    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>\n'
+        '  </Settings>\n'
+        '  <Actions Context="Author"><Exec><Command>' + _sx.escape(exe) + '</Command>'
+        '<Arguments>--service</Arguments></Exec></Actions>\n'
+        '</Task>\n'
+    )
+
+def _schtasks(*args, timeout: int = 30):
+    return subprocess.run(["schtasks"] + list(args), capture_output=True, text=True, errors="replace",
+                          timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 def _install_service():
-    """Crée la tâche « au démarrage » (SYSTEM) et la démarre. Droits administrateur requis.
-    Returns (ok, message)."""
+    """Cree la tache planifiee « au demarrage » (compte SYSTEM) via schtasks + XML, puis la
+    demarre. Droits administrateur requis. Returns (ok, message). Aucun appel a PowerShell :
+    plus fiable sur les postes ou PowerShell est restreint, et sans limite d'execution."""
     if not _is_admin():
         return False, "Droits administrateur requis."
-    if not config_exists():
-        return False, "Agent non configuré : renseignez d'abord le serveur et le token."
+    cfg = _load_service_config()
+    if cfg is None:
+        return False, "Agent non configure : renseignez d'abord le serveur et le token, puis reessayez."
     exe = os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)
     try:
-        # SYSTEM ne voit pas le %APPDATA% de l'utilisateur : copie de la configuration
-        # dans ProgramData, lisible uniquement par SYSTEM et les administrateurs (token).
-        cfg = load_config()
+        # SYSTEM ne voit pas le %APPDATA% de l'utilisateur : copie de la configuration dans
+        # ProgramData, lisible uniquement par SYSTEM et les administrateurs (protege le token).
         os.makedirs(_PROGRAMDATA_DIR, exist_ok=True)
-        if os.path.abspath(_config_path_existing() or "") != os.path.abspath(_SERVICE_CONF):
-            with open(_SERVICE_CONF, "w", encoding="utf-8") as f:
-                cfg.write(f)
+        with open(_SERVICE_CONF, "w", encoding="utf-8") as f:
+            cfg.write(f)
         subprocess.run(["icacls", _SERVICE_CONF, "/inheritance:r", "/grant:r",
-                        "*S-1-5-18:F", "*S-1-5-32-544:F"], capture_output=True, timeout=15)
-        # Register-ScheduledTask plutôt que schtasks : schtasks ne sait pas retirer la
-        # limite d'exécution par défaut de 72 h, qui couperait l'agent au bout de 3 jours.
-        script = (
-            "$ErrorActionPreference='Stop';"
-            f"$a=New-ScheduledTaskAction -Execute {_ps_quote(exe)} -Argument '--service';"
-            "$t=New-ScheduledTaskTrigger -AtStartup;"
-            "$p=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest;"
-            "$s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 "
-            "-RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries "
-            "-DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew;"
-            f"Register-ScheduledTask -TaskName {_ps_quote(_SERVICE_TASK)} -Action $a -Trigger $t "
-            "-Principal $p -Settings $s -Description 'Heimdall Security Agent (demarrage de la machine)' -Force | Out-Null;"
-            f"Start-ScheduledTask -TaskName {_ps_quote(_SERVICE_TASK)}"
-        )
-        r = _run_powershell(script)
+                        "*S-1-5-18:F", "*S-1-5-32-544:F"], capture_output=True, timeout=15,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        xml_path = os.path.join(_PROGRAMDATA_DIR, "service-task.xml")
+        with open(xml_path, "w", encoding="utf-16") as f:
+            f.write(_service_task_xml(exe))
+        r = _schtasks("/Create", "/TN", _SERVICE_TASK, "/XML", xml_path, "/F")
+        try:
+            os.remove(xml_path)
+        except OSError:
+            pass
         if r.returncode != 0:
-            return False, ((r.stderr or r.stdout).strip().splitlines() or ["échec"])[-1][:300]
+            detail = ((r.stderr or r.stdout).strip().splitlines() or ["echec inconnu"])[-1][:300]
+            logger.error("schtasks /Create a echoue (code %s) : %s", r.returncode,
+                         (r.stdout + r.stderr).strip()[:500])
+            return False, f"Creation de la tache refusee : {detail}"
+        run = _schtasks("/Run", "/TN", _SERVICE_TASK)
+        if run.returncode != 0:
+            # La tache est bien installee ; elle demarrera au prochain boot meme si /Run echoue ici.
+            logger.warning("schtasks /Run : %s", (run.stdout + run.stderr).strip()[:300])
     except Exception as e:
+        logger.exception("Installation du service echouee")
         return False, str(e)[:300]
     _is_service_installed(refresh=True)
-    logger.info("Service (tâche au démarrage) installé.")
-    return True, "L'agent démarrera désormais avec la machine, avant toute ouverture de session."
+    if not _is_service_installed(refresh=True):
+        return False, "La tache n'apparait pas apres creation (voir le journal)."
+    logger.info("Service (tache au demarrage) installe.")
+    return True, "L'agent demarrera desormais avec la machine, avant toute ouverture de session."
+
+def _stop_service_process():
+    """Arrete le processus --service en cours via son fichier PID (fonctionne meme apres une
+    auto-mise a jour, ou le processus relance ne depend plus de la tache planifiee)."""
+    try:
+        with open(_SERVICE_PID, encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return
+    if pid and pid != os.getpid():
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=15,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        os.remove(_SERVICE_PID)
+    except OSError:
+        pass
 
 def _uninstall_service():
     if not _is_admin():
         return False, "Droits administrateur requis."
-    r = _run_powershell(
-        f"Stop-ScheduledTask -TaskName {_ps_quote(_SERVICE_TASK)} -ErrorAction SilentlyContinue;"
-        f"Unregister-ScheduledTask -TaskName {_ps_quote(_SERVICE_TASK)} -Confirm:$false -ErrorAction SilentlyContinue")
-    # Arrêt du processus --service (Stop-ScheduledTask ne suffit pas après une auto-mise à jour,
-    # le processus relancé ne dépendant plus de la tâche)
-    _run_powershell("Get-CimInstance Win32_Process -Filter \"Name='HeimdallAgent.exe'\" | "
-                    "Where-Object { $_.CommandLine -like '*--service*' } | "
-                    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+    _schtasks("/End", "/TN", _SERVICE_TASK)
+    r = _schtasks("/Delete", "/TN", _SERVICE_TASK, "/F")
+    _stop_service_process()
+    if r.returncode not in (0, 1):   # 1 = tache deja absente
+        logger.warning("schtasks /Delete : %s", (r.stdout + r.stderr).strip()[:300])
     _is_service_installed(refresh=True)
-    logger.info("Service (tâche au démarrage) retiré.")
-    return True, "Le démarrage avec la machine est désactivé."
+    logger.info("Service (tache au demarrage) retire.")
+    return True, "Le demarrage avec la machine est desactive."
 
 def _run_elevated_and_wait(flag: str) -> bool:
     """Relance l'agent avec `flag` en administrateur (invite UAC) et attend sa fin."""
@@ -3031,15 +3108,31 @@ def _run_service():
         logger.info("Service déjà en cours d'exécution — sortie.")
         return
     logger.info(f"Agent démarré en mode service (v{AGENT_VERSION}).")
+    try:
+        with open(_SERVICE_PID, "w", encoding="utf-8") as f:   # pour l'arrêt propre à la désinstallation
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
     while state.running and not config_exists():
         logger.error(f"Configuration introuvable ({_SERVICE_CONF}) — nouvelle tentative dans 60 s.")
         time.sleep(60)
     load_config()
-    threading.Thread(target=heartbeat_loop, daemon=True, name="Heartbeat").start()
-    threading.Thread(target=update_loop,    daemon=True, name="UpdateCheck").start()
-    threading.Thread(target=monitor_loop,   daemon=True, name="Monitor").start()
-    agent_loop()
+    _spawn("Heartbeat", heartbeat_loop)
+    _spawn("UpdateCheck", update_loop)
+    _spawn("Monitor", monitor_loop)
+    # La boucle principale est supervisée : un plantage la relance au lieu d'arrêter le service
+    # (la tâche planifiée relance aussi le processus en dernier recours — RestartCount).
+    _supervise("AgentLoop", agent_loop)
     ctypes.windll.kernel32.CloseHandle(mutex)
+
+def _run_service_guarded():
+    """Filet global : toute erreur non rattrapée du mode service est journalisée, jamais une
+    fenêtre (session 0). Le processus ressort en erreur et la tâche planifiée le relancera."""
+    try:
+        _run_service()
+    except Exception:
+        logger.exception("Mode service interrompu par une erreur fatale")
+        os._exit(1)
 
 def _on_toggle_autostart(_icon=None, _item=None):
     """Bascule le démarrage automatique avec Windows."""
@@ -3603,7 +3696,7 @@ def main():
         install_scheduled_task()
 
     if args.service:
-        _run_service()
+        _run_service_guarded()
         return
 
     # Créer la racine tkinter UNE SEULE FOIS pour tout le processus
@@ -3665,15 +3758,15 @@ def main():
     if args.once or args.no_tray or not TRAY_OK:
         send_report()
         if not args.once:
-            threading.Thread(target=monitor_loop, daemon=True, name="Monitor").start()
+            _spawn("Monitor", monitor_loop)
             agent_loop()
         return
 
     # ── Mode icône système ──
-    threading.Thread(target=agent_loop,     daemon=True, name="AgentLoop").start()
-    threading.Thread(target=heartbeat_loop, daemon=True, name="Heartbeat").start()
-    threading.Thread(target=update_loop,    daemon=True, name="UpdateCheck").start()
-    threading.Thread(target=monitor_loop,   daemon=True, name="Monitor").start()
+    _spawn("AgentLoop", agent_loop)
+    _spawn("Heartbeat", heartbeat_loop)
+    _spawn("UpdateCheck", update_loop)
+    _spawn("Monitor", monitor_loop)
 
     # state.tk_root est déjà créé en début de main()
 

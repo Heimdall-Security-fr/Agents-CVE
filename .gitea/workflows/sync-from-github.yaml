@@ -94,7 +94,7 @@ jobs:
         run: |
           python3 -m pip install --quiet -r server/requirements.txt
           python3 -m unittest \
-            tests.test_windows_agent_python37 tests.test_windows_monitoring_rules tests.test_linux_monitoring_rules \
+            tests.test_windows_agent_python37 tests.test_agent_resilience tests.test_windows_monitoring_rules tests.test_linux_monitoring_rules \
             server.test_monitoring server.test_notifications server.test_cve_circuit_breaker server.test_vulnerability_state
 
   publish:

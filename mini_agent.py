@@ -1933,7 +1933,7 @@ def monitor_loop(config):
         pass
     time.sleep(20)
     mon = _Monitor(config)
-    threading.Thread(target=log_watch_loop, args=(mon,), daemon=True, name="LogWatch").start()
+    _spawn("LogWatch", log_watch_loop, mon)
     next_system = next_software = 0.0
     while True:
         enabled, proc_interval, system_minutes = _monitor_settings(config)
@@ -2355,6 +2355,22 @@ def run_once(config, do_port_scan=False):
         logger.info(f"  Ports ouverts : {open_ports}")
     send_report(config, software, open_ports)
 
+def _supervise(name, target, *args):
+    """Relance `target(*args)` s'il lève (backoff 5 s → 5 min). Un plantage d'un fil de fond
+    (surveillance, journaux, heartbeat…) ne doit jamais arrêter l'agent durablement."""
+    delay = 5
+    while True:
+        try:
+            target(*args)
+            return
+        except Exception:
+            logger.exception("Fil « %s » interrompu par une erreur — redémarrage dans %s s", name, delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 300)
+
+def _spawn(name, target, *args):
+    threading.Thread(target=_supervise, args=(name, target) + args, daemon=True, name=name).start()
+
 def run_daemon(config):
     interval = int(config.get("agent", "interval_minutes", fallback=60)) * 60
     logger.info(f"Mode démon — intervalle : {interval // 60} min — version {AGENT_VERSION}")
@@ -2380,10 +2396,10 @@ def run_daemon(config):
             for _ in range(86400):  # 24h
                 time.sleep(1)
 
-    threading.Thread(target=_hb_loop, daemon=True, name="Heartbeat").start()
-    threading.Thread(target=_update_loop, daemon=True, name="UpdateLoop").start()
+    _spawn("Heartbeat", _hb_loop)
+    _spawn("UpdateLoop", _update_loop)
     if platform.system() == "Linux":
-        threading.Thread(target=monitor_loop, args=(config,), daemon=True, name="Monitor").start()
+        _spawn("Monitor", monitor_loop, config)
 
     while True:
         try:
