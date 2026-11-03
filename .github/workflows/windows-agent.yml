@@ -99,8 +99,10 @@ jobs:
           $u = Start-Process -FilePath $exe -ArgumentList "--service-uninstall","--silent" -Wait -PassThru
           "uninstall exit=$($u.ExitCode)"
           schtasks /Query /TN HeimdallSecurityAgentService 2>$null
-          if ($LASTEXITCODE -eq 0) { "La tâche subsiste après désinstallation"; exit 1 }
-          "Service installé puis désinstallé avec succès." | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          $gone = ($LASTEXITCODE -ne 0)
+          if (-not $gone) { "La tâche subsiste après désinstallation"; exit 1 }
+          "Service installé (SYSTEM, démarrage) puis désinstallé avec succès." | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          exit 0   # GitHub prend le dernier code de sortie ; schtasks /Query d'une tâche absente renvoie 1
       - uses: actions/download-artifact@v4
         with:
           name: published-exe
