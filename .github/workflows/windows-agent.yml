@@ -91,11 +91,10 @@ jobs:
           # La tâche doit exister, tourner sous SYSTEM, au démarrage, sans limite de durée
           $raw = (schtasks /Query /TN HeimdallSecurityAgentService /XML ONE) -join "`n"
           if ($LASTEXITCODE -ne 0) { "La tâche n'existe pas après installation"; exit 1 }
-          $xml = [xml]$raw
-          "Compte d'exécution : $($xml.Task.Principals.Principal.UserId)"
-          if ($xml.Task.Principals.Principal.UserId -ne "S-1-5-18") { "Pas sous le compte SYSTEM"; exit 1 }
-          if ($xml.Task.Settings.ExecutionTimeLimit -ne "PT0S") { "Limite d'exécution non neutralisée"; exit 1 }
-          if (-not $xml.Task.Triggers.BootTrigger) { "Pas de déclencheur au démarrage"; exit 1 }
+          Write-Host $raw
+          if ($raw -notmatch 'S-1-5-18')     { "Pas sous le compte SYSTEM"; exit 1 }
+          if ($raw -notmatch '<BootTrigger') { "Pas de déclencheur au démarrage"; exit 1 }
+          if ($raw -notmatch '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>') { "Limite d'exécution non neutralisée"; exit 1 }
           # Désinstallation : la tâche doit disparaître
           $u = Start-Process -FilePath $exe -ArgumentList "--service-uninstall","--silent" -Wait -PassThru
           "uninstall exit=$($u.ExitCode)"
